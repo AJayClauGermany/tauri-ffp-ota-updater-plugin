@@ -61,7 +61,8 @@ export class Update {
 
   /**
    * Switches to the downloaded bundle now by reloading the app's webviews.
-   * In-memory page state is lost, as with any reload.
+   * In-memory page state is lost, as with any reload. The new frontend has to
+   * call {@link notifyReady} or it is reverted on the next launch.
    */
   async install(): Promise<void> {
     await invoke('plugin:ffp-ota-updater|install', { version: this.version })
@@ -117,4 +118,16 @@ export async function currentVersion(): Promise<string> {
  */
 export async function reset(): Promise<void> {
   await invoke('plugin:ffp-ota-updater|reset')
+}
+
+/**
+ * Confirms that the frontend being served works. Call it on every start, once
+ * the app got far enough that it could update itself again.
+ *
+ * A downloaded bundle that has not confirmed itself by the next launch is
+ * reverted to the last confirmed one (or the built-in frontend) and its
+ * version is never offered again. Disable with `"rollback": false`.
+ */
+export async function notifyReady(): Promise<void> {
+  await invoke('plugin:ffp-ota-updater|notify_ready')
 }

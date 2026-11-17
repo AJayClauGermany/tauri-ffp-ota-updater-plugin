@@ -7,4 +7,5 @@ permissions = [
   "allow-download-and-install",
   "allow-current-version",
   "allow-reset",
+  "allow-notify-ready",
 ]

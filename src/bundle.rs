@@ -4,25 +4,41 @@
 //! as downloaded, next to its signature, and is verified and unpacked into memory every time it
 //! is loaded. Nothing is ever extracted to disk, so a tampered or corrupted file can at worst be
 //! rejected, in which case the app falls back to an older bundle or its built-in assets.
+//!
+//! Next to the bundles, `state.json` records which bundle was confirmed to work, which one is
+//! on trial, and which versions were rejected. See [`Store::select`].
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
-    io::Read,
-    path::{Component, PathBuf},
+    io::{Read, Write},
+    path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use base64::Engine;
 use minisign_verify::{PublicKey, Signature};
 use semver::Version;
-use tauri::utils::assets::AssetKey;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
 const ARCHIVE_EXT: &str = ".tar.gz";
 const SIGNATURE_EXT: &str = ".tar.gz.sig";
+const PARTIAL_EXT: &str = ".part";
+const STATE_FILE: &str = "state.json";
+/// Entries (files and directories) a bundle may contain.
+const MAX_ENTRIES: usize = 20_000;
+
+/// Size limits applied to a bundle, in bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// The compressed archive, as downloaded and stored.
+    pub archive: u64,
+    /// The sum of the unpacked files, which are held in memory.
+    pub unpacked: u64,
+}
 
 /// Decides whether a frontend bundle version may run on a given binary version.
 ///
@@ -44,37 +60,54 @@ pub(crate) struct Bundle {
 
 impl Bundle {
     /// Verifies `archive` against `signature` and unpacks it.
+    ///
+    /// The archive has to be unambiguous: anything but plain files and directories, paths that
+    /// are absolute or climb out, and two entries for the same file are errors, not skipped.
     pub fn from_archive(
         archive: &[u8],
         signature: &str,
         pubkey: &str,
         version: &Version,
         require_signed_version: bool,
+        limits: Limits,
     ) -> Result<Self> {
+        if archive.len() as u64 > limits.archive {
+            return Err(Error::TooLarge("bundle", limits.archive));
+        }
         verify_signature(archive, signature, pubkey, version, require_signed_version)?;
 
         let mut files = HashMap::new();
+        let mut unpacked = 0u64;
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-        for entry in tar.entries().map_err(invalid)? {
+        for (index, entry) in tar.entries().map_err(invalid)?.enumerate() {
+            if index >= MAX_ENTRIES {
+                return Err(Error::InvalidBundle(format!(
+                    "more than {MAX_ENTRIES} entries"
+                )));
+            }
             let mut entry = entry.map_err(invalid)?;
-            // directories, links and other special entries have no place in a set of assets
-            if !entry.header().entry_type().is_file() {
+            let kind = entry.header().entry_type();
+            // `git archive` leads with a global pax header; it carries no file
+            if kind.is_dir() || kind.is_pax_global_extensions() {
                 continue;
             }
-            // `tar -C dist .` names entries `./index.html`; keep only the plain components so
-            // the key is `/index.html`. Paths that try to climb out are not assets.
-            let path = entry.path().map_err(invalid)?;
-            if path.components().any(|c| matches!(c, Component::ParentDir)) {
-                continue;
+            let key = asset_key(&entry.path_bytes())?;
+            if !kind.is_file() {
+                return Err(Error::InvalidBundle(format!(
+                    "`{key}` is a link or special file"
+                )));
             }
-            let key = AssetKey::from(
-                path.components()
-                    .filter(|c| matches!(c, Component::Normal(_)))
-                    .collect::<PathBuf>(),
-            );
+            unpacked = unpacked.saturating_add(entry.size());
+            if unpacked > limits.unpacked {
+                return Err(Error::TooLarge("unpacked bundle", limits.unpacked));
+            }
             let mut contents = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut contents).map_err(invalid)?;
-            files.insert(key.as_ref().to_string(), contents);
+            if files.insert(key.clone(), contents).is_some() {
+                return Err(Error::InvalidBundle(format!(
+                    "`{key}` is in the archive twice"
+                )));
+            }
         }
 
         if !files.contains_key("/index.html") {
@@ -88,6 +121,31 @@ impl Bundle {
             files,
         })
     }
+}
+
+/// Turns an archive path into the key Tauri looks assets up by: `./assets/app.js` (what
+/// `tar -C dist .` writes) becomes `/assets/app.js`.
+fn asset_key(path: &[u8]) -> Result<String> {
+    let bad = || Error::InvalidBundle(format!("bad path `{}`", String::from_utf8_lossy(path)));
+    let path = std::str::from_utf8(path).map_err(|_| bad())?;
+    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
+        return Err(bad());
+    }
+    let mut key = String::with_capacity(path.len() + 1);
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err(bad()),
+            part => {
+                key.push('/');
+                key.push_str(part);
+            }
+        }
+    }
+    if key.is_empty() {
+        return Err(bad());
+    }
+    Ok(key)
 }
 
 fn invalid(error: std::io::Error) -> Error {
@@ -130,11 +188,44 @@ fn base64_to_string(value: &str) -> Result<String> {
     String::from_utf8(decoded).map_err(|_| Error::SignatureUtf8)
 }
 
-/// The directory downloaded bundles live in: `<version>.tar.gz` plus `<version>.tar.gz.sig`.
+/// What is known about the stored bundles beyond their files.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct State {
+    /// The last bundle the frontend confirmed to work; kept as the fallback.
+    confirmed: Option<Version>,
+    /// The bundle being served without having been confirmed yet. Recorded before it is
+    /// served, so that a launch that finds it still here knows the trial failed.
+    trial: Option<Version>,
+    /// Versions that failed a trial or were rolled back. They are never served or offered
+    /// again; a fixed frontend needs a new version.
+    rejected: BTreeSet<Version>,
+}
+
+/// The directory downloaded bundles live in: `<version>.tar.gz` plus `<version>.tar.gz.sig`,
+/// and `state.json`.
 pub(crate) struct Store {
     pub dir: PathBuf,
     pub pubkey: String,
     pub require_signed_version: bool,
+    pub limits: Limits,
+    /// With rollback off every bundle counts as confirmed as soon as it is served.
+    pub rollback: bool,
+    pub binary: Version,
+    pub comparator: VersionComparator,
+    /// Serializes everything that reads and then writes the state.
+    pub lock: Mutex<()>,
+}
+
+/// Writes `contents` so that `path` either keeps its old content or has all of the new one,
+/// also across a crash or power loss.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(PARTIAL_EXT);
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
 }
 
 impl Store {
@@ -146,39 +237,73 @@ impl Store {
         self.dir.join(format!("{version}{SIGNATURE_EXT}"))
     }
 
+    /// Whether `version` is a frontend-only update for this binary.
+    pub fn compatible(&self, version: &Version) -> bool {
+        (self.comparator)(&self.binary, version)
+    }
+
+    pub fn is_rejected(&self, version: &Version) -> bool {
+        self.read_state().rejected.contains(version)
+    }
+
+    fn read_state(&self) -> State {
+        match fs::read(self.dir.join(STATE_FILE)) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                log::warn!("ignoring unreadable OTA state: {error}");
+                State::default()
+            }),
+            Err(_) => State::default(),
+        }
+    }
+
+    fn write_state(&self, state: &State) -> Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        write_atomic(&self.dir.join(STATE_FILE), &serde_json::to_vec(state)?)?;
+        Ok(())
+    }
+
     fn verify(&self, archive: &[u8], signature: &str, version: &Version) -> Result<Bundle> {
+        if !self.compatible(version) {
+            return Err(Error::Incompatible(version.to_string()));
+        }
         Bundle::from_archive(
             archive,
             signature,
             &self.pubkey,
             version,
             self.require_signed_version,
+            self.limits,
         )
     }
 
     /// Verifies a downloaded archive and, only if it is valid, persists it.
-    pub fn save(&self, archive: &[u8], signature: &str, version: &Version) -> Result<Bundle> {
-        let bundle = self.verify(archive, signature, version)?;
+    pub fn save(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        if self.is_rejected(version) {
+            return Err(Error::Rejected(version.to_string()));
+        }
+        self.verify(archive, signature, version)?;
         fs::create_dir_all(&self.dir)?;
-        // The signature is written last and the archive is renamed into place, so an
-        // interrupted save never leaves something that looks like a complete bundle. Even if it
-        // did, `load` verifies it again.
-        let archive_path = self.archive_path(version);
-        let tmp = archive_path.with_extension("part");
-        fs::write(&tmp, archive)?;
-        fs::rename(&tmp, &archive_path)?;
-        fs::write(self.signature_path(version), signature)?;
-        Ok(bundle)
+        // Each file appears complete or not at all, and the archive, which `versions` goes by,
+        // comes last. Even a half-saved bundle would only fail verification in `load`.
+        write_atomic(&self.signature_path(version), signature.as_bytes())?;
+        write_atomic(&self.archive_path(version), archive)?;
+        Ok(())
     }
 
     /// Loads and verifies a stored bundle.
-    pub fn load(&self, version: &Version) -> Result<Bundle> {
-        let archive = match fs::read(self.archive_path(version)) {
+    fn load(&self, version: &Version) -> Result<Bundle> {
+        let path = self.archive_path(version);
+        let size = match fs::metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::NotDownloaded(version.to_string()));
             }
-            other => other?,
+            other => other?.len(),
         };
+        if size > self.limits.archive {
+            return Err(Error::TooLarge("bundle", self.limits.archive));
+        }
+        let archive = fs::read(path)?;
         let signature = fs::read_to_string(self.signature_path(version))?;
         self.verify(&archive, &signature, version)
     }
@@ -198,39 +323,109 @@ impl Store {
         versions
     }
 
-    pub fn remove(&self, version: &Version) {
+    fn remove(&self, version: &Version) {
         let _ = fs::remove_file(self.archive_path(version));
         let _ = fs::remove_file(self.signature_path(version));
     }
 
-    /// Removes every stored bundle.
-    pub fn clear(&self) {
+    /// Removes what `serving` supersedes: everything older, except the confirmed fallback.
+    fn prune(&self, state: &State, serving: &Version) {
+        for version in self.versions() {
+            if version < *serving && state.confirmed.as_ref() != Some(&version) {
+                self.remove(&version);
+            }
+        }
+    }
+
+    /// Removes every stored bundle. The rejected versions stay on record.
+    pub fn clear(&self) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
         for version in self.versions() {
             self.remove(&version);
         }
-    }
-
-    /// Removes every stored bundle older than `keep`.
-    pub fn prune_older_than(&self, keep: &Version) {
-        for version in self.versions().iter().filter(|v| *v < keep) {
-            self.remove(version);
+        let state = self.read_state();
+        if state.confirmed.is_some() || state.trial.is_some() {
+            self.write_state(&State {
+                rejected: state.rejected,
+                ..State::default()
+            })?;
         }
+        Ok(())
     }
 
-    /// Picks the newest stored bundle that is compatible with `binary` and passes verification.
+    /// Loads the stored bundle `version` to switch to it while the app is running, recording
+    /// it as on trial before it is returned for serving.
+    pub fn activate(&self, version: &Version) -> Result<Bundle> {
+        let _guard = self.lock.lock().unwrap();
+        let mut state = self.read_state();
+        if state.rejected.contains(version) {
+            return Err(Error::Rejected(version.to_string()));
+        }
+        let bundle = self.load(version)?;
+        if !self.rollback {
+            state.confirmed = Some(version.clone());
+            state.trial = None;
+        } else if state.confirmed.as_ref() != Some(version) {
+            state.trial = Some(version.clone());
+        }
+        self.write_state(&state)?;
+        self.prune(&state, version);
+        Ok(bundle)
+    }
+
+    /// Records that the frontend of `serving` works. It becomes the fallback and the previous
+    /// one is deleted.
+    pub fn confirm(&self, serving: &Version) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        let mut state = self.read_state();
+        if state.trial.as_ref() == Some(serving) {
+            state.confirmed = state.trial.take();
+            self.write_state(&state)?;
+            self.prune(&state, serving);
+        }
+        Ok(())
+    }
+
+    /// Picks the bundle to serve: the newest stored one that is compatible with the binary, was
+    /// not rejected and passes verification.
     ///
-    /// Bundles that are incompatible (e.g. left over from before a full update), invalid, or
-    /// superseded are deleted. Never fails: with no usable bundle the built-in assets are used.
-    pub fn load_newest(&self, binary: &Version, comparator: &VersionComparator) -> Option<Bundle> {
+    /// Called at startup, where a trial left unconfirmed by the previous run is rejected, and
+    /// to roll back, where `reject` is the version to abandon. A bundle chosen without having
+    /// been confirmed before goes on trial. Bundles that are incompatible (e.g. left over from
+    /// before a full update), rejected, invalid or superseded are deleted. Never fails: with no
+    /// usable bundle the built-in assets are used.
+    pub fn select(&self, reject: Option<&Version>) -> Option<Bundle> {
+        let _guard = self.lock.lock().unwrap();
+        let old_state = self.read_state();
+        let mut state = old_state.clone();
+
+        if let Some(version) = state.trial.take() {
+            log::warn!("frontend bundle {version} was not confirmed to work; rejecting it");
+            state.rejected.insert(version);
+        }
+        if let Some(version) = reject {
+            state.rejected.insert(version.clone());
+        }
+        // a full update makes the history of the previous binary irrelevant
+        state.rejected.retain(|version| self.compatible(version));
+        if state
+            .confirmed
+            .as_ref()
+            .is_some_and(|v| !self.compatible(v) || state.rejected.contains(v))
+        {
+            state.confirmed = None;
+        }
+
+        let mut chosen = None;
         for version in self.versions() {
-            if !comparator(binary, &version) {
+            if state.rejected.contains(&version) {
                 self.remove(&version);
                 continue;
             }
             match self.load(&version) {
                 Ok(bundle) => {
-                    self.prune_older_than(&version);
-                    return Some(bundle);
+                    chosen = Some(bundle);
+                    break;
                 }
                 Err(error) => {
                     log::warn!("discarding frontend bundle {version}: {error}");
@@ -238,6 +433,55 @@ impl Store {
                 }
             }
         }
-        None
+
+        match &chosen {
+            Some(bundle) if !self.rollback => state.confirmed = Some(bundle.version.clone()),
+            Some(bundle) if state.confirmed.as_ref() != Some(&bundle.version) => {
+                state.trial = Some(bundle.version.clone());
+            }
+            _ => {}
+        }
+        if state != old_state
+            && let Err(error) = self.write_state(&state)
+        {
+            // a trial that is not on record could not be rolled back
+            log::warn!("could not record the OTA state: {error}");
+            if state.trial.take().is_some() {
+                chosen = state.confirmed.as_ref().and_then(|v| self.load(v).ok());
+            }
+        }
+        if let Some(bundle) = &chosen {
+            self.prune(&state, &bundle.version);
+        }
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            // left behind by an interrupted write
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(PARTIAL_EXT) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        chosen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_key;
+
+    #[test]
+    fn asset_keys_are_canonical() {
+        for path in [
+            "./assets/app.js",
+            "assets/app.js",
+            "assets//app.js",
+            "./assets/./app.js",
+        ] {
+            assert_eq!(asset_key(path.as_bytes()).unwrap(), "/assets/app.js");
+        }
+        for path in ["../x", "a/../x", "/x", "a\\x", "a\nb", ".", "", "./"] {
+            assert!(asset_key(path.as_bytes()).is_err(), "{path:?} was accepted");
+        }
+        assert!(asset_key(&[0xff, b'a']).is_err());
     }
 }
