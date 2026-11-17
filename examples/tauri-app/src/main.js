@@ -1,19 +1,60 @@
 // `app.withGlobalTauri` is enabled in tauri.conf.json, so the Tauri API is
-// available on `window.__TAURI__` and no bundler is required.
-const { invoke } = window.__TAURI__.core;
+// available on `window.__TAURI__` and no bundler is required. With a bundler,
+// use `check()` from `tauri-plugin-ffp-ota-updater-api` instead of `invoke`.
+const { invoke, Channel } = window.__TAURI__.core;
+const plugin = (command, args) => invoke(`plugin:ffp-ota-updater|${command}`, args);
 
-const form = document.querySelector("#ping-form");
-const input = document.querySelector("#ping-input");
-const output = document.querySelector("#output");
+const $ = (id) => document.getElementById(id);
+const log = (message) => ($("output").textContent += `${message}\n`);
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
+let update = null;
+
+function progressChannel() {
+  const channel = new Channel();
+  let received = 0;
+  channel.onmessage = ({ event, data }) => {
+    if (event === "Progress") received += data.chunkLength;
+    if (event === "Finished") log(`Downloaded ${received} bytes`);
+  };
+  return channel;
+}
+
+async function run(action) {
   try {
-    const response = await invoke("plugin:ffp-ota-updater|ping", {
-      payload: { value: input.value },
-    });
-    output.textContent = `Plugin responded: ${JSON.stringify(response)}`;
+    await action();
   } catch (error) {
-    output.textContent = `Error: ${error}`;
+    log(`Error: ${error}`);
   }
+}
+
+$("check").addEventListener("click", () =>
+  run(async () => {
+    update = await plugin("check");
+    $("download").disabled = $("install").disabled = !update;
+    log(
+      update
+        ? `Frontend update ${update.version} available (current ${update.currentVersion}): ${update.body ?? ""}`
+        : "No frontend update available",
+    );
+  }),
+);
+
+$("download").addEventListener("click", () =>
+  run(async () => {
+    await plugin("download", { version: update.version, onEvent: progressChannel() });
+    log("Stored. It will be used the next time the app starts.");
+  }),
+);
+
+$("install").addEventListener("click", () =>
+  // reloads the page into the new frontend
+  run(() =>
+    plugin("download_and_install", { version: update.version, onEvent: progressChannel() }),
+  ),
+);
+
+$("reset").addEventListener("click", () => run(() => plugin("reset")));
+
+run(async () => {
+  $("version").textContent = await plugin("current_version");
 });

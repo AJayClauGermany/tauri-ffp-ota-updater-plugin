@@ -1,8 +1,192 @@
 # Tauri Plugin ffp-ota-updater
 
-A [Tauri v2](https://v2.tauri.app) plugin for over-the-air (OTA) updates. This is
-currently the bare plugin scaffold (a single `ping` command) that the real
-functionality will be built on.
+Over-the-air updates for the **frontend** of a [Tauri v2](https://v2.tauri.app)
+app. Where [`tauri-plugin-updater`](https://v2.tauri.app/plugin/updater/)
+downloads and installs a whole new application, this plugin downloads a signed
+tarball of your web assets and serves it in place of the ones embedded in the
+binary. Design tweaks and small fixes ship without a binary download or an app
+restart.
+
+It is modelled on the updater plugin and meant to sit next to it: same config
+keys, same signing keys and `tauri signer` tooling, same manifest fields, same
+`check()` / `download()` / `install()` API.
+
+| | `tauri-plugin-updater` | this plugin |
+| --- | --- | --- |
+| Replaces | the application | the frontend assets |
+| Artifact | installer / app bundle per platform | one `frontend.tar.gz` for all platforms |
+| Applies | after restart | on webview reload, or on next launch |
+| Default scope | any newer version | newer **patch** versions of the installed binary |
+
+Desktop only (Windows, macOS, Linux) for now.
+
+## How it works
+
+- `check()` asks your endpoint for a release manifest. By default a release is
+  a frontend update only if it is a newer patch of the installed binary
+  (binary `1.2.0` accepts `1.2.1`, `1.2.7`, but not `1.3.0` or `2.0.0`): minor
+  and major bumps are assumed to need new Rust code and are left to the
+  updater plugin. Override this with `Builder::version_comparator`.
+- `download()` fetches the tarball, verifies its minisign signature (and that
+  it was signed for the announced version) and stores it in the app's local
+  data directory. Nothing else happens until the next launch.
+- `install()` switches to the downloaded bundle and reloads the webviews.
+  `downloadAndInstall()` does both.
+- On every launch the plugin picks the **newest** stored bundle that is still
+  compatible with the binary, verifies it again and serves it. Bundles that
+  fail verification, are older, or no longer apply (for instance after a full
+  update to `1.3.0`) are deleted. If none is usable the built-in frontend is
+  served.
+
+Bundles are kept as the signed archive and unpacked in memory, never extracted
+to disk, so what is served is always exactly what was signed. The page keeps
+its origin (`tauri://localhost` / `http://tauri.localhost`), so IPC,
+capabilities, `localStorage` and IndexedDB carry over.
+
+## Setup
+
+Add the crate and, if you use a bundler, the JS package
+(`tauri-plugin-ffp-ota-updater-api`). Then register the plugin. Unlike most
+plugins it needs one extra line, `install(&mut context)`, which is what allows
+it to replace the embedded assets:
+
+```rust
+pub fn run() {
+    let mut context = tauri::generate_context!();
+    tauri_plugin_ffp_ota_updater::install(&mut context);
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_ffp_ota_updater::init())
+        .run(context)
+        .expect("error while running tauri application");
+}
+```
+
+Configure it in `tauri.conf.json`. If you already use the updater plugin,
+reuse its `pubkey`:
+
+```json
+{
+  "plugins": {
+    "ffp-ota-updater": {
+      "endpoints": ["https://releases.example.com/ota.json"],
+      "pubkey": "CONTENT OF YOUR .key.pub FILE"
+    }
+  }
+}
+```
+
+| Key | Default | |
+| --- | --- | --- |
+| `endpoints` | `[]` | Manifest URLs, tried in order. Variables: `{{current_version}}` (frontend being served), `{{binary_version}}`, `{{target}}`, `{{arch}}`. |
+| `pubkey` | | Minisign public key from `tauri signer generate`. |
+| `dangerousInsecureTransportProtocol` | `false` | Allow non-`https` endpoints. |
+| `requireSignedVersion` | `true` | Reject signatures that do not record the version they were made for. Needs a Tauri CLI with `tauri signer sign --app-version`. |
+
+Grant the permission in a capability file:
+
+```json
+{ "permissions": ["core:default", "ffp-ota-updater:default"] }
+```
+
+## Publishing a frontend update
+
+After your normal frontend build (`dist` here), with the frontend version
+bumped to a new patch release:
+
+```bash
+tar -czf frontend.tar.gz -C dist .
+```
+
+```bash
+npx tauri signer sign --app-version 1.2.1 frontend.tar.gz
+```
+
+The signer reads the same `TAURI_SIGNING_PRIVATE_KEY` /
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` variables as the updater's build, and
+writes `frontend.tar.gz.sig`. Upload the tarball and publish the manifest, whose
+`signature` is the *content* of the `.sig` file:
+
+```json
+{
+  "version": "1.2.1",
+  "notes": "New colors",
+  "pub_date": "2026-01-01T00:00:00Z",
+  "url": "https://releases.example.com/1.2.1/frontend.tar.gz",
+  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6…"
+}
+```
+
+As with the updater, an endpoint may answer `204 No Content` for "no update".
+The archive must contain the whole frontend with `index.html` at its root; it
+replaces the built-in assets entirely.
+
+## Using it
+
+```js
+import { check } from "tauri-plugin-ffp-ota-updater-api";
+
+const update = await check();
+if (update) {
+  // store it now, use it from the next launch on
+  await update.download();
+  // ...or switch immediately (reloads the page)
+  await update.downloadAndInstall((event) => {
+    if (event.event === "Progress") console.log(event.data.chunkLength);
+  });
+}
+```
+
+Also available: `currentVersion()` (version of the frontend being served) and
+`reset()` (delete downloaded bundles and go back to the built-in frontend).
+Without a bundler, call the commands through `window.__TAURI__.core.invoke`
+as `examples/tauri-app` does.
+
+From Rust:
+
+```rust
+use tauri_plugin_ffp_ota_updater::OtaUpdaterExt;
+
+if let Some(update) = app.ota_updater().check().await? {
+    update.download_and_install(|_chunk, _total| {}, || {}).await?;
+}
+```
+
+### Together with the updater plugin
+
+The two plugins are independent, each with its own manifest. Check for a full
+update first and fall back to a frontend one; `update.kind === "frontend"`
+tells them apart if one function handles both:
+
+```js
+import { check as checkApp } from "@tauri-apps/plugin-updater";
+import { check as checkFrontend } from "tauri-plugin-ffp-ota-updater-api";
+
+const appUpdate = await checkApp();
+if (appUpdate) {
+  await appUpdate.downloadAndInstall(); // then relaunch
+} else {
+  await (await checkFrontend())?.downloadAndInstall();
+}
+```
+
+A workable versioning scheme: bump the patch version for frontend-only
+releases and publish them through this plugin; bump minor or major when the
+Rust side changes and publish those through the updater.
+
+## Limitations
+
+- **Dev mode**: `tauri dev` loads the frontend from the dev server, so a
+  downloaded bundle is never displayed there. Test with a release build.
+- **Strict CSP**: Tauri computes nonces and hashes for inline scripts and
+  styles at build time, for the embedded HTML only. In a downloaded bundle,
+  load scripts and styles from files (what bundlers emit) rather than inline.
+- **No automatic rollback for a bundle that verifies but is broken at
+  runtime**: if a published frontend cannot run far enough to update itself,
+  recover by calling `app.ota_updater().reset()` from Rust or by shipping a
+  full update.
+- The manifest itself is not signed, the bundle is. `requireSignedVersion`
+  is what prevents a tampered manifest from presenting an old bundle as new.
 
 ## Layout
 
@@ -13,12 +197,6 @@ functionality will be built on.
 | `permissions/`       | Permission definitions (`default.toml` + autogenerated)    |
 | `guest-js/`          | TypeScript API wrapper, built to `dist-js/` (tsc + rollup) |
 | `examples/tauri-app` | Plain HTML/JS app for trying out the plugin                |
-
-Desktop only for now. `src/mobile.rs` and the `android_path`/`ios_path` calls
-in `build.rs` are leftover template placeholders (no `android/` or `ios/`
-projects exist), so mobile builds are unsupported. To add mobile support, run
-`tauri plugin android init` / `tauri plugin ios init` and replace the
-placeholder plugin class in `src/mobile.rs`.
 
 ## Prerequisites
 
@@ -57,48 +235,13 @@ npm run dev
 3. Add `allow-<command>` to `permissions/default.toml`.
 4. Expose it in `guest-js/index.ts`.
 
-## Usage
+## Trying the example
 
-```rust
-fn main() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_ffp_ota_updater::init())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-```
-
-Grant access in the app's capability file
-(e.g. `src-tauri/capabilities/default.json`):
-
-```json
-{ "permissions": ["core:default", "ffp-ota-updater:default"] }
-```
-
-Call the plugin from the frontend, either through the JS API package
-(`tauri-plugin-ffp-ota-updater-api`):
-
-```js
-import { ping } from "tauri-plugin-ffp-ota-updater-api";
-
-await ping("hello"); // "hello"
-```
-
-or directly, which works without a bundler when `app.withGlobalTauri` is
-enabled (see `examples/tauri-app`):
-
-```js
-const { invoke } = window.__TAURI__.core;
-await invoke("plugin:ffp-ota-updater|ping", { payload: { value: "hello" } });
-```
-
-And from Rust, via the extension trait:
-
-```rust
-use tauri_plugin_ffp_ota_updater::{FfpOtaUpdaterExt, PingRequest};
-
-app.ffp_ota_updater().ping(PingRequest { value: Some("hello".into()) })?;
-```
+The example points at `http://localhost:8000/ota.json`. Generate a key, put
+the public key in `examples/tauri-app/src-tauri/tauri.conf.json`, build a
+release binary, then publish a modified copy of `examples/tauri-app/src` as
+version `0.1.1` following [Publishing a frontend update](#publishing-a-frontend-update)
+and serve the manifest and tarball with any static file server on port 8000.
 
 ## Testing
 

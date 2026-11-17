@@ -2,7 +2,7 @@
 name = "tauri-plugin-ffp-ota-updater"
 version = "0.1.0"
 authors = [ "Suraj S Singh" ]
-description = "Tauri plugin for over-the-air (OTA) updates"
+description = "Tauri plugin for over-the-air (OTA) updates of the frontend assets"
 edition = "2024"
 rust-version = "1.90"
 repository = "https://github.com/SurajSSingh/tauri-ffp-ota-updater-plugin"
@@ -12,11 +12,31 @@ links = "tauri-plugin-ffp-ota-updater"
 
 [dependencies]
 tauri = { version = "2.12.5" }
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+log = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+url = { version = "2", features = ["serde"] }
+http = "1"
+minisign-verify = "0.3"
+base64 = "0.23"
+semver = { version = "1", features = ["serde"] }
+futures-util = "0.3"
+percent-encoding = "2.3"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [build-dependencies]
 tauri-plugin = { version = "2.7.2", features = ["build"] }
 
 [dev-dependencies]
 tauri = { version = "2.12.5", features = ["test"] }
+minisign = "0.10"
+tempfile = "3"
+base64 = "0.23"
+semver = "1"
+serde_json = "1"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"

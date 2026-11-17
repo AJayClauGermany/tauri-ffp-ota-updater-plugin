@@ -10,10 +10,13 @@
   <body>
     <main>
       <h1>ffp-ota-updater example</h1>
-      <form id="ping-form">
-        <input id="ping-input" placeholder="Value to send to the plugin…" />
-        <button type="submit">Ping</button>
-      </form>
+      <p>Frontend version: <strong id="version">…</strong></p>
+      <p>
+        <button id="check">Check for frontend update</button>
+        <button id="download" disabled>Download (apply on next launch)</button>
+        <button id="install" disabled>Download and install now</button>
+        <button id="reset">Reset to built-in</button>
+      </p>
       <pre id="output"></pre>
     </main>
   </body>

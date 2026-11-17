@@ -1,13 +1,129 @@
-use tauri::{AppHandle, Runtime, command};
+use std::{str::FromStr, time::Duration};
 
-use crate::FfpOtaUpdaterExt;
-use crate::Result;
-use crate::models::*;
+use http::{HeaderMap, HeaderName, HeaderValue};
+use serde::Serialize;
+use tauri::{AppHandle, Runtime, command, ipc::Channel};
+
+use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Update};
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", content = "data")]
+pub enum DownloadEvent {
+    #[serde(rename_all = "camelCase")]
+    Started {
+        content_length: Option<u64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        chunk_length: usize,
+    },
+    Finished,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Metadata {
+    kind: &'static str,
+    current_version: String,
+    version: String,
+    date: Option<String>,
+    body: Option<String>,
+    raw_json: serde_json::Value,
+}
+
+/// The update `check` last returned to the webview, if it is for `version`.
+fn pending<R: Runtime>(app: &AppHandle<R>, version: &str) -> Result<Update<R>> {
+    app.ota_updater()
+        .pending
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|update| update.version.to_string() == version)
+        .ok_or_else(|| Error::NoPendingUpdate(version.to_string()))
+}
+
+async fn download_with_events<R: Runtime>(
+    update: &Update<R>,
+    on_event: &Channel<DownloadEvent>,
+) -> Result<()> {
+    let mut started = false;
+    update
+        .download(
+            |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = on_event.send(DownloadEvent::Started { content_length });
+                }
+                let _ = on_event.send(DownloadEvent::Progress { chunk_length });
+            },
+            || {
+                let _ = on_event.send(DownloadEvent::Finished);
+            },
+        )
+        .await
+}
 
 #[command]
-pub(crate) async fn ping<R: Runtime>(
+pub(crate) async fn check<R: Runtime>(
     app: AppHandle<R>,
-    payload: PingRequest,
-) -> Result<PingResponse> {
-    app.ffp_ota_updater().ping(payload)
+    headers: Option<Vec<(String, String)>>,
+    timeout: Option<u64>,
+) -> Result<Option<Metadata>> {
+    let mut options = RequestOptions {
+        headers: HeaderMap::new(),
+        timeout: timeout.map(Duration::from_millis),
+    };
+    for (name, value) in headers.unwrap_or_default() {
+        options
+            .headers
+            .append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?);
+    }
+
+    let updater = app.ota_updater();
+    let update = updater.check_with(options).await?;
+    let metadata = update.as_ref().map(|update| Metadata {
+        kind: "frontend",
+        current_version: update.current_version.to_string(),
+        version: update.version.to_string(),
+        date: update.date.clone(),
+        body: update.body.clone(),
+        raw_json: update.raw_json.clone(),
+    });
+    *updater.pending.lock().unwrap() = update;
+    Ok(metadata)
+}
+
+#[command]
+pub(crate) async fn download<R: Runtime>(
+    app: AppHandle<R>,
+    version: String,
+    on_event: Channel<DownloadEvent>,
+) -> Result<()> {
+    download_with_events(&pending(&app, &version)?, &on_event).await
+}
+
+#[command]
+pub(crate) async fn install<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
+    pending(&app, &version)?.install()
+}
+
+#[command]
+pub(crate) async fn download_and_install<R: Runtime>(
+    app: AppHandle<R>,
+    version: String,
+    on_event: Channel<DownloadEvent>,
+) -> Result<()> {
+    let update = pending(&app, &version)?;
+    download_with_events(&update, &on_event).await?;
+    update.install()
+}
+
+#[command]
+pub(crate) fn current_version<R: Runtime>(app: AppHandle<R>) -> String {
+    app.ota_updater().current_version().to_string()
+}
+
+#[command]
+pub(crate) async fn reset<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.ota_updater().reset()
 }
