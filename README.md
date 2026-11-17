@@ -95,8 +95,10 @@ Grant the permission in a capability file:
 
 ## Publishing a frontend update
 
-After your normal frontend build (`dist` here), with the frontend version
-bumped to a new patch release:
+The plugin does not hook into the build. Package the output of your normal
+frontend build, i.e. what `build.beforeBuildCommand` writes to
+`build.frontendDist` (`dist` here), with the frontend version bumped to a new
+patch release:
 
 ```bash
 tar -czf frontend.tar.gz -C dist .
@@ -126,6 +128,27 @@ The archive must contain the whole frontend with `index.html` at its root; it
 replaces the built-in assets entirely. Only plain files and directories are
 accepted: an archive with links, absolute or `..` paths, or the same file
 twice is refused as a whole.
+
+In a multi-page app every page is served, as long as it is in the archive:
+only the presence of `index.html` is checked, so a bundle that lacks another
+page is accepted and that page is then missing.
+
+The manifest and the tarball can live on any host that serves them over
+`https`.
+
+### Per-platform bundles
+
+One tarball serves every platform by default. If the frontend build differs
+between platforms, publish one manifest per platform, each pointing at its own
+tarball, and select it with the endpoint variables:
+
+```json
+{ "endpoints": ["https://releases.example.com/{{target}}-{{arch}}/ota.json"] }
+```
+
+`{{target}}` is `linux`, `windows` or `darwin`; `{{arch}}` is `x86_64`,
+`aarch64`, `i686` or `armv7`. Sign each tarball with the same
+`--app-version`.
 
 ## Using it
 
@@ -292,7 +315,7 @@ and serve the manifest and tarball with any static file server on port 8000.
 ## Testing
 
 ```bash
-cargo test                                    # Rust tests (mock Tauri runtime)
+cargo test                                    # Rust tests (mock Tauri runtime; not on Windows)
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 npm run check                                 # TypeScript type-check
