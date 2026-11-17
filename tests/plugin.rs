@@ -1,24 +1,303 @@
 // Windows test binaries that link the Tauri runtime crash at startup with
 // STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) unless an application manifest is
-// embedded, so this runtime-backed smoke test only runs on Linux and macOS.
+// embedded, so these runtime-backed tests only run on Linux and macOS.
 #![cfg(not(windows))]
 
-use tauri::test::{mock_builder, mock_context, noop_assets};
-use tauri_plugin_ffp_ota_updater::{FfpOtaUpdaterExt, PingRequest};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    io::{BufRead, BufReader, Cursor, Write},
+    net::TcpListener,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+use base64::Engine;
+use semver::Version;
+use tauri::{
+    App, Assets,
+    async_runtime::block_on,
+    test::{MockRuntime, mock_builder, mock_context},
+    utils::{
+        assets::{AssetKey, AssetsIter, CspHash},
+        config::AppDirectoriesOverride,
+    },
+};
+use tauri_plugin_ffp_ota_updater::{Error, OtaUpdaterExt, default_version_comparator};
+
+/// Stands in for the frontend embedded in the binary.
+struct BuiltIn;
+
+impl Assets<MockRuntime> for BuiltIn {
+    fn get(&self, key: &AssetKey) -> Option<Cow<'_, [u8]>> {
+        (key.as_ref() == "/index.html").then_some(Cow::Borrowed(b"built-in"))
+    }
+    fn iter(&self) -> Box<AssetsIter<'_>> {
+        Box::new(std::iter::empty())
+    }
+    fn csp_hashes(&self, _: &AssetKey) -> Box<dyn Iterator<Item = CspHash<'_>> + '_> {
+        Box::new(std::iter::empty())
+    }
+}
+
+fn b64(value: impl AsRef<[u8]>) -> String {
+    base64::engine::general_purpose::STANDARD.encode(value)
+}
+
+/// A gzipped tarball with an `index.html` containing `index`, laid out like `tar -C dist .`.
+fn archive(index: &str) -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    for (path, contents) in [("./index.html", index), ("./assets/app.js", "js")] {
+        // written verbatim: `append_data` would normalize the leading `./` away, but the
+        // `tar` command line tool keeps it
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, contents.as_bytes()).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap()
+}
+
+/// Signs like `tauri signer sign --app-version <version>` does.
+fn sign(key: &minisign::KeyPair, data: &[u8], version: Option<&str>) -> String {
+    let mut comment = String::from("timestamp:0\tfile:frontend.tar.gz");
+    if let Some(version) = version {
+        comment.push_str(&format!("\tversion:{version}"));
+    }
+    let signature = minisign::sign(
+        Some(&key.pk),
+        &key.sk,
+        Cursor::new(data),
+        Some(&comment),
+        Some("signature from tauri secret key"),
+    )
+    .unwrap();
+    b64(signature.to_string())
+}
+
+type Routes = Arc<Mutex<HashMap<&'static str, Vec<u8>>>>;
+
+/// Serves `routes` by the last path segment and records every requested path.
+fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let path = request_line
+                .split(' ')
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            let body = routes
+                .lock()
+                .unwrap()
+                .get(path.rsplit('/').next().unwrap())
+                .cloned();
+            requests.lock().unwrap().push(path);
+            let (status, body) = match body {
+                Some(body) => ("200 OK", body),
+                None => ("404 Not Found", Vec::new()),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    port
+}
+
+fn launch(data_dir: &Path, binary_version: &str, pubkey: &str, port: u16) -> App<MockRuntime> {
+    let mut context = mock_context(BuiltIn);
+    context.package_info_mut().version = binary_version.parse().unwrap();
+    context.config_mut().app.app_directories_override =
+        Some(AppDirectoriesOverride::Root(data_dir.into()));
+    context.config_mut().plugins.0.insert(
+        "ffp-ota-updater".into(),
+        serde_json::json!({
+            "endpoints": [format!(
+                "http://127.0.0.1:{port}/{{{{target}}}}/{{{{binary_version}}}}/{{{{current_version}}}}/ota.json"
+            )],
+            "pubkey": pubkey,
+            "dangerousInsecureTransportProtocol": true,
+        }),
+    );
+    tauri_plugin_ffp_ota_updater::install(&mut context);
+    mock_builder()
+        .plugin(tauri_plugin_ffp_ota_updater::init())
+        .build(context)
+        .expect("failed to build app with plugin")
+}
+
+fn served_index(app: &App<MockRuntime>) -> String {
+    let asset = app
+        .asset_resolver()
+        .get("index.html".into())
+        .expect("index.html is not served");
+    String::from_utf8(asset.bytes().to_vec()).unwrap()
+}
 
 #[test]
-fn ping_echoes_value() {
-    let app = mock_builder()
-        .plugin(tauri_plugin_ffp_ota_updater::init())
-        .build(mock_context(noop_assets()))
-        .expect("failed to build app with plugin");
+fn default_comparator_only_accepts_newer_patches() {
+    let v = |s: &str| Version::parse(s).unwrap();
+    assert!(default_version_comparator(&v("1.2.0"), &v("1.2.1")));
+    assert!(!default_version_comparator(&v("1.2.1"), &v("1.2.1")));
+    assert!(!default_version_comparator(&v("1.2.1"), &v("1.2.0")));
+    assert!(!default_version_comparator(&v("1.2.0"), &v("1.3.0")));
+    assert!(!default_version_comparator(&v("1.2.0"), &v("2.2.1")));
+}
 
-    let response = app
-        .ffp_ota_updater()
-        .ping(PingRequest {
-            value: Some("hello".into()),
-        })
-        .expect("ping failed");
+// One scenario rather than several tests: the active bundle is process-wide state.
+#[test]
+fn frontend_update_lifecycle() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
 
-    assert_eq!(response.value.as_deref(), Some("hello"));
+    let routes = Routes::default();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = serve(routes.clone(), requests.clone());
+    let publish = |version: &str, file: &'static str, signature: &str| {
+        let manifest = serde_json::json!({
+            "version": version,
+            "notes": "notes",
+            "pub_date": "2026-01-01T00:00:00Z",
+            "url": format!("http://127.0.0.1:{port}/{file}"),
+            "signature": signature,
+        });
+        routes
+            .lock()
+            .unwrap()
+            .insert("ota.json", manifest.to_string().into_bytes());
+    };
+
+    let v121 = archive("ota 1.2.1");
+    let v121_signature = sign(&key, &v121, Some("1.2.1"));
+    routes.lock().unwrap().insert("1.2.1.tar.gz", v121.clone());
+    let unversioned = archive("ota 1.2.2");
+    let unversioned_signature = sign(&key, &unversioned, None);
+    routes
+        .lock()
+        .unwrap()
+        .insert("unversioned.tar.gz", unversioned);
+    routes
+        .lock()
+        .unwrap()
+        .insert("corrupt.tar.gz", archive("tampered"));
+
+    // --- first launch: nothing downloaded, the built-in frontend is served
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(updater.current_version().to_string(), "1.2.0");
+
+    // a minor bump is a full update, not ours
+    publish("1.3.0", "1.2.1.tar.gz", &v121_signature);
+    assert!(block_on(updater.check()).unwrap().is_none());
+
+    // bundles that fail verification are rejected and never stored
+    let download = |version: &str, file: &'static str, signature: &str| {
+        publish(version, file, signature);
+        let update = block_on(updater.check()).unwrap().expect("no update");
+        block_on(update.download(|_, _| {}, || {}))
+    };
+    assert!(matches!(
+        download("1.2.2", "1.2.1.tar.gz", &v121_signature),
+        Err(Error::SignedVersionMismatch { .. })
+    ));
+    assert!(matches!(
+        download("1.2.2", "unversioned.tar.gz", &unversioned_signature),
+        Err(Error::MissingSignedVersion)
+    ));
+    assert!(matches!(
+        download("1.2.1", "corrupt.tar.gz", &v121_signature),
+        Err(Error::Minisign(_))
+    ));
+    assert_eq!(std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0), 0);
+
+    // a patch bump is a frontend update
+    publish("v1.2.1", "1.2.1.tar.gz", &v121_signature);
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    assert_eq!(update.version.to_string(), "1.2.1");
+    assert_eq!(update.current_version.to_string(), "1.2.0");
+    assert_eq!(update.body.as_deref(), Some("notes"));
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .ends_with("/1.2.0/1.2.0/ota.json")
+    );
+
+    // installing before downloading fails
+    assert!(matches!(update.install(), Err(Error::NotDownloaded(_))));
+
+    // download only stages the bundle...
+    let mut downloaded = 0;
+    let mut finished = false;
+    block_on(update.download(|chunk, _| downloaded += chunk, || finished = true)).unwrap();
+    assert_eq!(downloaded, v121.len());
+    assert!(finished);
+    assert_eq!(served_index(&app), "built-in");
+
+    // ...install swaps it in
+    update.install().unwrap();
+    assert_eq!(served_index(&app), "ota 1.2.1");
+    assert!(app.asset_resolver().get("assets/app.js".into()).is_some());
+    assert_eq!(updater.current_version().to_string(), "1.2.1");
+    assert!(block_on(updater.check()).unwrap().is_none());
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .ends_with("/1.2.0/1.2.1/ota.json")
+    );
+    drop(app);
+
+    // --- next launch: the newest valid bundle is picked up; a newer but tampered one and an
+    // older one are discarded
+    std::fs::write(store.join("1.2.9.tar.gz"), archive("evil")).unwrap();
+    std::fs::write(store.join("1.2.9.tar.gz.sig"), &v121_signature).unwrap();
+    std::fs::copy(store.join("1.2.1.tar.gz"), store.join("1.2.0-rc.1.tar.gz")).unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    assert_eq!(served_index(&app), "ota 1.2.1");
+    assert!(!store.join("1.2.9.tar.gz").exists());
+    assert!(!store.join("1.2.9.tar.gz.sig").exists());
+    assert!(!store.join("1.2.0-rc.1.tar.gz").exists());
+    assert!(store.join("1.2.1.tar.gz").exists());
+    drop(app);
+
+    // --- after a full update the old bundle no longer applies and is removed
+    let app = launch(data_dir.path(), "1.3.0", &pubkey, port);
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.2.1.tar.gz").exists());
+
+    // --- reset goes back to the built-in frontend
+    let v131 = archive("ota 1.3.1");
+    routes.lock().unwrap().insert("1.3.1.tar.gz", v131.clone());
+    publish("1.3.1", "1.3.1.tar.gz", &sign(&key, &v131, Some("1.3.1")));
+    let updater = app.ota_updater();
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    assert_eq!(served_index(&app), "ota 1.3.1");
+    updater.reset().unwrap();
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.3.1.tar.gz").exists());
 }

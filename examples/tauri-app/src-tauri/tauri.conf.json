@@ -29,5 +29,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "ffp-ota-updater": {
+      "endpoints": [
+        "http://localhost:8000/ota.json"
+      ],
+      "pubkey": "REPLACE_WITH_YOUR_PUBLIC_KEY",
+      "dangerousInsecureTransportProtocol": true
+    }
   }
 }

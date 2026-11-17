@@ -1,3 +1,10 @@
 [default]
-description = "Default permissions for the plugin"
-permissions = ["allow-ping"]
+description = "Allows checking for, downloading and installing frontend (OTA) updates"
+permissions = [
+  "allow-check",
+  "allow-download",
+  "allow-install",
+  "allow-download-and-install",
+  "allow-current-version",
+  "allow-reset",
+]
