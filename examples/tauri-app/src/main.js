@@ -56,5 +56,7 @@ $("install").addEventListener("click", () =>
 $("reset").addEventListener("click", () => run(() => plugin("reset")));
 
 run(async () => {
+  // the page got this far, so a downloaded frontend is good to keep
+  await plugin("notify_ready");
   $("version").textContent = await plugin("current_version");
 });

@@ -5,6 +5,7 @@ const COMMANDS: &[&str] = &[
     "download_and_install",
     "current_version",
     "reset",
+    "notify_ready",
 ];
 
 fn main() {

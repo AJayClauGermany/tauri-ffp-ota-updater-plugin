@@ -64,8 +64,8 @@ impl Builder {
     /// Replaces the rule deciding which bundle versions are frontend-only updates for a given
     /// binary. Receives `(binary_version, bundle_version)`.
     ///
-    /// The rule is applied to releases found by `check` and to the downloaded bundles at
-    /// startup, where a bundle that fails it (typically after a full update) is deleted.
+    /// The rule is applied to releases found by `check` and whenever a bundle is stored or
+    /// loaded. At startup a bundle that fails it (typically after a full update) is deleted.
     /// Defaults to [`default_version_comparator`].
     pub fn version_comparator(
         mut self,
@@ -84,6 +84,7 @@ impl Builder {
                 commands::download_and_install,
                 commands::current_version,
                 commands::reset,
+                commands::notify_ready,
             ])
             .setup(move |app, api| {
                 let mut config = api.config().clone().unwrap_or_default();
@@ -92,15 +93,22 @@ impl Builder {
                 }
                 config.validate()?;
 
+                let binary_version = app.package_info().version.clone();
                 let store = bundle::Store {
                     dir: app.path().app_local_data_dir()?.join("ffp-ota-updater"),
                     pubkey: config.pubkey.clone(),
                     require_signed_version: config.require_signed_version,
+                    limits: bundle::Limits {
+                        archive: config.max_bundle_size,
+                        unpacked: config.max_unpacked_size,
+                    },
+                    rollback: config.rollback,
+                    binary: binary_version.clone(),
+                    comparator: self
+                        .comparator
+                        .unwrap_or_else(|| Arc::new(default_version_comparator)),
+                    lock: Mutex::new(()),
                 };
-                let binary_version = app.package_info().version.clone();
-                let comparator = self
-                    .comparator
-                    .unwrap_or_else(|| Arc::new(default_version_comparator));
 
                 // Plugins are set up before any window is created, so the bundle chosen here is
                 // what the first page load gets.
@@ -109,14 +117,13 @@ impl Builder {
                         "tauri_plugin_ffp_ota_updater::install(&mut context) was not called; downloaded frontends will not be served"
                     );
                 }
-                assets::set_active(store.load_newest(&binary_version, &comparator));
+                assets::set_active(store.select(None));
 
                 app.manage(OtaUpdater {
                     app: app.clone(),
                     config,
                     store,
                     binary_version,
-                    comparator,
                     pending: Mutex::new(None),
                 });
                 Ok(())

@@ -8,12 +8,16 @@ use serde::{Deserialize, Deserializer};
 use tauri::{AppHandle, Manager, Runtime};
 use url::Url;
 
-use crate::{
-    Config, Error, OtaUpdaterExt, Result, assets,
-    bundle::{Store, VersionComparator},
-};
+use crate::{Config, Error, OtaUpdaterExt, Result, assets, bundle::Store};
 
 const USER_AGENT: &str = concat!("tauri-plugin-ffp-ota-updater/", env!("CARGO_PKG_VERSION"));
+/// A manifest is a few hundred bytes.
+const MAX_MANIFEST_SIZE: u64 = 1 << 20;
+/// Deadlines for a whole request when [`RequestOptions::timeout`] is not set.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Longest wait for a connection, and for more data once connected.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The release manifest an endpoint responds with.
 ///
@@ -46,7 +50,8 @@ fn parse_version<'de, D: Deserializer<'de>>(
 pub struct RequestOptions {
     /// Extra headers sent with the manifest request and the bundle download.
     pub headers: HeaderMap,
-    /// Timeout applied to each request.
+    /// Timeout applied to each request. Defaults to 30 seconds for the manifest and 30 minutes
+    /// for the bundle; a connection that stalls for 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
 }
 
@@ -56,7 +61,6 @@ pub struct OtaUpdater<R: Runtime> {
     pub(crate) config: Config,
     pub(crate) store: Store,
     pub(crate) binary_version: Version,
-    pub(crate) comparator: VersionComparator,
     /// The release the last successful `check` from the webview returned.
     pub(crate) pending: Mutex<Option<Update<R>>>,
 }
@@ -76,9 +80,10 @@ impl<R: Runtime> OtaUpdater<R> {
 
     /// Checks the endpoints for a frontend update.
     ///
-    /// Returns `None` when there is none, or when the release is not frontend-only according to
-    /// the version comparator (by default: anything but a newer patch release of the binary).
-    /// Those releases are the regular updater plugin's job.
+    /// Returns `None` when there is none, when the release is not frontend-only according to
+    /// the version comparator (by default: anything but a newer patch release of the binary;
+    /// those releases are the regular updater plugin's job), or when that version was rejected
+    /// by a rollback before.
     pub async fn check(&self) -> Result<Option<Update<R>>> {
         self.check_with(RequestOptions::default()).await
     }
@@ -94,7 +99,7 @@ impl<R: Runtime> OtaUpdater<R> {
         headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("application/json"));
-        let client = client(options.timeout)?;
+        let client = self.client(options.timeout.unwrap_or(CHECK_TIMEOUT))?;
 
         let mut last_error = String::from("no endpoint responded successfully");
         let mut found = None;
@@ -115,13 +120,15 @@ impl<R: Runtime> OtaUpdater<R> {
                 last_error = format!("endpoint responded with {}", response.status());
                 continue;
             }
-            let raw_json: serde_json::Value = match response.json().await {
-                Ok(json) => json,
-                Err(error) => {
-                    last_error = error.to_string();
-                    continue;
-                }
-            };
+            let body = read_limited(response, "manifest", MAX_MANIFEST_SIZE, |_| {}).await;
+            let raw_json: serde_json::Value =
+                match body.and_then(|body| Ok(serde_json::from_slice(&body)?)) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        last_error = error.to_string();
+                        continue;
+                    }
+                };
             match serde_json::from_value::<RemoteRelease>(raw_json.clone()) {
                 Ok(release) => {
                     found = Some((release, raw_json));
@@ -135,7 +142,8 @@ impl<R: Runtime> OtaUpdater<R> {
         };
 
         if release.version <= current_version
-            || !(self.comparator)(&self.binary_version, &release.version)
+            || !self.store.compatible(&release.version)
+            || self.store.is_rejected(&release.version)
         {
             return Ok(None);
         }
@@ -153,10 +161,35 @@ impl<R: Runtime> OtaUpdater<R> {
         }))
     }
 
+    /// Tells the updater that the frontend being served works.
+    ///
+    /// A bundle is on trial from the moment it is first served until this is called. A trial
+    /// that is still open when the app starts the next time has failed: that version is
+    /// rejected for good and the last confirmed bundle, or else the built-in frontend, is
+    /// served instead. Does nothing when there is no trial, so call it on every start, once the
+    /// frontend got far enough that it could update itself again.
+    pub fn notify_ready(&self) -> Result<()> {
+        match assets::active() {
+            Some(bundle) => self.store.confirm(&bundle.version),
+            None => Ok(()),
+        }
+    }
+
+    /// Abandons the bundle being served, whether on trial or confirmed, without help from the
+    /// frontend: its version is rejected, the app switches to the last confirmed bundle or the
+    /// built-in frontend and the webviews are reloaded.
+    pub fn rollback(&self) -> Result<()> {
+        if let Some(bundle) = assets::active() {
+            assets::set_active(self.store.select(Some(&bundle.version)));
+            self.reload()?;
+        }
+        Ok(())
+    }
+
     /// Deletes every downloaded bundle and goes back to the built-in frontend, reloading the
     /// webviews if a bundle was being served.
     pub fn reset(&self) -> Result<()> {
-        self.store.clear();
+        self.store.clear()?;
         if assets::active().is_some() {
             assets::set_active(None);
             self.reload()?;
@@ -164,11 +197,28 @@ impl<R: Runtime> OtaUpdater<R> {
         Ok(())
     }
 
-    fn reload(&self) -> Result<()> {
+    /// Reloads every webview, which makes them load the frontend that is active now.
+    pub fn reload(&self) -> Result<()> {
         for window in self.app.webview_windows().values() {
             window.reload()?;
         }
         Ok(())
+    }
+
+    fn client(&self, timeout: Duration) -> Result<reqwest::Client> {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // can only fail if another thread installed one in the meantime, which is just as
+            // good
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+        Ok(reqwest::ClientBuilder::new()
+            .user_agent(USER_AGENT)
+            // covers redirects too
+            .https_only(!self.config.dangerous_insecure_transport_protocol)
+            .connect_timeout(STALL_TIMEOUT)
+            .read_timeout(STALL_TIMEOUT)
+            .timeout(timeout)
+            .build()?)
     }
 
     fn resolve_endpoint(&self, endpoint: &Url, current_version: &Version) -> Result<Url> {
@@ -191,16 +241,30 @@ impl<R: Runtime> OtaUpdater<R> {
     }
 }
 
-fn client(timeout: Option<Duration>) -> Result<reqwest::Client> {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        // can only fail if another thread installed one in the meantime, which is just as good
-        let _ = rustls::crypto::ring::default_provider().install_default();
+/// Reads a response body of at most `limit` bytes.
+async fn read_limited(
+    response: reqwest::Response,
+    what: &'static str,
+    limit: u64,
+    mut on_chunk: impl FnMut(usize),
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(Error::TooLarge(what, limit));
     }
-    let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
-    if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout);
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if (body.len() + chunk.len()) as u64 > limit {
+            return Err(Error::TooLarge(what, limit));
+        }
+        on_chunk(chunk.len());
+        body.extend_from_slice(&chunk);
     }
-    Ok(builder.build()?)
+    Ok(body)
 }
 
 fn target() -> &'static str {
@@ -269,17 +333,17 @@ impl<R: Runtime> Update<R> {
         if self.download_url.scheme() != "https"
             && !updater.config.dangerous_insecure_transport_protocol
         {
-            log::warn!(
-                "the frontend bundle URL {} does not use https; only its signature protects it",
-                self.download_url
-            );
+            return Err(Error::InsecureTransportProtocol(
+                self.download_url.to_string(),
+            ));
         }
 
         let mut headers = self.options.headers.clone();
         headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("application/octet-stream"));
-        let response = client(self.options.timeout)?
+        let response = updater
+            .client(self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT))?
             .get(self.download_url.clone())
             .headers(headers)
             .send()
@@ -287,13 +351,11 @@ impl<R: Runtime> Update<R> {
             .error_for_status()?;
 
         let content_length = response.content_length();
-        let mut archive = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            on_chunk(chunk.len(), content_length);
-            archive.extend_from_slice(&chunk);
-        }
+        let limit = updater.config.max_bundle_size;
+        let archive = read_limited(response, "bundle", limit, |chunk| {
+            on_chunk(chunk, content_length)
+        })
+        .await?;
         on_download_finish();
 
         updater
@@ -302,15 +364,26 @@ impl<R: Runtime> Update<R> {
         Ok(())
     }
 
-    /// Switches to the downloaded bundle and reloads every webview so it takes effect.
+    /// Switches to the downloaded bundle without touching the webviews: documents that are
+    /// already loaded keep running the old frontend, and whatever they or new windows request
+    /// from now on is served from the new one.
     ///
-    /// The bundle is verified again as it is loaded from disk.
-    pub fn install(&self) -> Result<()> {
-        let updater = self.app.ota_updater();
-        let bundle = updater.store.load(&self.version)?;
+    /// For apps that cannot be reloaded at an arbitrary moment. Finish or block the work that
+    /// must not be interrupted, call this, then reload or recreate each window (see
+    /// [`OtaUpdater::reload`]) before the old documents load more of their assets.
+    ///
+    /// The bundle is verified again as it is loaded from disk, and is on trial until
+    /// [`OtaUpdater::notify_ready`].
+    pub fn activate(&self) -> Result<()> {
+        let bundle = self.app.ota_updater().store.activate(&self.version)?;
         assets::set_active(Some(bundle));
-        updater.store.prune_older_than(&self.version);
-        updater.reload()
+        Ok(())
+    }
+
+    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    pub fn install(&self) -> Result<()> {
+        self.activate()?;
+        self.app.ota_updater().reload()
     }
 
     /// [`Self::download`] followed by [`Self::install`].

@@ -127,3 +127,8 @@ pub(crate) fn current_version<R: Runtime>(app: AppHandle<R>) -> String {
 pub(crate) async fn reset<R: Runtime>(app: AppHandle<R>) -> Result<()> {
     app.ota_updater().reset()
 }
+
+#[command]
+pub(crate) async fn notify_ready<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.ota_updater().notify_ready()
+}

@@ -46,9 +46,13 @@ fn b64(value: impl AsRef<[u8]>) -> String {
 
 /// A gzipped tarball with an `index.html` containing `index`, laid out like `tar -C dist .`.
 fn archive(index: &str) -> Vec<u8> {
+    archive_of(&[("./index.html", index), ("./assets/app.js", "js")])
+}
+
+fn archive_of(entries: &[(&str, &str)]) -> Vec<u8> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
-    for (path, contents) in [("./index.html", index), ("./assets/app.js", "js")] {
+    for &(path, contents) in entries {
         // written verbatim: `append_data` would normalize the leading `./` away, but the
         // `tar` command line tool keeps it
         let mut header = tar::Header::new_gnu();
@@ -121,6 +125,16 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
 }
 
 fn launch(data_dir: &Path, binary_version: &str, pubkey: &str, port: u16) -> App<MockRuntime> {
+    launch_with(data_dir, binary_version, pubkey, port, 64 << 20)
+}
+
+fn launch_with(
+    data_dir: &Path,
+    binary_version: &str,
+    pubkey: &str,
+    port: u16,
+    max_bundle_size: u64,
+) -> App<MockRuntime> {
     let mut context = mock_context(BuiltIn);
     context.package_info_mut().version = binary_version.parse().unwrap();
     context.config_mut().app.app_directories_override =
@@ -133,6 +147,7 @@ fn launch(data_dir: &Path, binary_version: &str, pubkey: &str, port: u16) -> App
             )],
             "pubkey": pubkey,
             "dangerousInsecureTransportProtocol": true,
+            "maxBundleSize": max_bundle_size,
         }),
     );
     tauri_plugin_ffp_ota_updater::install(&mut context);
@@ -227,6 +242,27 @@ fn frontend_update_lifecycle() {
         download("1.2.1", "corrupt.tar.gz", &v121_signature),
         Err(Error::Minisign(_))
     ));
+    // ...as are archives that are ambiguous about what they contain
+    for (file, entries) in [
+        (
+            "twice.tar.gz",
+            &[("./index.html", "a"), ("index.html", "b")][..],
+        ),
+        ("climbs.tar.gz", &[("./index.html", "a"), ("../x", "b")]),
+        ("absolute.tar.gz", &[("./index.html", "a"), ("/x", "b")]),
+        ("no-index.tar.gz", &[("./app.js", "a")]),
+    ] {
+        let bad = archive_of(entries);
+        let signature = sign(&key, &bad, Some("1.2.1"));
+        routes.lock().unwrap().insert(file, bad);
+        assert!(
+            matches!(
+                download("1.2.1", file, &signature),
+                Err(Error::InvalidBundle(_))
+            ),
+            "{file} was accepted"
+        );
+    }
     assert_eq!(std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0), 0);
 
     // a patch bump is a frontend update
@@ -255,8 +291,8 @@ fn frontend_update_lifecycle() {
     assert!(finished);
     assert_eq!(served_index(&app), "built-in");
 
-    // ...install swaps it in
-    update.install().unwrap();
+    // ...activate swaps it in, without reloading anything
+    update.activate().unwrap();
     assert_eq!(served_index(&app), "ota 1.2.1");
     assert!(app.asset_resolver().get("assets/app.js".into()).is_some());
     assert_eq!(updater.current_version().to_string(), "1.2.1");
@@ -269,6 +305,8 @@ fn frontend_update_lifecycle() {
             .unwrap()
             .ends_with("/1.2.0/1.2.1/ota.json")
     );
+    // the frontend reports that it works, which ends the trial
+    updater.notify_ready().unwrap();
     drop(app);
 
     // --- next launch: the newest valid bundle is picked up; a newer but tampered one and an
@@ -282,12 +320,69 @@ fn frontend_update_lifecycle() {
     assert!(!store.join("1.2.9.tar.gz.sig").exists());
     assert!(!store.join("1.2.0-rc.1.tar.gz").exists());
     assert!(store.join("1.2.1.tar.gz").exists());
+
+    // --- a bundle that is never confirmed is rolled back on the launch after its trial
+    let stage = |app: &App<MockRuntime>, version: &'static str, file: &'static str| {
+        let bundle = archive(&format!("ota {version}"));
+        let signature = sign(&key, &bundle, Some(version));
+        routes.lock().unwrap().insert(file, bundle);
+        publish(version, file, &signature);
+        let update = block_on(app.ota_updater().check())
+            .unwrap()
+            .expect("no update");
+        block_on(update.download(|_, _| {}, || {})).unwrap();
+        update
+    };
+    stage(&app, "1.2.2", "1.2.2.tar.gz");
+    std::fs::write(store.join("1.2.5.tar.gz.part"), "interrupted").unwrap();
+    drop(app);
+
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    assert_eq!(served_index(&app), "ota 1.2.2");
+    // the confirmed bundle is kept to fall back on
+    assert!(store.join("1.2.1.tar.gz").exists());
+    assert!(!store.join("1.2.5.tar.gz.part").exists());
+    drop(app); // without notify_ready
+
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "ota 1.2.1");
+    assert!(!store.join("1.2.2.tar.gz").exists());
+    // the rejected version is not offered again, the next one is
+    assert!(block_on(updater.check()).unwrap().is_none());
+
+    // --- a confirmed trial replaces the fallback
+    stage(&app, "1.2.3", "1.2.3.tar.gz").install().unwrap();
+    assert_eq!(served_index(&app), "ota 1.2.3");
+    assert!(store.join("1.2.1.tar.gz").exists());
+    updater.notify_ready().unwrap();
+    assert!(!store.join("1.2.1.tar.gz").exists());
+
+    // --- rollback from Rust abandons the served bundle, confirmed or not
+    stage(&app, "1.2.4", "1.2.4.tar.gz").install().unwrap();
+    assert_eq!(served_index(&app), "ota 1.2.4");
+    updater.rollback().unwrap();
+    assert_eq!(served_index(&app), "ota 1.2.3");
+    assert!(block_on(updater.check()).unwrap().is_none());
+    updater.rollback().unwrap();
+    assert_eq!(served_index(&app), "built-in");
+    drop(app);
+
+    // rejections survive a restart, and a stored copy of a rejected version is not used
+    std::fs::write(
+        store.join("1.2.4.tar.gz"),
+        routes.lock().unwrap()["1.2.4.tar.gz"].clone(),
+    )
+    .unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.2.4.tar.gz").exists());
+    assert!(block_on(app.ota_updater().check()).unwrap().is_none());
     drop(app);
 
     // --- after a full update the old bundle no longer applies and is removed
     let app = launch(data_dir.path(), "1.3.0", &pubkey, port);
     assert_eq!(served_index(&app), "built-in");
-    assert!(!store.join("1.2.1.tar.gz").exists());
 
     // --- reset goes back to the built-in frontend
     let v131 = archive("ota 1.3.1");
@@ -300,4 +395,44 @@ fn frontend_update_lifecycle() {
     updater.reset().unwrap();
     assert_eq!(served_index(&app), "built-in");
     assert!(!store.join("1.3.1.tar.gz").exists());
+
+    drop(app);
+    oversized_bundles_are_refused();
+}
+
+fn oversized_bundles_are_refused() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let bundle = archive("ota 1.2.1");
+    let manifest = serde_json::json!({
+        "version": "1.2.1",
+        "url": "http://127.0.0.1:1/unused",
+        "signature": sign(&key, &bundle, Some("1.2.1")),
+    });
+    let routes = Routes::default();
+    let port = serve(routes.clone(), Default::default());
+    let manifest = manifest
+        .to_string()
+        .replace(":1/unused", &format!(":{port}/bundle.tar.gz"));
+    routes.lock().unwrap().extend([
+        ("ota.json", manifest.into_bytes()),
+        ("bundle.tar.gz", bundle.clone()),
+    ]);
+
+    let app = launch_with(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        port,
+        bundle.len() as u64 - 1,
+    );
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    assert!(matches!(
+        block_on(update.download(|_, _| {}, || {})),
+        Err(Error::TooLarge("bundle", _))
+    ));
+    assert!(!data_dir.path().join("ffp-ota-updater").exists());
 }

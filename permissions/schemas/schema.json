@@ -355,6 +355,18 @@
           "markdownDescription": "Denies the install command without any pre-configured scope."
         },
         {
+          "description": "Enables the notify_ready command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-notify-ready",
+          "markdownDescription": "Enables the notify_ready command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the notify_ready command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-notify-ready",
+          "markdownDescription": "Denies the notify_ready command without any pre-configured scope."
+        },
+        {
           "description": "Enables the reset command without any pre-configured scope.",
           "type": "string",
           "const": "allow-reset",
@@ -367,10 +379,10 @@
           "markdownDescription": "Denies the reset command without any pre-configured scope."
         },
         {
-          "description": "Allows checking for, downloading and installing frontend (OTA) updates\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-reset`",
+          "description": "Allows checking for, downloading and installing frontend (OTA) updates\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-reset`\n- `allow-notify-ready`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Allows checking for, downloading and installing frontend (OTA) updates\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-reset`"
+          "markdownDescription": "Allows checking for, downloading and installing frontend (OTA) updates\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-reset`\n- `allow-notify-ready`"
         }
       ]
     }

@@ -13,7 +13,7 @@ pub struct Config {
     /// Minisign public key, as printed by `tauri signer generate`. The same key the updater
     /// plugin uses can be reused here.
     pub pubkey: String,
-    /// Allow non-`https` endpoints.
+    /// Allow non-`https` endpoints, bundle URLs and redirects.
     #[serde(alias = "dangerous-insecure-transport-protocol")]
     pub dangerous_insecure_transport_protocol: bool,
     /// Require the bundle signature to record the version it was signed for
@@ -21,6 +21,15 @@ pub struct Config {
     /// could pair a new version number with an older signed bundle.
     #[serde(alias = "require-signed-version")]
     pub require_signed_version: bool,
+    /// Revert a bundle the frontend does not confirm with `notifyReady()`. Defaults to `true`.
+    pub rollback: bool,
+    /// Largest bundle (the `.tar.gz`) accepted, in bytes. Defaults to 64 MiB.
+    #[serde(alias = "max-bundle-size")]
+    pub max_bundle_size: u64,
+    /// Largest total size of the files in a bundle, in bytes. They are held in memory.
+    /// Defaults to 256 MiB.
+    #[serde(alias = "max-unpacked-size")]
+    pub max_unpacked_size: u64,
 }
 
 impl Default for Config {
@@ -30,6 +39,9 @@ impl Default for Config {
             pubkey: String::new(),
             dangerous_insecure_transport_protocol: false,
             require_signed_version: true,
+            rollback: true,
+            max_bundle_size: 64 << 20,
+            max_unpacked_size: 256 << 20,
         }
     }
 }

@@ -10,6 +10,7 @@ Allows checking for, downloading and installing frontend (OTA) updates
 - `allow-download-and-install`
 - `allow-current-version`
 - `allow-reset`
+- `allow-notify-ready`
 
 ## Permission Table
 
@@ -146,6 +147,32 @@ Enables the install command without any pre-configured scope.
 <td>
 
 Denies the install command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-notify-ready`
+
+</td>
+<td>
+
+Enables the notify_ready command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-notify-ready`
+
+</td>
+<td>
+
+Denies the notify_ready command without any pre-configured scope.
 
 </td>
 </tr>

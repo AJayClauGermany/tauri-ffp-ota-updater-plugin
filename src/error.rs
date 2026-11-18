@@ -28,9 +28,10 @@ pub enum Error {
     /// No endpoints are configured under `plugins.ffp-ota-updater.endpoints`.
     #[error("no OTA update endpoints are configured")]
     EmptyEndpoints,
-    /// An endpoint is not `https` and `dangerousInsecureTransportProtocol` is not enabled.
+    /// An endpoint or bundle URL is not `https` and `dangerousInsecureTransportProtocol` is
+    /// not enabled.
     #[error(
-        "the OTA endpoint `{0}` does not use https; set `dangerousInsecureTransportProtocol` to allow it"
+        "the OTA URL `{0}` does not use https; set `dangerousInsecureTransportProtocol` to allow it"
     )]
     InsecureTransportProtocol(String),
     /// Every endpoint failed without a usable response.
@@ -50,6 +51,15 @@ pub enum Error {
     /// The archive is not a usable frontend bundle.
     #[error("invalid frontend bundle: {0}")]
     InvalidBundle(String),
+    /// A manifest or bundle exceeds its size limit, in bytes.
+    #[error("the {0} is larger than the limit of {1} bytes")]
+    TooLarge(&'static str, u64),
+    /// The bundle version is not a frontend-only update for this binary.
+    #[error("frontend version `{0}` is not compatible with this application version")]
+    Incompatible(String),
+    /// The version failed a trial or was rolled back before.
+    #[error("frontend version `{0}` was rejected earlier and will not be used again")]
+    Rejected(String),
     /// `download`/`install` was called for a version `check` did not return.
     #[error("no pending OTA update for version `{0}`; call `check` first")]
     NoPendingUpdate(String),
