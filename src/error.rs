@@ -1,4 +1,7 @@
-use serde::{Serialize, ser::Serializer};
+use serde::{
+    Serialize,
+    ser::{SerializeStruct, Serializer},
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -24,6 +27,8 @@ pub enum Error {
     #[error(transparent)]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error(transparent)]
+    Http(#[from] http::Error),
+    #[error(transparent)]
     UrlParse(#[from] url::ParseError),
     /// No endpoints are configured under `plugins.ffp-ota-updater.endpoints`.
     #[error("no OTA update endpoints are configured")]
@@ -34,7 +39,8 @@ pub enum Error {
         "the OTA URL `{0}` does not use https; set `dangerousInsecureTransportProtocol` to allow it"
     )]
     InsecureTransportProtocol(String),
-    /// Every endpoint failed without a usable response.
+    /// An endpoint answered, but none with a usable manifest. When no endpoint could be reached
+    /// at all (offline, say) the error is [`Error::Reqwest`] instead.
     #[error("could not fetch a valid OTA release manifest from any endpoint: {0}")]
     ReleaseNotFound(String),
     /// The public key or signature is not valid base64-encoded minisign text.
@@ -68,11 +74,46 @@ pub enum Error {
     NotDownloaded(String),
 }
 
+impl Error {
+    /// A stable, machine-readable name for what went wrong. This is the `kind` the webview
+    /// receives next to the message; several variants that an app would handle the same way
+    /// share one.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Tauri(_) => "tauri",
+            Self::Reqwest(_) => "network",
+            Self::Json(_) => "json",
+            Self::Semver(_) => "invalidVersion",
+            Self::Base64(_) | Self::Minisign(_) | Self::SignatureUtf8 => "signature",
+            Self::InvalidHeaderName(_) | Self::InvalidHeaderValue(_) | Self::Http(_) => {
+                "invalidHeader"
+            }
+            Self::UrlParse(_) => "invalidUrl",
+            Self::EmptyEndpoints => "emptyEndpoints",
+            Self::InsecureTransportProtocol(_) => "insecureTransportProtocol",
+            Self::ReleaseNotFound(_) => "releaseNotFound",
+            Self::MissingSignedVersion => "missingSignedVersion",
+            Self::SignedVersionMismatch { .. } => "signedVersionMismatch",
+            Self::InvalidBundle(_) => "invalidBundle",
+            Self::TooLarge(..) => "tooLarge",
+            Self::Incompatible(_) => "incompatible",
+            Self::Rejected(_) => "rejected",
+            Self::NoPendingUpdate(_) => "noPendingUpdate",
+            Self::NotDownloaded(_) => "notDownloaded",
+        }
+    }
+}
+
+/// Reaches the webview as `{ "kind": "...", "message": "..." }`.
 impl Serialize for Error {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.to_string().as_ref())
+        let mut error = serializer.serialize_struct("Error", 2)?;
+        error.serialize_field("kind", self.kind())?;
+        error.serialize_field("message", &self.to_string())?;
+        error.end()
     }
 }

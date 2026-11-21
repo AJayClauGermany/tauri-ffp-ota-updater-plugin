@@ -6,6 +6,8 @@ const COMMANDS: &[&str] = &[
     "current_version",
     "reset",
     "notify_ready",
+    "status",
+    "rollback",
 ];
 
 fn main() {

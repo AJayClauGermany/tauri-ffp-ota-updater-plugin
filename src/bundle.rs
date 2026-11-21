@@ -50,12 +50,14 @@ pub(crate) struct Limits {
 
 /// Decides whether a frontend bundle version may run on a given binary version.
 ///
-/// Receives `(binary_version, bundle_version)`.
-pub type VersionComparator = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
+/// Receives `(binary_version, bundle_version)`. Unlike the updater plugin's version comparator
+/// this does not decide whether a release is an update: a bundle also has to be newer than the
+/// frontend being served.
+pub type Compatibility = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
 
-/// The default [`VersionComparator`]: a bundle is frontend-only when it is a newer *patch*
+/// The default [`Compatibility`] rule: a bundle is frontend-only when it is a newer *patch*
 /// release of the binary (same major and minor). Anything else needs a full update.
-pub fn default_version_comparator(binary: &Version, bundle: &Version) -> bool {
+pub fn default_compatibility(binary: &Version, bundle: &Version) -> bool {
     bundle.major == binary.major && bundle.minor == binary.minor && bundle > binary
 }
 
@@ -226,7 +228,7 @@ pub(crate) struct Store {
     /// The bundle whose trial this run of the app already counts as an attempt of.
     pub shown: Mutex<Option<Version>>,
     pub binary: Version,
-    pub comparator: VersionComparator,
+    pub compatibility: Compatibility,
     /// Serializes everything that reads and then writes the state.
     pub lock: Mutex<()>,
 }
@@ -253,11 +255,26 @@ impl Store {
 
     /// Whether `version` is a frontend-only update for this binary.
     pub fn compatible(&self, version: &Version) -> bool {
-        (self.comparator)(&self.binary, version)
+        (self.compatibility)(&self.binary, version)
     }
 
     pub fn is_rejected(&self, version: &Version) -> bool {
         self.read_state().rejected.contains(version)
+    }
+
+    /// Versions that failed a trial or were rolled back, oldest first.
+    pub fn rejected(&self) -> Vec<Version> {
+        self.read_state().rejected.into_iter().collect()
+    }
+
+    /// The newest stored bundle that is newer than `current` and may be served, i.e. the one
+    /// the next launch would pick. Goes by the files present; nothing is verified.
+    pub fn staged(&self, current: &Version) -> Option<Version> {
+        let _guard = self.lock.lock().unwrap();
+        let state = self.read_state();
+        self.versions().into_iter().find(|version| {
+            version > current && self.compatible(version) && !state.rejected.contains(version)
+        })
     }
 
     /// Whether serving `version` is a trial, i.e. it still has to be confirmed.

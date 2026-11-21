@@ -6,6 +6,92 @@ export interface CheckOptions {
   headers?: HeadersInit
   /** Timeout in milliseconds, applied to each request. */
   timeout?: number
+  /** Proxy URL for the manifest request and the bundle download. */
+  proxy?: string
+}
+
+/**
+ * What went wrong, in a form that is safe to branch on. `network` means no
+ * endpoint or download host could be reached, which is what an offline device
+ * gets. More kinds may be added.
+ */
+export type OtaUpdateErrorKind =
+  | 'network'
+  | 'releaseNotFound'
+  | 'signature'
+  | 'missingSignedVersion'
+  | 'signedVersionMismatch'
+  | 'invalidBundle'
+  | 'tooLarge'
+  | 'incompatible'
+  | 'rejected'
+  | 'noPendingUpdate'
+  | 'notDownloaded'
+  | 'emptyEndpoints'
+  | 'insecureTransportProtocol'
+  | 'invalidHeader'
+  | 'invalidUrl'
+  | 'invalidVersion'
+  | 'io'
+  | 'json'
+  | 'tauri'
+  | 'unknown'
+
+/** The error every function of this module rejects with. */
+export class OtaUpdateError extends Error {
+  readonly kind: OtaUpdateErrorKind
+
+  constructor(kind: OtaUpdateErrorKind, message: string) {
+    super(message)
+    this.name = 'OtaUpdateError'
+    this.kind = kind
+  }
+}
+
+/** Where the updater stands, from {@link status}. */
+export interface Status {
+  /** Version of the application, i.e. of the frontend built into it. */
+  binaryVersion: string
+  /** Version of the frontend being served. */
+  currentVersion: string
+  /**
+   * `false` while the frontend being served is a downloaded bundle that has
+   * not called {@link notifyReady} yet, and is reverted if it never does.
+   */
+  confirmed: boolean
+  /**
+   * A downloaded bundle that is newer than the one being served. The next
+   * launch switches to it.
+   */
+  staged?: string
+  /**
+   * Versions that failed their trial or were rolled back, oldest first. They
+   * are not offered again.
+   */
+  rejected: string[]
+}
+
+async function call<T>(
+  command: string,
+  args?: Record<string, unknown>
+): Promise<T> {
+  try {
+    return await invoke<T>(`plugin:ffp-ota-updater|${command}`, args)
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'kind' in error &&
+      'message' in error
+    ) {
+      throw new OtaUpdateError(
+        error.kind as OtaUpdateErrorKind,
+        String(error.message)
+      )
+    }
+    // not from the plugin: a denied permission, for instance
+    throw new OtaUpdateError('unknown', String(error))
+  }
 }
 
 /** Download progress events, identical to the updater plugin's. */
@@ -15,7 +101,6 @@ export type DownloadEvent =
   | { event: 'Finished' }
 
 interface UpdateMetadata {
-  kind: 'frontend'
   currentVersion: string
   version: string
   downloaded: boolean
@@ -64,7 +149,7 @@ export class Update {
    * fetched and only the `Finished` event is sent.
    */
   async download(onEvent?: (progress: DownloadEvent) => void): Promise<void> {
-    await invoke('plugin:ffp-ota-updater|download', {
+    await call('download', {
       version: this.version,
       onEvent: channel(onEvent),
     })
@@ -77,14 +162,14 @@ export class Update {
    * call {@link notifyReady} or it is reverted.
    */
   async install(): Promise<void> {
-    await invoke('plugin:ffp-ota-updater|install', { version: this.version })
+    await call('install', { version: this.version })
   }
 
   /** {@link download} followed by {@link install}. */
   async downloadAndInstall(
     onEvent?: (progress: DownloadEvent) => void
   ): Promise<void> {
-    await invoke('plugin:ffp-ota-updater|download_and_install', {
+    await call('download_and_install', {
       version: this.version,
       onEvent: channel(onEvent),
     })
@@ -104,15 +189,13 @@ function channel(onEvent?: (progress: DownloadEvent) => void) {
  * the published release needs a full application update instead.
  */
 export async function check(options?: CheckOptions): Promise<Update | null> {
-  const metadata = await invoke<UpdateMetadata | null>(
-    'plugin:ffp-ota-updater|check',
-    {
-      headers: options?.headers
-        ? Array.from(new Headers(options.headers).entries())
-        : undefined,
-      timeout: options?.timeout,
-    }
-  )
+  const metadata = await call<UpdateMetadata | null>('check', {
+    headers: options?.headers
+      ? Array.from(new Headers(options.headers).entries())
+      : undefined,
+    timeout: options?.timeout,
+    proxy: options?.proxy,
+  })
   return metadata ? new Update(metadata) : null
 }
 
@@ -121,15 +204,40 @@ export async function check(options?: CheckOptions): Promise<Update | null> {
  * else the application's.
  */
 export async function currentVersion(): Promise<string> {
-  return await invoke('plugin:ffp-ota-updater|current_version')
+  return await call('current_version')
+}
+
+/**
+ * What is being served and whether it is confirmed, what is staged for the
+ * next launch and which versions were rolled back. Makes no request, so it
+ * works offline.
+ */
+export async function status(): Promise<Status> {
+  return await call('status')
+}
+
+/**
+ * Abandons the frontend being served: its version is rejected for good and
+ * the app reloads into the last confirmed bundle, or else the built-in
+ * frontend. For a frontend that notices it is broken. Does nothing when the
+ * built-in frontend is being served.
+ *
+ * Not part of the default permission set: grant
+ * `ffp-ota-updater:allow-rollback`.
+ */
+export async function rollback(): Promise<void> {
+  await call('rollback')
 }
 
 /**
  * Deletes every downloaded bundle and goes back to the frontend built into the
  * application, reloading if a downloaded one was active.
+ *
+ * Not part of the default permission set: grant
+ * `ffp-ota-updater:allow-reset`.
  */
 export async function reset(): Promise<void> {
-  await invoke('plugin:ffp-ota-updater|reset')
+  await call('reset')
 }
 
 /**
@@ -142,5 +250,5 @@ export async function reset(): Promise<void> {
  * `"rollback": false`.
  */
 export async function notifyReady(): Promise<void> {
-  await invoke('plugin:ffp-ota-updater|notify_ready')
+  await call('notify_ready')
 }

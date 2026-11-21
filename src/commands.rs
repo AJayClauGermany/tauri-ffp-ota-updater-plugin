@@ -3,12 +3,13 @@ use std::{str::FromStr, time::Duration};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use tauri::{AppHandle, Runtime, command, ipc::Channel};
+use url::Url;
 
-use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Update};
+use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Status, Update};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
-pub enum DownloadEvent {
+pub(crate) enum DownloadEvent {
     #[serde(rename_all = "camelCase")]
     Started {
         content_length: Option<u64>,
@@ -23,7 +24,6 @@ pub enum DownloadEvent {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Metadata {
-    kind: &'static str,
     current_version: String,
     version: String,
     downloaded: bool,
@@ -69,10 +69,14 @@ pub(crate) async fn check<R: Runtime>(
     app: AppHandle<R>,
     headers: Option<Vec<(String, String)>>,
     timeout: Option<u64>,
+    proxy: Option<Url>,
 ) -> Result<Option<Metadata>> {
     let mut options = RequestOptions {
         headers: HeaderMap::new(),
         timeout: timeout.map(Duration::from_millis),
+        proxy,
+        // where updates come from is not the webview's to decide
+        endpoints: None,
     };
     for (name, value) in headers.unwrap_or_default() {
         options
@@ -83,7 +87,6 @@ pub(crate) async fn check<R: Runtime>(
     let updater = app.ota_updater();
     let update = updater.check_with(options).await?;
     let metadata = update.as_ref().map(|update| Metadata {
-        kind: "frontend",
         current_version: update.current_version.to_string(),
         version: update.version.to_string(),
         downloaded: update.downloaded,
@@ -133,4 +136,14 @@ pub(crate) async fn reset<R: Runtime>(app: AppHandle<R>) -> Result<()> {
 #[command]
 pub(crate) async fn notify_ready<R: Runtime>(app: AppHandle<R>) -> Result<()> {
     app.ota_updater().notify_ready()
+}
+
+#[command]
+pub(crate) fn status<R: Runtime>(app: AppHandle<R>) -> Status {
+    app.ota_updater().status()
+}
+
+#[command]
+pub(crate) async fn rollback<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.ota_updater().rollback()
 }
