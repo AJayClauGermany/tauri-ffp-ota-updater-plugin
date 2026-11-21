@@ -1,6 +1,7 @@
 use std::{str::FromStr, time::Duration};
 
 use http::{HeaderMap, HeaderName, HeaderValue};
+use semver::Version;
 use serde::Serialize;
 use tauri::{AppHandle, Runtime, command, ipc::Channel};
 use url::Url;
@@ -32,14 +33,18 @@ pub(crate) struct Metadata {
     raw_json: serde_json::Value,
 }
 
-/// The update `check` last returned to the webview, if it is for `version`.
+fn parse(version: &str) -> Result<Version> {
+    Ok(Version::parse(version.trim_start_matches('v'))?)
+}
+
+/// The update for `version` that a `check` returned to the webview.
 fn pending<R: Runtime>(app: &AppHandle<R>, version: &str) -> Result<Update<R>> {
     app.ota_updater()
         .pending
         .lock()
         .unwrap()
-        .clone()
-        .filter(|update| update.version.to_string() == version)
+        .get(&parse(version)?)
+        .cloned()
         .ok_or_else(|| Error::NoPendingUpdate(version.to_string()))
 }
 
@@ -71,12 +76,12 @@ pub(crate) async fn check<R: Runtime>(
     timeout: Option<u64>,
     proxy: Option<Url>,
 ) -> Result<Option<Metadata>> {
+    // no endpoints: where updates come from is not the webview's to decide
     let mut options = RequestOptions {
         headers: HeaderMap::new(),
         timeout: timeout.map(Duration::from_millis),
         proxy,
-        // where updates come from is not the webview's to decide
-        endpoints: None,
+        ..Default::default()
     };
     for (name, value) in headers.unwrap_or_default() {
         options
@@ -94,7 +99,14 @@ pub(crate) async fn check<R: Runtime>(
         body: update.body.clone(),
         raw_json: update.raw_json.clone(),
     });
-    *updater.pending.lock().unwrap() = update;
+    if let Some(update) = update {
+        // Kept until that version is being served, whatever later checks return: the page may
+        // still hold the object it got for it.
+        let current = updater.current_version();
+        let mut pending = updater.pending.lock().unwrap();
+        pending.retain(|version, _| *version > current);
+        pending.insert(update.version.clone(), update);
+    }
     Ok(metadata)
 }
 
@@ -109,7 +121,13 @@ pub(crate) async fn download<R: Runtime>(
 
 #[command]
 pub(crate) async fn install<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
-    pending(&app, &version)?.install()
+    // by version alone: a bundle staged in an earlier run needs no `check` to be installed
+    app.ota_updater().install(&parse(&version)?)
+}
+
+#[command]
+pub(crate) async fn discard<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
+    app.ota_updater().discard(&parse(&version)?)
 }
 
 #[command]

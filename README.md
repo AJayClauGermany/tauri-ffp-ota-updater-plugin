@@ -18,7 +18,8 @@ keys, same signing keys and `tauri signer` tooling, same manifest fields, same
 | Applies | after restart | on webview reload, or on next launch |
 | Default scope | any newer version | newer **patch** versions of the installed binary |
 
-Desktop only (Windows, macOS, Linux) for now.
+Desktop only (Windows, macOS, Linux), like the updater plugin: register it
+under `#[cfg(desktop)]` in an app that also builds for Android or iOS.
 
 ## How it works
 
@@ -95,7 +96,7 @@ Grant the permission in a capability file:
 ```
 
 `default` covers `check`, `download`, `install`, `downloadAndInstall`,
-`currentVersion`, `notifyReady` and `status`. The two calls that discard a
+`discard`, `currentVersion`, `notifyReady` and `status`. The two calls that discard a
 frontend, `rollback()` and `reset()`, are opt-in: add
 `ffp-ota-updater:allow-rollback` and/or `ffp-ota-updater:allow-reset`.
 
@@ -132,10 +133,7 @@ use tauri_plugin_ffp_ota_updater::{OtaUpdaterExt, RequestOptions};
 
 let update = app
     .ota_updater()
-    .check_with(RequestOptions {
-        endpoints: Some(vec![beta_url]),
-        ..Default::default()
-    })
+    .check_with(RequestOptions::new().endpoints(vec![beta_url]))
     .await?;
 ```
 
@@ -270,6 +268,20 @@ if (rejected.length) report(`rolled back: ${rejected.join(", ")}`);
 the versions that were rolled back. In Rust the same is
 `app.ota_updater().status()`.
 
+A staged bundle is addressed by its version, without another `check()`:
+
+```js
+import { install, discard } from "tauri-plugin-ffp-ota-updater-api";
+
+await install(staged);   // switch to it now (reloads), also when offline
+await discard(staged);   // or delete it: the user declined this update
+```
+
+Without `discard()` a downloaded bundle is used at the next launch whatever
+happened since. Discarding is not a rejection: `check()` offers the version
+again. The bundle being served and the confirmed one behind it cannot be
+discarded (`inUse`).
+
 Also available: `currentVersion()` (version of the frontend being served),
 `rollback()` (see [Rollback](#rollback)) and `reset()` (delete downloaded
 bundles and go back to the built-in frontend).
@@ -288,6 +300,25 @@ if let Some(update) = app.ota_updater().check().await? {
     update.download_and_install(|_chunk, _total| {}, || {}).await?;
 }
 ```
+
+### Bringing your own bundles
+
+`check()` and `download()` are one way to fill the bundle store, not the only
+one. From Rust, hand the plugin an archive and its signature that you got by
+other means: your own manifest format or transport, a release API, a file
+shipped next to the installer, a patch applied to the previous archive.
+
+```rust
+let updater = app.ota_updater();
+updater.stage(&archive, &signature, &version)?;  // verified, then stored
+updater.install(&version)?;                      // or leave it for the next launch
+```
+
+`stage` applies every check a download gets (signature, signed version,
+compatibility, size limits, archive contents) and nothing else about the
+bundle is trusted. `activate(&version)`, `install(&version)` and
+`discard(&version)` work on any stored bundle. Versions only move forward: a
+version older than the frontend being served is refused (`NotNewer`).
 
 ### Rollback
 
@@ -432,6 +463,26 @@ tauri_plugin_updater::Builder::new()
 ```
 
 A patch release must then never contain Rust changes.
+
+## Stability
+
+From 1.0 on these are covered by semantic versioning, in addition to the Rust
+and JavaScript APIs:
+
+- the configuration keys and the manifest fields (`version`, `notes`,
+  `pub_date`, `url`, `signature`), the bundle format (a `.tar.gz` of the
+  frontend, signed with `tauri signer`) and the endpoint variables;
+- the command names and their permissions, and which of them `default`
+  grants;
+- the `kind` strings of errors. New kinds may appear in minor releases, so
+  keep a fallback branch;
+- the store in the app's local data directory
+  (`ffp-ota-updater/<version>.tar.gz`, `.tar.gz.sig` and `state.json`): a
+  newer plugin version reads what an older one wrote.
+
+`reqwest` and `http` types are part of the Rust API (`configure_client`,
+headers, `Error`), so a new major version of either is a new major version of
+this crate.
 
 ## Limitations
 

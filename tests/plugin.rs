@@ -269,10 +269,7 @@ fn frontend_update_lifecycle() {
 
     // an endpoint that cannot be reached is told apart from one that has no usable manifest
     let check_at = |url: String| {
-        block_on(updater.check_with(RequestOptions {
-            endpoints: Some(vec![url.parse().unwrap()]),
-            ..Default::default()
-        }))
+        block_on(updater.check_with(RequestOptions::new().endpoints(vec![url.parse().unwrap()])))
     };
     let unreachable = check_at("http://127.0.0.1:1/ota.json".into())
         .err()
@@ -310,7 +307,7 @@ fn frontend_update_lifecycle() {
     ));
     assert!(matches!(
         download("1.2.1", "corrupt.tar.gz", &v121_signature),
-        Err(Error::Minisign(_))
+        Err(Error::InvalidSignature(_))
     ));
     // ...as are archives that are ambiguous about what they contain
     for (file, entries) in [
@@ -528,6 +525,87 @@ fn frontend_update_lifecycle() {
     unconfirmed_bundles_time_out();
     trial_attempts_are_configurable();
     builder_overrides_the_configuration();
+    bundles_are_staged_applied_and_discarded_without_a_check();
+}
+
+/// The store on its own: the app brings the bundles, and no endpoint is ever asked.
+fn bundles_are_staged_applied_and_discarded_without_a_check() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let v = |version: &str| Version::parse(version).unwrap();
+    let bundle = |version: &str| {
+        let archive = archive(&format!("own {version}"));
+        let signature = sign(&key, &archive, Some(version));
+        (archive, signature)
+    };
+    // port 1: nothing listens there
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+
+    // staging verifies like a download does
+    let (v121, v121_signature) = bundle("1.2.1");
+    assert!(matches!(
+        updater.stage(&v121, &v121_signature, &v("1.2.2")),
+        Err(Error::SignedVersionMismatch { .. })
+    ));
+    assert!(matches!(
+        updater.stage(&archive("tampered"), &v121_signature, &v("1.2.1")),
+        Err(Error::InvalidSignature(_))
+    ));
+    let (v130, v130_signature) = bundle("1.3.0");
+    assert!(matches!(
+        updater.stage(&v130, &v130_signature, &v("1.3.0")),
+        Err(Error::Incompatible(_))
+    ));
+    assert!(!store.exists());
+    assert!(matches!(
+        updater.install(&v("1.2.1")),
+        Err(Error::NotDownloaded(_))
+    ));
+
+    updater.stage(&v121, &v121_signature, &v("1.2.1")).unwrap();
+    assert_eq!(updater.status().staged, Some(v("1.2.1")));
+    assert_eq!(served_index(&app), "built-in");
+
+    // a staged bundle can be dropped again, which is not a rejection
+    updater.discard(&v("1.2.1")).unwrap();
+    assert_eq!(updater.status().staged, None);
+    assert!(!store.join("1.2.1.tar.gz").exists());
+    assert!(!store.join("1.2.1.tar.gz.sig").exists());
+    updater.discard(&v("1.2.1")).unwrap();
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "built-in");
+
+    // ...and is applied by its version alone
+    updater.stage(&v121, &v121_signature, &v("1.2.1")).unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.notify_ready().unwrap();
+
+    // what is in use stays: the bundle being served and the confirmed one behind a trial
+    assert!(matches!(updater.discard(&v("1.2.1")), Err(Error::InUse(_))));
+    let (v122, v122_signature) = bundle("1.2.2");
+    updater.stage(&v122, &v122_signature, &v("1.2.2")).unwrap();
+    updater.activate(&v("1.2.2")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.2");
+    for version in ["1.2.1", "1.2.2"] {
+        assert!(matches!(updater.discard(&v(version)), Err(Error::InUse(_))));
+    }
+    // versions only move forward
+    assert!(matches!(
+        updater.stage(&v121, &v121_signature, &v("1.2.1")),
+        Err(Error::NotNewer(_))
+    ));
+    assert!(matches!(
+        updater.activate(&v("1.2.1")),
+        Err(Error::NotNewer(_))
+    ));
+    assert_eq!(served_index(&app), "own 1.2.2");
+    updater.reset().unwrap();
 }
 
 fn builder_overrides_the_configuration() {
@@ -584,10 +662,9 @@ fn builder_overrides_the_configuration() {
     );
 
     // a header given to one check replaces the builder's of that name
-    let mut options = RequestOptions::default();
-    options
-        .headers
-        .insert("x-channel", "nightly".parse().unwrap());
+    let options = RequestOptions::new()
+        .header("x-channel", "nightly")
+        .unwrap();
     assert!(block_on(updater.check_with(options)).unwrap().is_none());
     assert_eq!(
         requests.lock().unwrap().last().unwrap(),

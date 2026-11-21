@@ -159,6 +159,7 @@ impl Builder {
                 commands::notify_ready,
                 commands::status,
                 commands::rollback,
+                commands::discard,
             ])
             .setup(move |app, api| {
                 let mut config = api.config().clone().unwrap_or_default();
@@ -202,7 +203,7 @@ impl Builder {
                     client: self.client,
                     store,
                     binary_version,
-                    pending: Mutex::new(None),
+                    pending: Default::default(),
                     downloading: Default::default(),
                 };
                 updater.serve(updater.store.select(None));

@@ -319,6 +319,18 @@
           "markdownDescription": "Denies the current_version command without any pre-configured scope."
         },
         {
+          "description": "Enables the discard command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-discard",
+          "markdownDescription": "Enables the discard command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the discard command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-discard",
+          "markdownDescription": "Denies the discard command without any pre-configured scope."
+        },
+        {
           "description": "Enables the download command without any pre-configured scope.",
           "type": "string",
           "const": "allow-download",
@@ -403,10 +415,10 @@
           "markdownDescription": "Denies the status command without any pre-configured scope."
         },
         {
-          "description": "Allows checking for, downloading and installing frontend (OTA) updates, confirming them and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-notify-ready`\n- `allow-status`",
+          "description": "Allows checking for, downloading and installing frontend (OTA) updates, confirming them, discarding a staged one and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-notify-ready`\n- `allow-status`\n- `allow-discard`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Allows checking for, downloading and installing frontend (OTA) updates, confirming them and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-notify-ready`\n- `allow-status`"
+          "markdownDescription": "Allows checking for, downloading and installing frontend (OTA) updates, confirming them, discarding a staged one and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`\n- `allow-current-version`\n- `allow-notify-ready`\n- `allow-status`\n- `allow-discard`"
         }
       ]
     }

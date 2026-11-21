@@ -61,6 +61,17 @@ run(async () => {
   await plugin("notify_ready");
   const status = await plugin("status");
   $("version").textContent = status.currentVersion;
-  if (status.staged) log(`${status.staged} is downloaded and will be used at the next launch.`);
+  if (status.staged) {
+    log(`${status.staged} is downloaded and will be used at the next launch.`);
+    $("apply").disabled = $("discard").disabled = false;
+    // by version alone: no check, so this works offline
+    $("apply").onclick = () => run(() => plugin("install", { version: status.staged }));
+    $("discard").onclick = () =>
+      run(async () => {
+        await plugin("discard", { version: status.staged });
+        $("apply").disabled = $("discard").disabled = true;
+        log(`Discarded ${status.staged}.`);
+      });
+  }
   if (status.rejected.length) log(`Rolled back earlier: ${status.rejected.join(", ")}`);
 });

@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use futures_util::StreamExt;
-use http::{HeaderMap, HeaderValue, StatusCode, header::ACCEPT};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::ACCEPT};
 use percent_encoding::{AsciiSet, CONTROLS};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -53,7 +54,15 @@ fn parse_version<'de, D: Deserializer<'de>>(
 
 /// Per-request options for [`OtaUpdater::check_with`]. What is left unset falls back to the
 /// [`Builder`](crate::Builder)'s setting.
+///
+/// ```
+/// # use tauri_plugin_ffp_ota_updater::RequestOptions;
+/// let options = RequestOptions::new()
+///     .endpoints(vec!["https://releases.example.com/beta/ota.json".parse().unwrap()])
+///     .timeout(std::time::Duration::from_secs(20));
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RequestOptions {
     /// Manifest URLs to query instead of the configured ones, in order. This is how an app
     /// switches release channels while it is running.
@@ -65,6 +74,45 @@ pub struct RequestOptions {
     pub timeout: Option<Duration>,
     /// Proxy for the manifest request and the bundle download.
     pub proxy: Option<Url>,
+}
+
+impl RequestOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`Self::endpoints`].
+    pub fn endpoints(mut self, endpoints: Vec<Url>) -> Self {
+        self.endpoints = Some(endpoints);
+        self
+    }
+
+    /// Adds a header to [`Self::headers`], replacing one of the same name.
+    pub fn header<K, V>(mut self, key: K, value: V) -> Result<Self>
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
+        let value: std::result::Result<HeaderValue, http::Error> =
+            value.try_into().map_err(Into::into);
+        self.headers.insert(key?, value?);
+        Ok(self)
+    }
+
+    /// Sets [`Self::timeout`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets [`Self::proxy`].
+    pub fn proxy(mut self, proxy: Url) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
 }
 
 /// What the [`Builder`](crate::Builder) sets for every request.
@@ -92,8 +140,9 @@ pub struct Status {
     /// `false` while the frontend being served is a downloaded bundle that still has to be
     /// confirmed with `notify_ready`, and would be rolled back otherwise.
     pub confirmed: bool,
-    /// A downloaded bundle newer than the one being served, which the next launch (or
-    /// [`Update::install`]) switches to. It is verified only when it is loaded.
+    /// A stored bundle newer than the one being served, which the next launch (or
+    /// [`OtaUpdater::install`]) switches to and [`OtaUpdater::discard`] removes. It is verified
+    /// only when it is loaded.
     pub staged: Option<Version>,
     /// Versions that failed their trial or were rolled back, oldest first. They are not
     /// offered or served again. The record is dropped once a full update makes them
@@ -108,8 +157,8 @@ pub struct OtaUpdater<R: Runtime> {
     pub(crate) client: ClientOptions,
     pub(crate) store: Store,
     pub(crate) binary_version: Version,
-    /// The release the last successful `check` from the webview returned.
-    pub(crate) pending: Mutex<Option<Update<R>>>,
+    /// The releases `check` returned to the webview, which holds on to them by version only.
+    pub(crate) pending: Mutex<HashMap<Version, Update<R>>>,
     /// Held for the length of a download, so that concurrent requests for the same bundle
     /// (two windows, or two pages of a multi-page app in a row) fetch it once.
     pub(crate) downloading: tauri::async_runtime::Mutex<()>,
@@ -256,6 +305,55 @@ impl<R: Runtime> OtaUpdater<R> {
             signature: release.signature,
             options,
         }))
+    }
+
+    /// Verifies and stores a bundle that the app obtained by its own means: another transport
+    /// or manifest format, a file shipped with the installer, a patch applied to the previous
+    /// archive. The checks are those of [`Update::download`]: `signature` (the content of the
+    /// `.sig` file) has to be this app's key signing exactly `archive`, for `version`, and the
+    /// version has to be compatible with the binary and not rejected.
+    ///
+    /// The bundle is then staged like a downloaded one: served from the next launch on, or at
+    /// once with [`Self::install`].
+    pub fn stage(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
+        if *version < self.current_version() {
+            return Err(Error::NotNewer(version.to_string()));
+        }
+        self.store.save(archive, signature, version)
+    }
+
+    /// Switches to the stored bundle `version` without touching the webviews: documents that
+    /// are already loaded keep running the old frontend, and whatever they or new windows
+    /// request from now on is served from the new one. No request is made, so a bundle staged
+    /// earlier (see [`Status::staged`]) can be applied offline.
+    ///
+    /// For apps that cannot be reloaded at an arbitrary moment. Finish or block the work that
+    /// must not be interrupted, call this, then reload or recreate each window (see
+    /// [`Self::reload`]) before the old documents load more of their assets.
+    ///
+    /// The bundle is verified again as it is loaded from disk, and is on trial from the first
+    /// page loaded from it until [`Self::notify_ready`].
+    pub fn activate(&self, version: &Version) -> Result<()> {
+        if *version < self.current_version() {
+            return Err(Error::NotNewer(version.to_string()));
+        }
+        self.serve(Some(self.store.activate(version)?));
+        Ok(())
+    }
+
+    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    pub fn install(&self, version: &Version) -> Result<()> {
+        self.activate(version)?;
+        self.reload()
+    }
+
+    /// Deletes the stored bundle `version` so that it is not served at the next launch, for an
+    /// update the user declined or the app decided to skip. The version is not rejected and
+    /// can be downloaded again. Fails with [`Error::InUse`] for the bundle being served and
+    /// for the confirmed one kept as the fallback; does nothing if the version is not stored.
+    pub fn discard(&self, version: &Version) -> Result<()> {
+        let serving = assets::active().map(|bundle| bundle.version.clone());
+        self.store.discard(version, serving.as_ref())
     }
 
     /// Tells the updater that the frontend being served works.
@@ -537,26 +635,14 @@ impl<R: Runtime> Update<R> {
         Ok(())
     }
 
-    /// Switches to the downloaded bundle without touching the webviews: documents that are
-    /// already loaded keep running the old frontend, and whatever they or new windows request
-    /// from now on is served from the new one.
-    ///
-    /// For apps that cannot be reloaded at an arbitrary moment. Finish or block the work that
-    /// must not be interrupted, call this, then reload or recreate each window (see
-    /// [`OtaUpdater::reload`]) before the old documents load more of their assets.
-    ///
-    /// The bundle is verified again as it is loaded from disk, and is on trial from the first
-    /// page loaded from it until [`OtaUpdater::notify_ready`].
+    /// [`OtaUpdater::activate`] for this update, once it is downloaded.
     pub fn activate(&self) -> Result<()> {
-        let updater = self.app.ota_updater();
-        updater.serve(Some(updater.store.activate(&self.version)?));
-        Ok(())
+        self.app.ota_updater().activate(&self.version)
     }
 
-    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    /// [`OtaUpdater::install`] for this update, once it is downloaded.
     pub fn install(&self) -> Result<()> {
-        self.activate()?;
-        self.app.ota_updater().reload()
+        self.app.ota_updater().install(&self.version)
     }
 
     /// [`Self::download`] followed by [`Self::install`].

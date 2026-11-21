@@ -27,6 +27,8 @@ export type OtaUpdateErrorKind =
   | 'rejected'
   | 'noPendingUpdate'
   | 'notDownloaded'
+  | 'notNewer'
+  | 'inUse'
   | 'emptyEndpoints'
   | 'insecureTransportProtocol'
   | 'invalidHeader'
@@ -61,7 +63,8 @@ export interface Status {
   confirmed: boolean
   /**
    * A downloaded bundle that is newer than the one being served. The next
-   * launch switches to it.
+   * launch switches to it; {@link install} does so now and {@link discard}
+   * deletes it.
    */
   staged?: string
   /**
@@ -162,7 +165,7 @@ export class Update {
    * call {@link notifyReady} or it is reverted.
    */
   async install(): Promise<void> {
-    await call('install', { version: this.version })
+    await install(this.version)
   }
 
   /** {@link download} followed by {@link install}. */
@@ -214,6 +217,25 @@ export async function currentVersion(): Promise<string> {
  */
 export async function status(): Promise<Status> {
   return await call('status')
+}
+
+/**
+ * Switches to the stored bundle `version` now by reloading the app's
+ * webviews, like {@link Update.install}, but without a {@link check}: a bundle
+ * that {@link status} reports as `staged` can be applied offline.
+ */
+export async function install(version: string): Promise<void> {
+  await call('install', { version })
+}
+
+/**
+ * Deletes the stored bundle `version` so that the next launch does not switch
+ * to it, for an update the user declined. The version can be downloaded
+ * again. Rejects with kind `inUse` for the bundle being served and for the
+ * confirmed one kept to fall back on.
+ */
+export async function discard(version: string): Promise<void> {
+  await call('discard', { version })
 }
 
 /**

@@ -19,10 +19,6 @@ pub enum Error {
     #[error(transparent)]
     Semver(#[from] semver::Error),
     #[error(transparent)]
-    Base64(#[from] base64::DecodeError),
-    #[error(transparent)]
-    Minisign(#[from] minisign_verify::Error),
-    #[error(transparent)]
     InvalidHeaderName(#[from] http::header::InvalidHeaderName),
     #[error(transparent)]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
@@ -43,9 +39,10 @@ pub enum Error {
     /// at all (offline, say) the error is [`Error::Reqwest`] instead.
     #[error("could not fetch a valid OTA release manifest from any endpoint: {0}")]
     ReleaseNotFound(String),
-    /// The public key or signature is not valid base64-encoded minisign text.
-    #[error("the public key or signature is not valid UTF-8 after base64 decoding")]
-    SignatureUtf8,
+    /// The public key or the signature cannot be read, or the signature is not one of this
+    /// key for this bundle.
+    #[error("the bundle signature is not valid: {0}")]
+    InvalidSignature(String),
     /// `requireSignedVersion` is on and the signature carries no version.
     #[error(
         "the signature does not record a version; sign with `tauri signer sign --app-version <version>` or disable `requireSignedVersion`"
@@ -69,6 +66,14 @@ pub enum Error {
     /// `download`/`install` was called for a version `check` did not return.
     #[error("no pending OTA update for version `{0}`; call `check` first")]
     NoPendingUpdate(String),
+    /// The version is older than the frontend being served. Versions only move forward; to go
+    /// back, roll back or publish the older build under a new version.
+    #[error("frontend version `{0}` is older than the one being served")]
+    NotNewer(String),
+    /// The bundle is being served, or is the confirmed one kept to fall back on, and cannot be
+    /// discarded.
+    #[error("the frontend bundle for version `{0}` is in use")]
+    InUse(String),
     /// `install` was called before the bundle was downloaded.
     #[error("the frontend bundle for version `{0}` has not been downloaded")]
     NotDownloaded(String),
@@ -85,7 +90,7 @@ impl Error {
             Self::Reqwest(_) => "network",
             Self::Json(_) => "json",
             Self::Semver(_) => "invalidVersion",
-            Self::Base64(_) | Self::Minisign(_) | Self::SignatureUtf8 => "signature",
+            Self::InvalidSignature(_) => "signature",
             Self::InvalidHeaderName(_) | Self::InvalidHeaderValue(_) | Self::Http(_) => {
                 "invalidHeader"
             }
@@ -100,6 +105,8 @@ impl Error {
             Self::Incompatible(_) => "incompatible",
             Self::Rejected(_) => "rejected",
             Self::NoPendingUpdate(_) => "noPendingUpdate",
+            Self::NotNewer(_) => "notNewer",
+            Self::InUse(_) => "inUse",
             Self::NotDownloaded(_) => "notDownloaded",
         }
     }

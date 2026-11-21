@@ -1,6 +1,6 @@
 ## Default Permission
 
-Allows checking for, downloading and installing frontend (OTA) updates, confirming them and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.
+Allows checking for, downloading and installing frontend (OTA) updates, confirming them, discarding a staged one and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.
 
 #### This default permission set includes the following:
 
@@ -11,6 +11,7 @@ Allows checking for, downloading and installing frontend (OTA) updates, confirmi
 - `allow-current-version`
 - `allow-notify-ready`
 - `allow-status`
+- `allow-discard`
 
 ## Permission Table
 
@@ -69,6 +70,32 @@ Enables the current_version command without any pre-configured scope.
 <td>
 
 Denies the current_version command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-discard`
+
+</td>
+<td>
+
+Enables the discard command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-discard`
+
+</td>
+<td>
+
+Denies the discard command without any pre-configured scope.
 
 </td>
 </tr>

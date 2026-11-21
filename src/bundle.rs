@@ -170,9 +170,10 @@ fn verify_signature(
     announced: &Version,
     require_signed_version: bool,
 ) -> Result<()> {
-    let public_key = PublicKey::decode(&base64_to_string(pubkey)?)?;
-    let signature = Signature::decode(&base64_to_string(signature)?)?;
-    public_key.verify(data, &signature, true)?;
+    let bad = |error: minisign_verify::Error| Error::InvalidSignature(error.to_string());
+    let public_key = PublicKey::decode(&base64_to_string(pubkey)?).map_err(bad)?;
+    let signature = Signature::decode(&base64_to_string(signature)?).map_err(bad)?;
+    public_key.verify(data, &signature, true).map_err(bad)?;
 
     // Only trustworthy after `verify`: minisign's global signature covers the trusted comment,
     // which the Tauri CLI writes as `timestamp:<unix>\tfile:<name>\tversion:<version>`.
@@ -194,8 +195,11 @@ fn verify_signature(
 }
 
 fn base64_to_string(value: &str) -> Result<String> {
-    let decoded = base64::engine::general_purpose::STANDARD.decode(value.trim())?;
-    String::from_utf8(decoded).map_err(|_| Error::SignatureUtf8)
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|error| Error::InvalidSignature(error.to_string()))?;
+    String::from_utf8(decoded)
+        .map_err(|_| Error::InvalidSignature("not UTF-8 after base64 decoding".into()))
 }
 
 /// What is known about the stored bundles beyond their files.
@@ -426,6 +430,23 @@ impl Store {
                 rejected: state.rejected,
                 ..State::default()
             })?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the stored bundle `version`, unless it is `serving` or the confirmed fallback.
+    /// A version that is not stored is not an error.
+    pub fn discard(&self, version: &Version, serving: Option<&Version>) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        let mut state = self.read_state();
+        if serving == Some(version) || state.confirmed.as_ref() == Some(version) {
+            return Err(Error::InUse(version.to_string()));
+        }
+        self.remove(version);
+        if state.trial.as_ref() == Some(version) {
+            state.trial = None;
+            state.attempts = 0;
+            self.write_state(&state)?;
         }
         Ok(())
     }

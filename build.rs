@@ -8,6 +8,7 @@ const COMMANDS: &[&str] = &[
     "notify_ready",
     "status",
     "rollback",
+    "discard",
 ];
 
 fn main() {
