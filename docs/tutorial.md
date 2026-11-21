@@ -146,8 +146,8 @@ crashes before it gets there: delete this line from `src/main.js`.
   await plugin("notify_ready");
 ```
 
-Publish it as `0.1.2`, the same three commands as before (stop the server
-with Ctrl+C first, or use a third terminal):
+Publish it as `0.1.2` with the same three commands as before, in a third
+terminal. The server keeps running; it serves whatever is in `ota`.
 
 ```bash
 tar -czf ota/frontend-0.1.2.tar.gz -C src .
@@ -177,7 +177,8 @@ again; **Check for frontend update** no longer offers it.
 ## 10. Clean up
 
 Click **Reset to built-in** to delete the downloaded bundles; the app is back
-on 0.1.0. Put the `notify_ready` line back in `src/main.js`.
+on 0.1.0 with its original heading. Put the `notify_ready` line back in
+`src/main.js`, and stop the server with Ctrl+C.
 
 ## What you did
 
