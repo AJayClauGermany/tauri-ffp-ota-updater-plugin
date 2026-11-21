@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default", "ffp-ota-updater:default"]
+  "permissions": ["core:default", "ffp-ota-updater:default", "ffp-ota-updater:allow-reset"]
 }

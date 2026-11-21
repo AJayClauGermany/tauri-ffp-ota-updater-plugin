@@ -23,7 +23,8 @@ async function run(action) {
   try {
     await action();
   } catch (error) {
-    log(`Error: ${error}`);
+    // plugin errors are `{ kind, message }`
+    log(`Error: ${error?.kind ? `[${error.kind}] ${error.message}` : error}`);
   }
 }
 
@@ -58,5 +59,19 @@ $("reset").addEventListener("click", () => run(() => plugin("reset")));
 run(async () => {
   // the page got this far, so a downloaded frontend is good to keep
   await plugin("notify_ready");
-  $("version").textContent = await plugin("current_version");
+  const status = await plugin("status");
+  $("version").textContent = status.currentVersion;
+  if (status.staged) {
+    log(`${status.staged} is downloaded and will be used at the next launch.`);
+    $("apply").disabled = $("discard").disabled = false;
+    // by version alone: no check, so this works offline
+    $("apply").onclick = () => run(() => plugin("install", { version: status.staged }));
+    $("discard").onclick = () =>
+      run(async () => {
+        await plugin("discard", { version: status.staged });
+        $("apply").disabled = $("discard").disabled = true;
+        log(`Discarded ${status.staged}.`);
+      });
+  }
+  if (status.rejected.length) log(`Rolled back earlier: ${status.rejected.join(", ")}`);
 });

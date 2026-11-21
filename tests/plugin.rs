@@ -23,7 +23,9 @@ use tauri::{
         config::AppDirectoriesOverride,
     },
 };
-use tauri_plugin_ffp_ota_updater::{Error, OtaUpdaterExt, default_version_comparator};
+use tauri_plugin_ffp_ota_updater::{
+    Builder, Error, OtaUpdaterExt, RequestOptions, default_compatibility,
+};
 
 /// Stands in for the frontend embedded in the binary.
 struct BuiltIn;
@@ -84,7 +86,8 @@ fn sign(key: &minisign::KeyPair, data: &[u8], version: Option<&str>) -> String {
 
 type Routes = Arc<Mutex<HashMap<&'static str, Vec<u8>>>>;
 
-/// Serves `routes` by the last path segment and records every requested path.
+/// Serves `routes` by the last path segment and records every requested path, followed by
+/// `#` and the value of the `x-channel` header if one was sent.
 fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -95,7 +98,11 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
             let mut line = String::new();
+            let mut channel = None;
             while reader.read_line(&mut line).unwrap() > 2 {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("x-channel:") {
+                    channel = Some(value.trim().to_string());
+                }
                 line.clear();
             }
             let path = request_line
@@ -108,7 +115,10 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
                 .unwrap()
                 .get(path.rsplit('/').next().unwrap())
                 .cloned();
-            requests.lock().unwrap().push(path);
+            requests.lock().unwrap().push(match channel {
+                Some(channel) => format!("{path}#{channel}"),
+                None => path,
+            });
             let (status, body) = match body {
                 Some(body) => ("200 OK", body),
                 None => ("404 Not Found", Vec::new()),
@@ -142,6 +152,24 @@ fn launch_with(
     port: u16,
     overrides: serde_json::Value,
 ) -> App<MockRuntime> {
+    launch_built(
+        data_dir,
+        binary_version,
+        pubkey,
+        port,
+        overrides,
+        Builder::new(),
+    )
+}
+
+fn launch_built(
+    data_dir: &Path,
+    binary_version: &str,
+    pubkey: &str,
+    port: u16,
+    overrides: serde_json::Value,
+    builder: Builder,
+) -> App<MockRuntime> {
     let mut context = mock_context(BuiltIn);
     context.package_info_mut().version = binary_version.parse().unwrap();
     context.config_mut().app.app_directories_override =
@@ -163,7 +191,7 @@ fn launch_with(
         .insert("ffp-ota-updater".into(), config);
     tauri_plugin_ffp_ota_updater::install(&mut context);
     mock_builder()
-        .plugin(tauri_plugin_ffp_ota_updater::init())
+        .plugin(builder.build())
         .build(context)
         .expect("failed to build app with plugin")
 }
@@ -182,13 +210,13 @@ fn served(app: &App<MockRuntime>, path: &str) -> String {
 }
 
 #[test]
-fn default_comparator_only_accepts_newer_patches() {
+fn default_compatibility_only_accepts_newer_patches() {
     let v = |s: &str| Version::parse(s).unwrap();
-    assert!(default_version_comparator(&v("1.2.0"), &v("1.2.1")));
-    assert!(!default_version_comparator(&v("1.2.1"), &v("1.2.1")));
-    assert!(!default_version_comparator(&v("1.2.1"), &v("1.2.0")));
-    assert!(!default_version_comparator(&v("1.2.0"), &v("1.3.0")));
-    assert!(!default_version_comparator(&v("1.2.0"), &v("2.2.1")));
+    assert!(default_compatibility(&v("1.2.0"), &v("1.2.1")));
+    assert!(!default_compatibility(&v("1.2.1"), &v("1.2.1")));
+    assert!(!default_compatibility(&v("1.2.1"), &v("1.2.0")));
+    assert!(!default_compatibility(&v("1.2.0"), &v("1.3.0")));
+    assert!(!default_compatibility(&v("1.2.0"), &v("2.2.1")));
 }
 
 // One scenario rather than several tests: the active bundle is process-wide state.
@@ -235,6 +263,29 @@ fn frontend_update_lifecycle() {
     let updater = app.ota_updater();
     assert_eq!(served_index(&app), "built-in");
     assert_eq!(updater.current_version().to_string(), "1.2.0");
+    let status = updater.status();
+    assert_eq!(status.binary_version.to_string(), "1.2.0");
+    assert!(status.confirmed && status.staged.is_none() && status.rejected.is_empty());
+
+    // an endpoint that cannot be reached is told apart from one that has no usable manifest
+    let check_at = |url: String| {
+        block_on(updater.check_with(RequestOptions::new().endpoints(vec![url.parse().unwrap()])))
+    };
+    let unreachable = check_at("http://127.0.0.1:1/ota.json".into())
+        .err()
+        .unwrap();
+    assert!(matches!(unreachable, Error::Reqwest(_)), "{unreachable}");
+    assert_eq!(
+        serde_json::to_value(&unreachable).unwrap()["kind"],
+        "network"
+    );
+    let missing = check_at(format!("http://127.0.0.1:{port}/nothing.json"))
+        .err()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&missing).unwrap(),
+        serde_json::json!({ "kind": "releaseNotFound", "message": missing.to_string() })
+    );
 
     // a minor bump is a full update, not ours
     publish("1.3.0", "1.2.1.tar.gz", &v121_signature);
@@ -256,7 +307,7 @@ fn frontend_update_lifecycle() {
     ));
     assert!(matches!(
         download("1.2.1", "corrupt.tar.gz", &v121_signature),
-        Err(Error::Minisign(_))
+        Err(Error::InvalidSignature(_))
     ));
     // ...as are archives that are ambiguous about what they contain
     for (file, entries) in [
@@ -307,6 +358,10 @@ fn frontend_update_lifecycle() {
     assert!(finished);
     assert!(!update.downloaded);
     assert_eq!(served_index(&app), "built-in");
+    // which shows without asking the server
+    let status = updater.status();
+    assert_eq!(status.staged.unwrap().to_string(), "1.2.1");
+    assert_eq!(status.current_version.to_string(), "1.2.0");
 
     // ...and a staged bundle is not fetched a second time, as happens when every page of a
     // multi-page app checks for updates
@@ -341,8 +396,11 @@ fn frontend_update_lifecycle() {
             .unwrap()
             .ends_with("/1.2.0/1.2.1/ota.json")
     );
+    let status = updater.status();
+    assert!(!status.confirmed && status.staged.is_none());
     // the frontend reports that it works, which ends the trial
     updater.notify_ready().unwrap();
+    assert!(updater.status().confirmed);
     drop(app);
 
     // --- next launch: the newest valid bundle is picked up; a newer but tampered one and an
@@ -412,6 +470,7 @@ fn frontend_update_lifecycle() {
     assert_eq!(served_index(&app), "ota 1.2.1");
     assert_eq!(state()["rejected"], serde_json::json!(["1.2.2"]));
     assert!(!store.join("1.2.2.tar.gz").exists());
+    assert_eq!(updater.status().rejected, ["1.2.2".parse().unwrap()]);
     // the rejected version is not offered again, the next one is
     assert!(block_on(updater.check()).unwrap().is_none());
 
@@ -465,6 +524,153 @@ fn frontend_update_lifecycle() {
     multi_page_bundles_are_served_page_by_page();
     unconfirmed_bundles_time_out();
     trial_attempts_are_configurable();
+    builder_overrides_the_configuration();
+    bundles_are_staged_applied_and_discarded_without_a_check();
+}
+
+/// The store on its own: the app brings the bundles, and no endpoint is ever asked.
+fn bundles_are_staged_applied_and_discarded_without_a_check() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let v = |version: &str| Version::parse(version).unwrap();
+    let bundle = |version: &str| {
+        let archive = archive(&format!("own {version}"));
+        let signature = sign(&key, &archive, Some(version));
+        (archive, signature)
+    };
+    // port 1: nothing listens there
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+
+    // staging verifies like a download does
+    let (v121, v121_signature) = bundle("1.2.1");
+    assert!(matches!(
+        updater.stage(&v121, &v121_signature, &v("1.2.2")),
+        Err(Error::SignedVersionMismatch { .. })
+    ));
+    assert!(matches!(
+        updater.stage(&archive("tampered"), &v121_signature, &v("1.2.1")),
+        Err(Error::InvalidSignature(_))
+    ));
+    let (v130, v130_signature) = bundle("1.3.0");
+    assert!(matches!(
+        updater.stage(&v130, &v130_signature, &v("1.3.0")),
+        Err(Error::Incompatible(_))
+    ));
+    assert!(!store.exists());
+    assert!(matches!(
+        updater.install(&v("1.2.1")),
+        Err(Error::NotDownloaded(_))
+    ));
+
+    updater.stage(&v121, &v121_signature, &v("1.2.1")).unwrap();
+    assert_eq!(updater.status().staged, Some(v("1.2.1")));
+    assert_eq!(served_index(&app), "built-in");
+
+    // a staged bundle can be dropped again, which is not a rejection
+    updater.discard(&v("1.2.1")).unwrap();
+    assert_eq!(updater.status().staged, None);
+    assert!(!store.join("1.2.1.tar.gz").exists());
+    assert!(!store.join("1.2.1.tar.gz.sig").exists());
+    updater.discard(&v("1.2.1")).unwrap();
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "built-in");
+
+    // ...and is applied by its version alone
+    updater.stage(&v121, &v121_signature, &v("1.2.1")).unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.notify_ready().unwrap();
+
+    // what is in use stays: the bundle being served and the confirmed one behind a trial
+    assert!(matches!(updater.discard(&v("1.2.1")), Err(Error::InUse(_))));
+    let (v122, v122_signature) = bundle("1.2.2");
+    updater.stage(&v122, &v122_signature, &v("1.2.2")).unwrap();
+    updater.activate(&v("1.2.2")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.2");
+    for version in ["1.2.1", "1.2.2"] {
+        assert!(matches!(updater.discard(&v(version)), Err(Error::InUse(_))));
+    }
+    // versions only move forward
+    assert!(matches!(
+        updater.stage(&v121, &v121_signature, &v("1.2.1")),
+        Err(Error::NotNewer(_))
+    ));
+    assert!(matches!(
+        updater.activate(&v("1.2.1")),
+        Err(Error::NotNewer(_))
+    ));
+    assert_eq!(served_index(&app), "own 1.2.2");
+    updater.reset().unwrap();
+}
+
+fn builder_overrides_the_configuration() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let bundle = archive("beta");
+    let routes = Routes::default();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = serve(routes.clone(), requests.clone());
+    let manifest = serde_json::json!({
+        "version": "1.4.0",
+        "url": format!("http://127.0.0.1:{port}/bundle.tar.gz"),
+        "signature": sign(&key, &bundle, Some("1.4.0")),
+    });
+    routes.lock().unwrap().extend([
+        ("beta.json", manifest.to_string().into_bytes()),
+        ("bundle.tar.gz", bundle),
+    ]);
+
+    let builder = Builder::new()
+        .endpoints(vec![
+            format!("http://127.0.0.1:{port}/beta.json")
+                .parse()
+                .unwrap(),
+        ])
+        .header("x-channel", "beta")
+        .unwrap()
+        .header("authorization", "Bearer default")
+        .unwrap()
+        .timeout(std::time::Duration::from_secs(5))
+        .no_proxy()
+        .configure_client(|client| client.user_agent("configured"))
+        // any newer version of the same major
+        .compatibility(|binary, bundle| bundle.major == binary.major && bundle > binary);
+    let app = launch_built(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        port,
+        serde_json::json!({}),
+        builder,
+    );
+    let updater = app.ota_updater();
+
+    // the builder's endpoint, headers and rule are used, for the download as well
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    assert_eq!(update.version.to_string(), "1.4.0");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    assert_eq!(served_index(&app), "beta");
+    assert_eq!(
+        *requests.lock().unwrap(),
+        ["/beta.json#beta", "/bundle.tar.gz#beta"]
+    );
+
+    // a header given to one check replaces the builder's of that name
+    let options = RequestOptions::new()
+        .header("x-channel", "nightly")
+        .unwrap();
+    assert!(block_on(updater.check_with(options)).unwrap().is_none());
+    assert_eq!(
+        requests.lock().unwrap().last().unwrap(),
+        "/beta.json#nightly"
+    );
+    updater.reset().unwrap();
 }
 
 fn trial_attempts_are_configurable() {

@@ -6,6 +6,7 @@ use url::Url;
 /// The keys deliberately match `tauri-plugin-updater`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+#[non_exhaustive]
 pub struct Config {
     /// URLs queried in order for a release manifest. Supports the `{{current_version}}`,
     /// `{{binary_version}}`, `{{target}}` and `{{arch}}` variables.

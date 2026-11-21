@@ -50,12 +50,14 @@ pub(crate) struct Limits {
 
 /// Decides whether a frontend bundle version may run on a given binary version.
 ///
-/// Receives `(binary_version, bundle_version)`.
-pub type VersionComparator = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
+/// Receives `(binary_version, bundle_version)`. Unlike the updater plugin's version comparator
+/// this does not decide whether a release is an update: a bundle also has to be newer than the
+/// frontend being served.
+pub type Compatibility = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
 
-/// The default [`VersionComparator`]: a bundle is frontend-only when it is a newer *patch*
+/// The default [`Compatibility`] rule: a bundle is frontend-only when it is a newer *patch*
 /// release of the binary (same major and minor). Anything else needs a full update.
-pub fn default_version_comparator(binary: &Version, bundle: &Version) -> bool {
+pub fn default_compatibility(binary: &Version, bundle: &Version) -> bool {
     bundle.major == binary.major && bundle.minor == binary.minor && bundle > binary
 }
 
@@ -168,9 +170,10 @@ fn verify_signature(
     announced: &Version,
     require_signed_version: bool,
 ) -> Result<()> {
-    let public_key = PublicKey::decode(&base64_to_string(pubkey)?)?;
-    let signature = Signature::decode(&base64_to_string(signature)?)?;
-    public_key.verify(data, &signature, true)?;
+    let bad = |error: minisign_verify::Error| Error::InvalidSignature(error.to_string());
+    let public_key = PublicKey::decode(&base64_to_string(pubkey)?).map_err(bad)?;
+    let signature = Signature::decode(&base64_to_string(signature)?).map_err(bad)?;
+    public_key.verify(data, &signature, true).map_err(bad)?;
 
     // Only trustworthy after `verify`: minisign's global signature covers the trusted comment,
     // which the Tauri CLI writes as `timestamp:<unix>\tfile:<name>\tversion:<version>`.
@@ -192,8 +195,11 @@ fn verify_signature(
 }
 
 fn base64_to_string(value: &str) -> Result<String> {
-    let decoded = base64::engine::general_purpose::STANDARD.decode(value.trim())?;
-    String::from_utf8(decoded).map_err(|_| Error::SignatureUtf8)
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|error| Error::InvalidSignature(error.to_string()))?;
+    String::from_utf8(decoded)
+        .map_err(|_| Error::InvalidSignature("not UTF-8 after base64 decoding".into()))
 }
 
 /// What is known about the stored bundles beyond their files.
@@ -226,7 +232,7 @@ pub(crate) struct Store {
     /// The bundle whose trial this run of the app already counts as an attempt of.
     pub shown: Mutex<Option<Version>>,
     pub binary: Version,
-    pub comparator: VersionComparator,
+    pub compatibility: Compatibility,
     /// Serializes everything that reads and then writes the state.
     pub lock: Mutex<()>,
 }
@@ -253,11 +259,26 @@ impl Store {
 
     /// Whether `version` is a frontend-only update for this binary.
     pub fn compatible(&self, version: &Version) -> bool {
-        (self.comparator)(&self.binary, version)
+        (self.compatibility)(&self.binary, version)
     }
 
     pub fn is_rejected(&self, version: &Version) -> bool {
         self.read_state().rejected.contains(version)
+    }
+
+    /// Versions that failed a trial or were rolled back, oldest first.
+    pub fn rejected(&self) -> Vec<Version> {
+        self.read_state().rejected.into_iter().collect()
+    }
+
+    /// The newest stored bundle that is newer than `current` and may be served, i.e. the one
+    /// the next launch would pick. Goes by the files present; nothing is verified.
+    pub fn staged(&self, current: &Version) -> Option<Version> {
+        let _guard = self.lock.lock().unwrap();
+        let state = self.read_state();
+        self.versions().into_iter().find(|version| {
+            version > current && self.compatible(version) && !state.rejected.contains(version)
+        })
     }
 
     /// Whether serving `version` is a trial, i.e. it still has to be confirmed.
@@ -409,6 +430,23 @@ impl Store {
                 rejected: state.rejected,
                 ..State::default()
             })?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the stored bundle `version`, unless it is `serving` or the confirmed fallback.
+    /// A version that is not stored is not an error.
+    pub fn discard(&self, version: &Version, serving: Option<&Version>) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        let mut state = self.read_state();
+        if serving == Some(version) || state.confirmed.as_ref() == Some(version) {
+            return Err(Error::InUse(version.to_string()));
+        }
+        self.remove(version);
+        if state.trial.as_ref() == Some(version) {
+            state.trial = None;
+            state.attempts = 0;
+            self.write_state(&state)?;
         }
         Ok(())
     }

@@ -1,10 +1,14 @@
-use std::{sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
-use http::{HeaderMap, HeaderValue, StatusCode, header::ACCEPT};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::ACCEPT};
 use percent_encoding::{AsciiSet, CONTROLS};
 use semver::Version;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
 use url::Url;
 
@@ -27,7 +31,7 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same shape as the updater plugin's dynamic response. A frontend bundle is platform
 /// independent, so there is no `platforms` map.
 #[derive(Debug, Clone, Deserialize)]
-pub struct RemoteRelease {
+pub(crate) struct RemoteRelease {
     /// Version of the frontend bundle. A leading `v` is tolerated.
     #[serde(deserialize_with = "parse_version")]
     pub version: Version,
@@ -48,35 +52,119 @@ fn parse_version<'de, D: Deserializer<'de>>(
     Version::parse(value.trim_start_matches('v')).map_err(serde::de::Error::custom)
 }
 
-/// Per-request options for [`OtaUpdater::check_with`].
+/// Per-request options for [`OtaUpdater::check_with`]. What is left unset falls back to the
+/// [`Builder`](crate::Builder)'s setting.
+///
+/// ```
+/// # use tauri_plugin_ffp_ota_updater::RequestOptions;
+/// let options = RequestOptions::new()
+///     .endpoints(vec!["https://releases.example.com/beta/ota.json".parse().unwrap()])
+///     .timeout(std::time::Duration::from_secs(20));
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RequestOptions {
+    /// Manifest URLs to query instead of the configured ones, in order. This is how an app
+    /// switches release channels while it is running.
+    pub endpoints: Option<Vec<Url>>,
     /// Extra headers sent with the manifest request and the bundle download.
     pub headers: HeaderMap,
     /// Timeout applied to each request. Defaults to 30 seconds for the manifest and 30 minutes
     /// for the bundle; a connection that stalls for 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
+    /// Proxy for the manifest request and the bundle download.
+    pub proxy: Option<Url>,
+}
+
+impl RequestOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`Self::endpoints`].
+    pub fn endpoints(mut self, endpoints: Vec<Url>) -> Self {
+        self.endpoints = Some(endpoints);
+        self
+    }
+
+    /// Adds a header to [`Self::headers`], replacing one of the same name.
+    pub fn header<K, V>(mut self, key: K, value: V) -> Result<Self>
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
+        let value: std::result::Result<HeaderValue, http::Error> =
+            value.try_into().map_err(Into::into);
+        self.headers.insert(key?, value?);
+        Ok(self)
+    }
+
+    /// Sets [`Self::timeout`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets [`Self::proxy`].
+    pub fn proxy(mut self, proxy: Url) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+}
+
+/// What the [`Builder`](crate::Builder) sets for every request.
+#[derive(Default)]
+pub(crate) struct ClientOptions {
+    pub headers: HeaderMap,
+    pub timeout: Option<Duration>,
+    pub proxy: Option<Url>,
+    pub no_proxy: bool,
+    #[allow(clippy::type_complexity)]
+    pub configure:
+        Option<Arc<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>>,
+}
+
+/// Where the updater stands, from [`OtaUpdater::status`]. Read from disk and memory; no request
+/// is made.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Status {
+    /// Version of the app binary, i.e. of the built-in frontend.
+    pub binary_version: Version,
+    /// Version of the frontend being served: the active bundle's, or else the binary's.
+    pub current_version: Version,
+    /// `false` while the frontend being served is a downloaded bundle that still has to be
+    /// confirmed with `notify_ready`, and would be rolled back otherwise.
+    pub confirmed: bool,
+    /// A stored bundle newer than the one being served, which the next launch (or
+    /// [`OtaUpdater::install`]) switches to and [`OtaUpdater::discard`] removes. It is verified
+    /// only when it is loaded.
+    pub staged: Option<Version>,
+    /// Versions that failed their trial or were rolled back, oldest first. They are not
+    /// offered or served again. The record is dropped once a full update makes them
+    /// irrelevant.
+    pub rejected: Vec<Version>,
 }
 
 /// Access to the frontend OTA updater. Get it with [`OtaUpdaterExt::ota_updater`].
 pub struct OtaUpdater<R: Runtime> {
     pub(crate) app: AppHandle<R>,
     pub(crate) config: Config,
+    pub(crate) client: ClientOptions,
     pub(crate) store: Store,
     pub(crate) binary_version: Version,
-    /// The release the last successful `check` from the webview returned.
-    pub(crate) pending: Mutex<Option<Update<R>>>,
+    /// The releases `check` returned to the webview, which holds on to them by version only.
+    pub(crate) pending: Mutex<HashMap<Version, Update<R>>>,
     /// Held for the length of a download, so that concurrent requests for the same bundle
     /// (two windows, or two pages of a multi-page app in a row) fetch it once.
     pub(crate) downloading: tauri::async_runtime::Mutex<()>,
 }
 
 impl<R: Runtime> OtaUpdater<R> {
-    /// Version of the app binary, i.e. of the built-in frontend.
-    pub fn binary_version(&self) -> &Version {
-        &self.binary_version
-    }
-
     /// Version of the frontend being served: the active bundle's, or else the binary's.
     pub fn current_version(&self) -> Version {
         assets::active()
@@ -84,41 +172,86 @@ impl<R: Runtime> OtaUpdater<R> {
             .unwrap_or_else(|| self.binary_version.clone())
     }
 
+    /// Where the updater stands: what is being served and whether it is confirmed, what is
+    /// staged for the next launch and which versions were rolled back.
+    pub fn status(&self) -> Status {
+        let current_version = self.current_version();
+        Status {
+            binary_version: self.binary_version.clone(),
+            confirmed: assets::active().is_none() || !self.store.unproven(&current_version),
+            staged: self.store.staged(&current_version),
+            rejected: self.store.rejected(),
+            current_version,
+        }
+    }
+
     /// Checks the endpoints for a frontend update.
     ///
     /// Returns `None` when there is none, when the release is not frontend-only according to
-    /// the version comparator (by default: anything but a newer patch release of the binary;
+    /// the compatibility rule (by default: anything but a newer patch release of the binary;
     /// those releases are the regular updater plugin's job), or when that version was rejected
     /// by a rollback before.
     pub async fn check(&self) -> Result<Option<Update<R>>> {
         self.check_with(RequestOptions::default()).await
     }
 
-    /// [`Self::check`] with extra headers and/or a timeout.
-    pub async fn check_with(&self, options: RequestOptions) -> Result<Option<Update<R>>> {
-        if self.config.endpoints.is_empty() {
+    /// [`Self::check`] with other endpoints, extra headers, a timeout and/or a proxy.
+    pub async fn check_with(&self, mut options: RequestOptions) -> Result<Option<Update<R>>> {
+        let endpoints = options.endpoints.take();
+        let endpoints = endpoints.as_ref().unwrap_or(&self.config.endpoints);
+        if endpoints.is_empty() {
             return Err(Error::EmptyEndpoints);
         }
+        if !self.config.dangerous_insecure_transport_protocol
+            && let Some(url) = endpoints.iter().find(|url| url.scheme() != "https")
+        {
+            return Err(Error::InsecureTransportProtocol(url.to_string()));
+        }
+
+        // what the download of the release found here is made with, too
+        let mut headers = self.client.headers.clone();
+        let mut replaced = None;
+        for (name, value) in std::mem::take(&mut options.headers) {
+            // `None` is another value for the name before it
+            if let Some(name) = name {
+                headers.remove(&name);
+                replaced = Some(name);
+            }
+            if let Some(name) = &replaced {
+                headers.append(name, value);
+            }
+        }
+        options.headers = headers;
+        options.timeout = options.timeout.or(self.client.timeout);
+        options.proxy = options.proxy.or_else(|| self.client.proxy.clone());
 
         let current_version = self.current_version();
         let mut headers = options.headers.clone();
         headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("application/json"));
-        let client = self.client(options.timeout.unwrap_or(CHECK_TIMEOUT))?;
+        let client = self.client(
+            options.timeout.unwrap_or(CHECK_TIMEOUT),
+            options.proxy.as_ref(),
+        )?;
 
         let mut last_error = String::from("no endpoint responded successfully");
+        // set while no endpoint has answered at all
+        let mut unreachable = None;
+        let mut responded = false;
         let mut found = None;
-        for endpoint in &self.config.endpoints {
+        for endpoint in endpoints {
             let url = self.resolve_endpoint(endpoint, &current_version)?;
             log::debug!("checking for frontend updates at {url}");
             let response = match client.get(url).headers(headers.clone()).send().await {
                 Ok(response) => response,
                 Err(error) => {
                     last_error = error.to_string();
+                    unreachable = Some(error);
                     continue;
                 }
             };
+            responded = true;
             if response.status() == StatusCode::NO_CONTENT {
                 return Ok(None);
             }
@@ -144,7 +277,11 @@ impl<R: Runtime> OtaUpdater<R> {
             }
         }
         let Some((release, raw_json)) = found else {
-            return Err(Error::ReleaseNotFound(last_error));
+            return Err(match unreachable {
+                // offline, most likely: a different matter than a broken manifest
+                Some(error) if !responded => Error::Reqwest(error),
+                _ => Error::ReleaseNotFound(last_error),
+            });
         };
 
         if release.version <= current_version
@@ -168,6 +305,55 @@ impl<R: Runtime> OtaUpdater<R> {
             signature: release.signature,
             options,
         }))
+    }
+
+    /// Verifies and stores a bundle that the app obtained by its own means: another transport
+    /// or manifest format, a file shipped with the installer, a patch applied to the previous
+    /// archive. The checks are those of [`Update::download`]: `signature` (the content of the
+    /// `.sig` file) has to be this app's key signing exactly `archive`, for `version`, and the
+    /// version has to be compatible with the binary and not rejected.
+    ///
+    /// The bundle is then staged like a downloaded one: served from the next launch on, or at
+    /// once with [`Self::install`].
+    pub fn stage(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
+        if *version < self.current_version() {
+            return Err(Error::NotNewer(version.to_string()));
+        }
+        self.store.save(archive, signature, version)
+    }
+
+    /// Switches to the stored bundle `version` without touching the webviews: documents that
+    /// are already loaded keep running the old frontend, and whatever they or new windows
+    /// request from now on is served from the new one. No request is made, so a bundle staged
+    /// earlier (see [`Status::staged`]) can be applied offline.
+    ///
+    /// For apps that cannot be reloaded at an arbitrary moment. Finish or block the work that
+    /// must not be interrupted, call this, then reload or recreate each window (see
+    /// [`Self::reload`]) before the old documents load more of their assets.
+    ///
+    /// The bundle is verified again as it is loaded from disk, and is on trial from the first
+    /// page loaded from it until [`Self::notify_ready`].
+    pub fn activate(&self, version: &Version) -> Result<()> {
+        if *version < self.current_version() {
+            return Err(Error::NotNewer(version.to_string()));
+        }
+        self.serve(Some(self.store.activate(version)?));
+        Ok(())
+    }
+
+    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    pub fn install(&self, version: &Version) -> Result<()> {
+        self.activate(version)?;
+        self.reload()
+    }
+
+    /// Deletes the stored bundle `version` so that it is not served at the next launch, for an
+    /// update the user declined or the app decided to skip. The version is not rejected and
+    /// can be downloaded again. Fails with [`Error::InUse`] for the bundle being served and
+    /// for the confirmed one kept as the fallback; does nothing if the version is not stored.
+    pub fn discard(&self, version: &Version) -> Result<()> {
+        let serving = assets::active().map(|bundle| bundle.version.clone());
+        self.store.discard(version, serving.as_ref())
     }
 
     /// Tells the updater that the frontend being served works.
@@ -262,20 +448,28 @@ impl<R: Runtime> OtaUpdater<R> {
         Ok(())
     }
 
-    fn client(&self, timeout: Duration) -> Result<reqwest::Client> {
+    fn client(&self, timeout: Duration, proxy: Option<&Url>) -> Result<reqwest::Client> {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             // can only fail if another thread installed one in the meantime, which is just as
             // good
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
-        Ok(reqwest::ClientBuilder::new()
+        let mut builder = reqwest::ClientBuilder::new()
             .user_agent(USER_AGENT)
             // covers redirects too
             .https_only(!self.config.dangerous_insecure_transport_protocol)
             .connect_timeout(STALL_TIMEOUT)
             .read_timeout(STALL_TIMEOUT)
-            .timeout(timeout)
-            .build()?)
+            .timeout(timeout);
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy.as_str())?);
+        } else if self.client.no_proxy {
+            builder = builder.no_proxy();
+        }
+        if let Some(configure) = &self.client.configure {
+            builder = configure(builder);
+        }
+        Ok(builder.build()?)
     }
 
     fn resolve_endpoint(&self, endpoint: &Url, current_version: &Version) -> Result<Url> {
@@ -417,7 +611,10 @@ impl<R: Runtime> Update<R> {
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("application/octet-stream"));
         let response = updater
-            .client(self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT))?
+            .client(
+                self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT),
+                self.options.proxy.as_ref(),
+            )?
             .get(self.download_url.clone())
             .headers(headers)
             .send()
@@ -438,26 +635,14 @@ impl<R: Runtime> Update<R> {
         Ok(())
     }
 
-    /// Switches to the downloaded bundle without touching the webviews: documents that are
-    /// already loaded keep running the old frontend, and whatever they or new windows request
-    /// from now on is served from the new one.
-    ///
-    /// For apps that cannot be reloaded at an arbitrary moment. Finish or block the work that
-    /// must not be interrupted, call this, then reload or recreate each window (see
-    /// [`OtaUpdater::reload`]) before the old documents load more of their assets.
-    ///
-    /// The bundle is verified again as it is loaded from disk, and is on trial from the first
-    /// page loaded from it until [`OtaUpdater::notify_ready`].
+    /// [`OtaUpdater::activate`] for this update, once it is downloaded.
     pub fn activate(&self) -> Result<()> {
-        let updater = self.app.ota_updater();
-        updater.serve(Some(updater.store.activate(&self.version)?));
-        Ok(())
+        self.app.ota_updater().activate(&self.version)
     }
 
-    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    /// [`OtaUpdater::install`] for this update, once it is downloaded.
     pub fn install(&self) -> Result<()> {
-        self.activate()?;
-        self.app.ota_updater().reload()
+        self.app.ota_updater().install(&self.version)
     }
 
     /// [`Self::download`] followed by [`Self::install`].

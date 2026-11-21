@@ -18,7 +18,8 @@ keys, same signing keys and `tauri signer` tooling, same manifest fields, same
 | Applies | after restart | on webview reload, or on next launch |
 | Default scope | any newer version | newer **patch** versions of the installed binary |
 
-Desktop only (Windows, macOS, Linux) for now.
+Desktop only (Windows, macOS, Linux), like the updater plugin: register it
+under `#[cfg(desktop)]` in an app that also builds for Android or iOS.
 
 ## How it works
 
@@ -26,7 +27,7 @@ Desktop only (Windows, macOS, Linux) for now.
   a frontend update only if it is a newer patch of the installed binary
   (binary `1.2.0` accepts `1.2.1`, `1.2.7`, but not `1.3.0` or `2.0.0`): minor
   and major bumps are assumed to need new Rust code and are left to the
-  updater plugin. Override this with `Builder::version_comparator`.
+  updater plugin. Override this with `Builder::compatibility`.
 - `download()` fetches the tarball, verifies its minisign signature (and that
   it was signed for the announced version) and stores it in the app's local
   data directory. Nothing else happens until the next launch.
@@ -93,6 +94,51 @@ Grant the permission in a capability file:
 ```json
 { "permissions": ["core:default", "ffp-ota-updater:default"] }
 ```
+
+`default` covers `check`, `download`, `install`, `downloadAndInstall`,
+`discard`, `currentVersion`, `notifyReady` and `status`. The two calls that discard a
+frontend, `rollback()` and `reset()`, are opt-in: add
+`ffp-ota-updater:allow-rollback` and/or `ffp-ota-updater:allow-reset`.
+
+### Configuring from Rust
+
+What depends on the build, the user or the environment is set on the builder
+instead of in `tauri.conf.json`:
+
+```rust
+tauri_plugin_ffp_ota_updater::Builder::new()
+    .endpoints(vec!["https://releases.example.com/beta/ota.json".parse()?])
+    .header("Authorization", format!("Bearer {token}"))?
+    .timeout(std::time::Duration::from_secs(20))
+    .proxy("http://proxy.example.com:8080".parse()?)   // or .no_proxy()
+    .configure_client(|client| client.add_root_certificate(company_ca.clone()))
+    .build()
+```
+
+| Method | |
+| --- | --- |
+| `pubkey`, `endpoints` | Override the configuration file. |
+| `header`, `headers` | Sent with every manifest request and bundle download. |
+| `timeout` | Deadline for each request. |
+| `proxy`, `no_proxy` | Use this proxy, or none, instead of the system's. |
+| `configure_client` | Last word on the `reqwest` client (re-exported as `tauri_plugin_ffp_ota_updater::reqwest`). |
+| `compatibility` | Which bundle versions a binary can run; see [How it works](#how-it-works). |
+
+To switch release channels while the app is running, give one check its own
+endpoints. The headers, timeout and proxy can be set the same way, and the
+download of the release that check finds uses them too:
+
+```rust
+use tauri_plugin_ffp_ota_updater::{OtaUpdaterExt, RequestOptions};
+
+let update = app
+    .ota_updater()
+    .check_with(RequestOptions::new().endpoints(vec![beta_url]))
+    .await?;
+```
+
+The webview can pass `headers`, `timeout` and `proxy` to `check()`, but not
+endpoints.
 
 ## Publishing a frontend update
 
@@ -192,12 +238,58 @@ catch its errors and never make rendering wait for it. `download()` does
 nothing for a bundle that is already stored (`update.downloaded`), so running
 this on every start is cheap.
 
-Also available: `currentVersion()` (version of the frontend being served) and
-`reset()` (delete downloaded bundles and go back to the built-in frontend).
+Every function rejects with an `OtaUpdateError`, whose `kind` says what
+happened without parsing the message:
+
+```js
+import { check, OtaUpdateError } from "tauri-plugin-ffp-ota-updater-api";
+
+try {
+  await (await check())?.download();
+} catch (error) {
+  if (error instanceof OtaUpdateError && error.kind === "network") {
+    // offline or the host is unreachable: try again later
+  } else {
+    report(error); // "signature", "invalidBundle", "releaseNotFound", ...
+  }
+}
+```
+
+`status()` describes the updater without a request, so it also works offline:
+
+```js
+const { currentVersion, confirmed, staged, rejected } = await status();
+if (staged) showBanner(`Restart to update to ${staged}`);
+if (rejected.length) report(`rolled back: ${rejected.join(", ")}`);
+```
+
+`staged` is a downloaded bundle waiting for the next launch, `confirmed` is
+`false` while the frontend on screen is still on trial, and `rejected` lists
+the versions that were rolled back. In Rust the same is
+`app.ota_updater().status()`.
+
+A staged bundle is addressed by its version, without another `check()`:
+
+```js
+import { install, discard } from "tauri-plugin-ffp-ota-updater-api";
+
+await install(staged);   // switch to it now (reloads), also when offline
+await discard(staged);   // or delete it: the user declined this update
+```
+
+Without `discard()` a downloaded bundle is used at the next launch whatever
+happened since. Discarding is not a rejection: `check()` offers the version
+again. The bundle being served and the confirmed one behind it cannot be
+discarded (`inUse`).
+
+Also available: `currentVersion()` (version of the frontend being served),
+`rollback()` (see [Rollback](#rollback)) and `reset()` (delete downloaded
+bundles and go back to the built-in frontend).
 Requests give up after 30 seconds without progress, and after 30 seconds
 (manifest) or 30 minutes (bundle) in total unless `timeout` is set.
 Without a bundler, call the commands through `window.__TAURI__.core.invoke`
-as `examples/tauri-app` does.
+as `examples/tauri-app` does; errors are then plain `{ kind, message }`
+objects.
 
 From Rust:
 
@@ -208,6 +300,25 @@ if let Some(update) = app.ota_updater().check().await? {
     update.download_and_install(|_chunk, _total| {}, || {}).await?;
 }
 ```
+
+### Bringing your own bundles
+
+`check()` and `download()` are one way to fill the bundle store, not the only
+one. From Rust, hand the plugin an archive and its signature that you got by
+other means: your own manifest format or transport, a release API, a file
+shipped next to the installer, a patch applied to the previous archive.
+
+```rust
+let updater = app.ota_updater();
+updater.stage(&archive, &signature, &version)?;  // verified, then stored
+updater.install(&version)?;                      // or leave it for the next launch
+```
+
+`stage` applies every check a download gets (signature, signed version,
+compatibility, size limits, archive contents) and nothing else about the
+bundle is trusted. `activate(&version)`, `install(&version)` and
+`discard(&version)` work on any stored bundle. Versions only move forward: a
+version older than the frontend being served is refused (`NotNewer`).
 
 ### Rollback
 
@@ -236,9 +347,13 @@ it is rejected and replaced right away, whatever attempts it has left, by
 reloading into the previous frontend. Choose a value well above the slowest start you expect, and do not
 make `notifyReady()` wait for the user (a login, say).
 
-From Rust, `app.ota_updater().rollback()` abandons the bundle being served
-without help from the frontend (for example from a menu item), and
-`notify_ready()` confirms it once a page was loaded from it.
+`rollback()` abandons the bundle being served at once, on trial or confirmed:
+its version is rejected and the app reloads into the last confirmed bundle or
+the built-in frontend. A frontend that notices it is broken can call it from
+an error boundary instead of waiting for the timeout (it needs the
+`allow-rollback` permission). From Rust, `app.ota_updater().rollback()` does
+the same without help from the frontend (for example from a menu item), and
+`notify_ready()` confirms the bundle once a page was loaded from it.
 
 To take back a frontend that was confirmed but turned out to be wrong, publish
 the previous build again under a new, higher version.
@@ -339,7 +454,7 @@ those releases to this plugin:
 tauri_plugin_updater::Builder::new()
     .default_version_comparator(|current, release| {
         release.version > current
-            && !tauri_plugin_ffp_ota_updater::default_version_comparator(
+            && !tauri_plugin_ffp_ota_updater::default_compatibility(
                 &current,
                 &release.version,
             )
@@ -348,6 +463,26 @@ tauri_plugin_updater::Builder::new()
 ```
 
 A patch release must then never contain Rust changes.
+
+## Stability
+
+From 1.0 on these are covered by semantic versioning, in addition to the Rust
+and JavaScript APIs:
+
+- the configuration keys and the manifest fields (`version`, `notes`,
+  `pub_date`, `url`, `signature`), the bundle format (a `.tar.gz` of the
+  frontend, signed with `tauri signer`) and the endpoint variables;
+- the command names and their permissions, and which of them `default`
+  grants;
+- the `kind` strings of errors. New kinds may appear in minor releases, so
+  keep a fallback branch;
+- the store in the app's local data directory
+  (`ffp-ota-updater/<version>.tar.gz`, `.tar.gz.sig` and `state.json`): a
+  newer plugin version reads what an older one wrote.
+
+`reqwest` and `http` types are part of the Rust API (`configure_client`,
+headers, `Error`), so a new major version of either is a new major version of
+this crate.
 
 ## Limitations
 
@@ -412,7 +547,8 @@ npm run dev
 1. Add the function in `src/commands.rs` and register it in `src/lib.rs`
    (`generate_handler!`).
 2. Add its name to `COMMANDS` in `build.rs`.
-3. Add `allow-<command>` to `permissions/default.toml`.
+3. Add `allow-<command>` to `permissions/default.toml`, unless it should be
+   opt-in.
 4. Expose it in `guest-js/index.ts`.
 
 ## Trying the example

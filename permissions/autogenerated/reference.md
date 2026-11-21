@@ -1,6 +1,6 @@
 ## Default Permission
 
-Allows checking for, downloading and installing frontend (OTA) updates
+Allows checking for, downloading and installing frontend (OTA) updates, confirming them, discarding a staged one and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.
 
 #### This default permission set includes the following:
 
@@ -9,8 +9,9 @@ Allows checking for, downloading and installing frontend (OTA) updates
 - `allow-install`
 - `allow-download-and-install`
 - `allow-current-version`
-- `allow-reset`
 - `allow-notify-ready`
+- `allow-status`
+- `allow-discard`
 
 ## Permission Table
 
@@ -69,6 +70,32 @@ Enables the current_version command without any pre-configured scope.
 <td>
 
 Denies the current_version command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-discard`
+
+</td>
+<td>
+
+Enables the discard command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-discard`
+
+</td>
+<td>
+
+Denies the discard command without any pre-configured scope.
 
 </td>
 </tr>
@@ -199,6 +226,58 @@ Enables the reset command without any pre-configured scope.
 <td>
 
 Denies the reset command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-rollback`
+
+</td>
+<td>
+
+Enables the rollback command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-rollback`
+
+</td>
+<td>
+
+Denies the rollback command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-status`
+
+</td>
+<td>
+
+Enables the status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-status`
+
+</td>
+<td>
+
+Denies the status command without any pre-configured scope.
 
 </td>
 </tr>

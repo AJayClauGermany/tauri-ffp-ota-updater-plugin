@@ -1,14 +1,16 @@
 use std::{str::FromStr, time::Duration};
 
 use http::{HeaderMap, HeaderName, HeaderValue};
+use semver::Version;
 use serde::Serialize;
 use tauri::{AppHandle, Runtime, command, ipc::Channel};
+use url::Url;
 
-use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Update};
+use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Status, Update};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
-pub enum DownloadEvent {
+pub(crate) enum DownloadEvent {
     #[serde(rename_all = "camelCase")]
     Started {
         content_length: Option<u64>,
@@ -23,7 +25,6 @@ pub enum DownloadEvent {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Metadata {
-    kind: &'static str,
     current_version: String,
     version: String,
     downloaded: bool,
@@ -32,14 +33,18 @@ pub(crate) struct Metadata {
     raw_json: serde_json::Value,
 }
 
-/// The update `check` last returned to the webview, if it is for `version`.
+fn parse(version: &str) -> Result<Version> {
+    Ok(Version::parse(version.trim_start_matches('v'))?)
+}
+
+/// The update for `version` that a `check` returned to the webview.
 fn pending<R: Runtime>(app: &AppHandle<R>, version: &str) -> Result<Update<R>> {
     app.ota_updater()
         .pending
         .lock()
         .unwrap()
-        .clone()
-        .filter(|update| update.version.to_string() == version)
+        .get(&parse(version)?)
+        .cloned()
         .ok_or_else(|| Error::NoPendingUpdate(version.to_string()))
 }
 
@@ -69,10 +74,14 @@ pub(crate) async fn check<R: Runtime>(
     app: AppHandle<R>,
     headers: Option<Vec<(String, String)>>,
     timeout: Option<u64>,
+    proxy: Option<Url>,
 ) -> Result<Option<Metadata>> {
+    // no endpoints: where updates come from is not the webview's to decide
     let mut options = RequestOptions {
         headers: HeaderMap::new(),
         timeout: timeout.map(Duration::from_millis),
+        proxy,
+        ..Default::default()
     };
     for (name, value) in headers.unwrap_or_default() {
         options
@@ -83,7 +92,6 @@ pub(crate) async fn check<R: Runtime>(
     let updater = app.ota_updater();
     let update = updater.check_with(options).await?;
     let metadata = update.as_ref().map(|update| Metadata {
-        kind: "frontend",
         current_version: update.current_version.to_string(),
         version: update.version.to_string(),
         downloaded: update.downloaded,
@@ -91,7 +99,14 @@ pub(crate) async fn check<R: Runtime>(
         body: update.body.clone(),
         raw_json: update.raw_json.clone(),
     });
-    *updater.pending.lock().unwrap() = update;
+    if let Some(update) = update {
+        // Kept until that version is being served, whatever later checks return: the page may
+        // still hold the object it got for it.
+        let current = updater.current_version();
+        let mut pending = updater.pending.lock().unwrap();
+        pending.retain(|version, _| *version > current);
+        pending.insert(update.version.clone(), update);
+    }
     Ok(metadata)
 }
 
@@ -106,7 +121,13 @@ pub(crate) async fn download<R: Runtime>(
 
 #[command]
 pub(crate) async fn install<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
-    pending(&app, &version)?.install()
+    // by version alone: a bundle staged in an earlier run needs no `check` to be installed
+    app.ota_updater().install(&parse(&version)?)
+}
+
+#[command]
+pub(crate) async fn discard<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
+    app.ota_updater().discard(&parse(&version)?)
 }
 
 #[command]
@@ -133,4 +154,14 @@ pub(crate) async fn reset<R: Runtime>(app: AppHandle<R>) -> Result<()> {
 #[command]
 pub(crate) async fn notify_ready<R: Runtime>(app: AppHandle<R>) -> Result<()> {
     app.ota_updater().notify_ready()
+}
+
+#[command]
+pub(crate) fn status<R: Runtime>(app: AppHandle<R>) -> Status {
+    app.ota_updater().status()
+}
+
+#[command]
+pub(crate) async fn rollback<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.ota_updater().rollback()
 }
