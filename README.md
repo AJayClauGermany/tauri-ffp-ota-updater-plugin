@@ -36,15 +36,14 @@ tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri
 ```
 
 ```bash
-npm install tauri-plugin-ffp-ota-updater-api
+npm install github:AJayClauGermany/tauri-ffp-ota-updater-plugin
 ```
 
-> The crate and the npm package are not on crates.io / npm yet. Until they
-> are, use the git dependency above, and either build the JS package from a
-> checkout (`npm install && npm run build`, then install the folder) or call
-> the commands through `invoke` as
+> The crate and the npm package (`tauri-plugin-ffp-ota-updater-api`) are not
+> on crates.io / npm yet, so both are installed from git; the JS package is
+> built on your machine while it installs. `tauri add` does not know this
+> plugin. Without a bundler, call the commands through `invoke` as
 > [`examples/tauri-app`](examples/tauri-app/src/main.js) does.
-> `tauri add` does not know this plugin.
 
 ### 2. Register
 
