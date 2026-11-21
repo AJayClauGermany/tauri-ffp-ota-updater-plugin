@@ -81,9 +81,10 @@ reuse its `pubkey`:
 | `endpoints` | `[]` | Manifest URLs, tried in order. Variables: `{{current_version}}` (frontend being served), `{{binary_version}}`, `{{target}}`, `{{arch}}`. |
 | `pubkey` | | Minisign public key from `tauri signer generate`. |
 | `dangerousInsecureTransportProtocol` | `false` | Allow non-`https` endpoints, bundle URLs and redirects. |
-| `requireSignedVersion` | `true` | Reject signatures that do not record the version they were made for. Needs a Tauri CLI with `tauri signer sign --app-version`. |
-
+| `requireSignedVersion` | `true` | Reject signatures that do not record the version they were made for. Needs Tauri CLI 2.12 or newer (`tauri signer sign --app-version`). |
 | `rollback` | `true` | Revert a bundle the frontend does not confirm with `notifyReady()`. See [Rollback](#rollback). |
+| `trialAttempts` | `2` | Runs of the app in which a new bundle may be shown without confirming itself before it is reverted. See [Rollback](#rollback). |
+| `readyTimeout` | off | Milliseconds a new bundle gets to call `notifyReady()` before it is reverted while the app is running. See [Rollback](#rollback). |
 | `maxBundleSize` | 64 MiB | Largest `.tar.gz` accepted, in bytes. |
 | `maxUnpackedSize` | 256 MiB | Largest total size of the files in a bundle, in bytes. They are held in memory. |
 
@@ -136,6 +137,23 @@ page is accepted and that page is then missing.
 The manifest and the tarball can live on any host that serves them over
 `https`.
 
+In CI, after the frontend build, that comes down to (`VERSION` being the new
+patch version, `BASE_URL` where the files will be served from):
+
+```bash
+grep -rq 'ffp-ota-updater|notify_ready' dist   # fail if the build lost notifyReady()
+tar -czf "frontend-$VERSION.tar.gz" -C dist .
+npx tauri signer sign --app-version "$VERSION" "frontend-$VERSION.tar.gz"
+jq -n --arg v "$VERSION" --arg u "$BASE_URL/frontend-$VERSION.tar.gz" \
+  --rawfile s "frontend-$VERSION.tar.gz.sig" \
+  '{version: $v, url: $u, signature: $s}' > ota.json
+```
+
+Give the tarball a name that contains its version. A manifest and a tarball
+that are both "the latest" can be fetched from two different releases while
+one is being published; with versioned names that download fails cleanly
+instead, and the signature check catches the mix-up in either case.
+
 ### Per-platform bundles
 
 One tarball serves every platform by default. If the frontend build differs
@@ -169,6 +187,11 @@ if (update) {
 }
 ```
 
+`check()` rejects when the device is offline or the endpoint is down, so
+catch its errors and never make rendering wait for it. `download()` does
+nothing for a bundle that is already stored (`update.downloaded`), so running
+this on every start is cheap.
+
 Also available: `currentVersion()` (version of the frontend being served) and
 `reset()` (delete downloaded bundles and go back to the built-in frontend).
 Requests give up after 30 seconds without progress, and after 30 seconds
@@ -188,21 +211,37 @@ if let Some(update) = app.ota_updater().check().await? {
 
 ### Rollback
 
-A downloaded bundle is on trial from the first time it is served until the
-frontend calls `notifyReady()`. If the app starts again and the trial is still
-open, the bundle is taken to be broken: its version is rejected for good
-(`check()` no longer offers it; publish the fix as a new version) and the last
-confirmed bundle, or else the built-in frontend, is served. The trial is
-recorded on disk before the bundle is served, and the confirmed bundle is kept
-until its successor is confirmed.
+A downloaded bundle is on trial from the first page loaded from it until the
+frontend calls `notifyReady()`. A run of the app that shows the bundle and
+ends without that call is a failed attempt. One such run may be an app that
+was closed while it was starting, so the bundle is tried again; after the
+second (`trialAttempts`) it is taken to be broken: its version is rejected for
+good (`check()` no longer offers it; publish the fix as a new version) and the
+last confirmed bundle, or else the built-in frontend, is served. The confirmed
+bundle is kept until its successor is confirmed.
+
+Runs in which no page was loaded from the bundle, such as an app that starts
+hidden in the tray or is closed before its window appears, are not attempts
+and leave the bundle as it was. The attempt is recorded on disk before the
+page is served.
 
 **Every frontend you publish must call `notifyReady()`**, or it is reverted on
-the second launch. Call it once the app got far enough that it could update
+the third launch. Call it once the app got far enough that it could update
 itself again. Set `"rollback": false` to serve bundles without a trial.
 
+Without `readyTimeout` a broken bundle stays on screen until the user restarts
+the app, twice with the default `trialAttempts`. Set it, for example `"readyTimeout": 20000`, and a bundle that has not
+confirmed itself that many milliseconds after the first page was loaded from
+it is rejected and replaced right away, whatever attempts it has left, by
+reloading into the previous frontend. Choose a value well above the slowest start you expect, and do not
+make `notifyReady()` wait for the user (a login, say).
+
 From Rust, `app.ota_updater().rollback()` abandons the bundle being served
-without help from the frontend (for example from a menu item, or your own
-watchdog timer), and `notify_ready()` confirms it.
+without help from the frontend (for example from a menu item), and
+`notify_ready()` confirms it once a page was loaded from it.
+
+To take back a frontend that was confirmed but turned out to be wrong, publish
+the previous build again under a new, higher version.
 
 ### Switching without reloading
 
@@ -218,6 +257,55 @@ app.ota_updater().reload()?;     // or reload / recreate windows one by one
 Between the two calls, documents that are already loaded still run the old
 frontend but would get lazily loaded assets from the new one, so keep the gap
 short.
+
+### What a frontend update can change
+
+A bundle runs on every binary of its minor version line, including the oldest
+one still installed, so it may only rely on what all of them have. Fixed in
+the binary, and therefore out of reach of a frontend update:
+
+- Rust commands and plugins, and the capabilities that permit them. Keep the
+  `@tauri-apps/plugin-*` npm packages at the versions the binary was built
+  with.
+- `tauri.conf.json`: window labels and the page each window opens, the CSP
+  (a new API host, font or image origin needs a binary release), asset and
+  filesystem scopes.
+- `getVersion()` from `@tauri-apps/api/app` keeps returning the binary's
+  version. Use `currentVersion()` for what the user is actually running.
+
+Build the bundle exactly like the frontend of the app: same bundler `base`,
+same environment variables. Data the old frontend left in `localStorage` or
+IndexedDB is read by the new one, so version anything you persist (with
+TanStack Query's persisted cache, set its `buster` to the frontend version).
+
+### Multi-page apps
+
+Every page is a fresh document, which has three consequences:
+
+- The start-up code runs on every navigation. Call `notifyReady()` on each
+  page (it is a no-op once confirmed), from a module all entry points share.
+  With React, call it in an effect of the root component rather than at the
+  top of the module, so that a build that fails to render is not confirmed.
+- Check for updates once per launch, not once per page: from Rust (below), or
+  guarded by a `sessionStorage` flag, which survives navigation.
+- `install()` reloads the page the window is on. Pages a bundle no longer
+  contains, and requests for files of the previous build, are answered with
+  `index.html` (Tauri's fallback), not with an error: keep page paths stable.
+
+Checking from Rust is independent of which page is open:
+
+```rust
+.setup(|app| {
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        // staged for the next launch; errors (offline) are not fatal
+        if let Ok(Some(update)) = handle.ota_updater().check().await {
+            let _ = update.download(|_, _| {}, || {}).await;
+        }
+    });
+    Ok(())
+})
+```
 
 ### Together with the updater plugin
 
@@ -241,6 +329,26 @@ A workable versioning scheme: bump the patch version for frontend-only
 releases and publish them through this plugin; bump minor or major when the
 Rust side changes and publish those through the updater.
 
+If every release is also built and published as a full application (so that
+new users install the latest frontend), the updater would offer a patch
+release as a full download even to users who already have it as a frontend
+bundle, because it compares against the binary's version. Tell it to leave
+those releases to this plugin:
+
+```rust
+tauri_plugin_updater::Builder::new()
+    .default_version_comparator(|current, release| {
+        release.version > current
+            && !tauri_plugin_ffp_ota_updater::default_version_comparator(
+                &current,
+                &release.version,
+            )
+    })
+    .build()
+```
+
+A patch release must then never contain Rust changes.
+
 ## Limitations
 
 - **Dev mode**: `tauri dev` loads the frontend from the dev server, so a
@@ -248,10 +356,13 @@ Rust side changes and publish those through the updater.
 - **Strict CSP**: Tauri computes nonces and hashes for inline scripts and
   styles at build time, for the embedded HTML only. In a downloaded bundle,
   load scripts and styles from files (what bundlers emit) rather than inline.
-- **Rollback happens at the next launch**, not while the broken frontend is
-  on screen, and `notifyReady()` is not tied to a particular page: any window
-  can confirm the trial. Add a timer around `rollback()` in Rust if you need
-  more.
+- **Rollback happens at the next launch** unless `readyTimeout` is set, and
+  `notifyReady()` is not tied to a particular page: any window can confirm
+  the trial.
+- **A good bundle can still be rejected** if the app is closed between
+  showing it and its `notifyReady()` call in `trialAttempts` runs in a row.
+  The device then stays on the previous frontend until the next version is
+  published.
 - One running instance per user is assumed; the bundle store is not locked
   against a second process.
 - The manifest itself is not signed, the bundle is. `requireSignedVersion`

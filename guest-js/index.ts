@@ -18,6 +18,7 @@ interface UpdateMetadata {
   kind: 'frontend'
   currentVersion: string
   version: string
+  downloaded: boolean
   date?: string
   body?: string
   rawJson: Record<string, unknown>
@@ -34,6 +35,12 @@ export class Update {
   currentVersion: string
   /** Version of the update. */
   version: string
+  /**
+   * Whether the bundle is already stored on this device, waiting for
+   * {@link install} or the next launch. {@link download} then returns without
+   * fetching it again.
+   */
+  downloaded: boolean
   date?: string
   /** Release notes. */
   body?: string
@@ -43,6 +50,7 @@ export class Update {
   constructor(metadata: UpdateMetadata) {
     this.currentVersion = metadata.currentVersion
     this.version = metadata.version
+    this.downloaded = metadata.downloaded
     this.date = metadata.date
     this.body = metadata.body
     this.rawJson = metadata.rawJson
@@ -51,18 +59,22 @@ export class Update {
   /**
    * Downloads, verifies and stores the frontend bundle. Without a following
    * {@link install} it takes effect the next time the app starts.
+   *
+   * Safe to call again for a bundle that is already stored: nothing is
+   * fetched and only the `Finished` event is sent.
    */
   async download(onEvent?: (progress: DownloadEvent) => void): Promise<void> {
     await invoke('plugin:ffp-ota-updater|download', {
       version: this.version,
       onEvent: channel(onEvent),
     })
+    this.downloaded = true
   }
 
   /**
    * Switches to the downloaded bundle now by reloading the app's webviews.
    * In-memory page state is lost, as with any reload. The new frontend has to
-   * call {@link notifyReady} or it is reverted on the next launch.
+   * call {@link notifyReady} or it is reverted.
    */
   async install(): Promise<void> {
     await invoke('plugin:ffp-ota-updater|install', { version: this.version })
@@ -124,9 +136,10 @@ export async function reset(): Promise<void> {
  * Confirms that the frontend being served works. Call it on every start, once
  * the app got far enough that it could update itself again.
  *
- * A downloaded bundle that has not confirmed itself by the next launch is
- * reverted to the last confirmed one (or the built-in frontend) and its
- * version is never offered again. Disable with `"rollback": false`.
+ * A downloaded bundle that was shown in two runs of the app (`trialAttempts`)
+ * without confirming itself is reverted to the last confirmed one (or the
+ * built-in frontend) and its version is never offered again. Disable with
+ * `"rollback": false`.
  */
 export async function notifyReady(): Promise<void> {
   await invoke('plugin:ffp-ota-updater|notify_ready')

@@ -103,6 +103,8 @@ impl Builder {
                         unpacked: config.max_unpacked_size,
                     },
                     rollback: config.rollback,
+                    trial_attempts: config.trial_attempts,
+                    shown: Mutex::new(None),
                     binary: binary_version.clone(),
                     comparator: self
                         .comparator
@@ -117,15 +119,16 @@ impl Builder {
                         "tauri_plugin_ffp_ota_updater::install(&mut context) was not called; downloaded frontends will not be served"
                     );
                 }
-                assets::set_active(store.select(None));
-
-                app.manage(OtaUpdater {
+                let updater = OtaUpdater {
                     app: app.clone(),
                     config,
                     store,
                     binary_version,
                     pending: Mutex::new(None),
-                });
+                    downloading: Default::default(),
+                };
+                updater.serve(updater.store.select(None));
+                app.manage(updater);
                 Ok(())
             })
             .build()

@@ -8,7 +8,10 @@ use serde::{Deserialize, Deserializer};
 use tauri::{AppHandle, Manager, Runtime};
 use url::Url;
 
-use crate::{Config, Error, OtaUpdaterExt, Result, assets, bundle::Store};
+use crate::{
+    Config, Error, OtaUpdaterExt, Result, assets,
+    bundle::{Bundle, Store},
+};
 
 const USER_AGENT: &str = concat!("tauri-plugin-ffp-ota-updater/", env!("CARGO_PKG_VERSION"));
 /// A manifest is a few hundred bytes.
@@ -63,6 +66,9 @@ pub struct OtaUpdater<R: Runtime> {
     pub(crate) binary_version: Version,
     /// The release the last successful `check` from the webview returned.
     pub(crate) pending: Mutex<Option<Update<R>>>,
+    /// Held for the length of a download, so that concurrent requests for the same bundle
+    /// (two windows, or two pages of a multi-page app in a row) fetch it once.
+    pub(crate) downloading: tauri::async_runtime::Mutex<()>,
 }
 
 impl<R: Runtime> OtaUpdater<R> {
@@ -151,6 +157,9 @@ impl<R: Runtime> OtaUpdater<R> {
         Ok(Some(Update {
             app: self.app.clone(),
             current_version,
+            downloaded: self
+                .store
+                .is_stored(&release.version, &release.signature, false),
             version: release.version,
             date: release.pub_date,
             body: release.notes,
@@ -163,11 +172,12 @@ impl<R: Runtime> OtaUpdater<R> {
 
     /// Tells the updater that the frontend being served works.
     ///
-    /// A bundle is on trial from the moment it is first served until this is called. A trial
-    /// that is still open when the app starts the next time has failed: that version is
-    /// rejected for good and the last confirmed bundle, or else the built-in frontend, is
-    /// served instead. Does nothing when there is no trial, so call it on every start, once the
-    /// frontend got far enough that it could update itself again.
+    /// A bundle is on trial from the first page loaded from it until this is called. A run of
+    /// the app that ends with the trial still open is a failed attempt; after `trialAttempts`
+    /// of them (2 by default) that version is rejected for good and the last confirmed bundle,
+    /// or else the built-in frontend, is served instead. Does nothing when there is no trial,
+    /// which includes a bundle no page was loaded from yet, so call it on every start, once
+    /// the frontend got far enough that it could update itself again.
     pub fn notify_ready(&self) -> Result<()> {
         match assets::active() {
             Some(bundle) => self.store.confirm(&bundle.version),
@@ -180,10 +190,57 @@ impl<R: Runtime> OtaUpdater<R> {
     /// built-in frontend and the webviews are reloaded.
     pub fn rollback(&self) -> Result<()> {
         if let Some(bundle) = assets::active() {
-            assets::set_active(self.store.select(Some(&bundle.version)));
+            self.serve(self.store.select(Some(&bundle.version)));
             self.reload()?;
         }
         Ok(())
+    }
+
+    /// Makes `bundle` (or the built-in frontend) what is served from now on.
+    ///
+    /// The trial of an unconfirmed bundle starts when the first page is loaded from it, not
+    /// here: an app that is closed before it showed the bundle has learned nothing about it.
+    /// With `readyTimeout` set, the bundle is rolled back if it is still unconfirmed that long
+    /// after that page load.
+    pub(crate) fn serve(&self, bundle: Option<Bundle>) {
+        let timeout = self.config.ready_timeout.filter(|ms| *ms > 0);
+        let unproven = bundle
+            .as_ref()
+            .map(|bundle| bundle.version.clone())
+            .filter(|version| self.store.unproven(version));
+        let on_document = unproven.map(|version| {
+            let app = self.app.clone();
+            Box::new(move || {
+                let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
+                    return;
+                };
+                if let Err(error) = updater.store.begin_trial(&version) {
+                    // a trial that is not on record could not be rolled back
+                    log::warn!("not serving frontend bundle {version}: {error}");
+                    updater.serve(updater.store.fallback());
+                    return;
+                }
+                let Some(timeout) = timeout else {
+                    return;
+                };
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(timeout));
+                    let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
+                        return;
+                    };
+                    if let Some(fallback) = updater.store.fail_trial(&version) {
+                        log::warn!(
+                            "frontend bundle {version} was not confirmed within {timeout} ms; rolling it back"
+                        );
+                        updater.serve(fallback);
+                        if let Err(error) = updater.reload() {
+                            log::error!("could not reload after the rollback: {error}");
+                        }
+                    }
+                });
+            }) as assets::DocumentHook
+        });
+        assets::set_active(bundle, on_document);
     }
 
     /// Deletes every downloaded bundle and goes back to the built-in frontend, reloading the
@@ -191,7 +248,7 @@ impl<R: Runtime> OtaUpdater<R> {
     pub fn reset(&self) -> Result<()> {
         self.store.clear()?;
         if assets::active().is_some() {
-            assets::set_active(None);
+            self.serve(None);
             self.reload()?;
         }
         Ok(())
@@ -289,6 +346,9 @@ pub struct Update<R: Runtime> {
     pub current_version: Version,
     /// Version of the update.
     pub version: Version,
+    /// Whether this bundle was already downloaded when the check was made, and is waiting for
+    /// [`Self::install`] or the next launch. [`Self::download`] then does not fetch it again.
+    pub downloaded: bool,
     /// Release date from the manifest.
     pub date: Option<String>,
     /// Release notes from the manifest.
@@ -308,6 +368,7 @@ impl<R: Runtime> Clone for Update<R> {
             app: self.app.clone(),
             current_version: self.current_version.clone(),
             version: self.version.clone(),
+            downloaded: self.downloaded,
             date: self.date.clone(),
             body: self.body.clone(),
             raw_json: self.raw_json.clone(),
@@ -324,6 +385,10 @@ impl<R: Runtime> Update<R> {
     /// A stored bundle is picked up automatically on the next launch; call [`Self::install`] to
     /// switch to it right away. `on_chunk` receives the chunk length and the total content
     /// length, if known.
+    ///
+    /// A bundle that is already stored, with the signature this release announces, is not
+    /// fetched again: only `on_download_finish` is called. Calling this on every start, or on
+    /// every page of a multi-page app, is therefore cheap.
     pub async fn download<C: FnMut(usize, Option<u64>), D: FnOnce()>(
         &self,
         mut on_chunk: C,
@@ -336,6 +401,15 @@ impl<R: Runtime> Update<R> {
             return Err(Error::InsecureTransportProtocol(
                 self.download_url.to_string(),
             ));
+        }
+
+        let _downloading = updater.downloading.lock().await;
+        if updater
+            .store
+            .is_stored(&self.version, &self.signature, true)
+        {
+            on_download_finish();
+            return Ok(());
         }
 
         let mut headers = self.options.headers.clone();
@@ -372,11 +446,11 @@ impl<R: Runtime> Update<R> {
     /// must not be interrupted, call this, then reload or recreate each window (see
     /// [`OtaUpdater::reload`]) before the old documents load more of their assets.
     ///
-    /// The bundle is verified again as it is loaded from disk, and is on trial until
-    /// [`OtaUpdater::notify_ready`].
+    /// The bundle is verified again as it is loaded from disk, and is on trial from the first
+    /// page loaded from it until [`OtaUpdater::notify_ready`].
     pub fn activate(&self) -> Result<()> {
-        let bundle = self.app.ota_updater().store.activate(&self.version)?;
-        assets::set_active(Some(bundle));
+        let updater = self.app.ota_updater();
+        updater.serve(Some(updater.store.activate(&self.version)?));
         Ok(())
     }
 

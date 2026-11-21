@@ -3,7 +3,7 @@
 use std::{
     borrow::Cow,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -19,13 +19,21 @@ use crate::bundle::Bundle;
 // exists, so the two halves share the active bundle through process-wide state.
 static ACTIVE: RwLock<Option<Arc<Bundle>>> = RwLock::new(None);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Runs once, when the active bundle serves its next HTML document.
+static ON_DOCUMENT: Mutex<Option<DocumentHook>> = Mutex::new(None);
+
+pub(crate) type DocumentHook = Box<dyn FnOnce() + Send>;
 
 pub(crate) fn active() -> Option<Arc<Bundle>> {
     ACTIVE.read().unwrap().clone()
 }
 
-pub(crate) fn set_active(bundle: Option<Bundle>) {
-    *ACTIVE.write().unwrap() = bundle.map(Arc::new);
+/// Switches the frontend being served. `on_document` is called once, right before the first
+/// page is loaded from `bundle`, and replaces a hook that has not run yet. It may switch again.
+pub(crate) fn set_active(bundle: Option<Bundle>, on_document: Option<DocumentHook>) {
+    let mut active = ACTIVE.write().unwrap();
+    *ON_DOCUMENT.lock().unwrap() = on_document;
+    *active = bundle.map(Arc::new);
 }
 
 pub(crate) fn is_installed() -> bool {
@@ -45,7 +53,19 @@ impl<R: Runtime> Assets<R> for OtaAssets<R> {
         match active() {
             // A bundle replaces the frontend as a whole: files it lacks are not looked up in
             // the embedded assets, which would mix two versions.
-            Some(bundle) => bundle.files.get(key.as_ref()).cloned().map(Cow::Owned),
+            Some(bundle) => {
+                let file = bundle.files.get(key.as_ref())?;
+                if key.as_ref().ends_with(".html") {
+                    // taken out first: the hook must not run under the lock
+                    let hook = ON_DOCUMENT.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                        // the hook may have decided against serving this bundle
+                        return self.get(key);
+                    }
+                }
+                Some(Cow::Owned(file.clone()))
+            }
             None => self.embedded.get(key),
         }
     }

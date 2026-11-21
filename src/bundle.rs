@@ -6,7 +6,15 @@
 //! rejected, in which case the app falls back to an older bundle or its built-in assets.
 //!
 //! Next to the bundles, `state.json` records which bundle was confirmed to work, which one is
-//! on trial, and which versions were rejected. See [`Store::select`].
+//! on trial, and which versions were rejected. A bundle goes through these stages:
+//!
+//! - *stored*: downloaded, and no page has been loaded from it yet. Launching the app any
+//!   number of times without showing it changes nothing.
+//! - *on trial*: a page was loaded from it ([`Store::begin_trial`]). Every run of the app that
+//!   does so without a confirmation following counts as a failed attempt.
+//! - *confirmed* by the frontend ([`Store::confirm`]), which makes it the fallback, or
+//!   *rejected*: when the attempts are used up ([`Store::select`]), or at once by a rollback
+//!   or an expired ready timeout ([`Store::fail_trial`]).
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -194,9 +202,11 @@ fn base64_to_string(value: &str) -> Result<String> {
 struct State {
     /// The last bundle the frontend confirmed to work; kept as the fallback.
     confirmed: Option<Version>,
-    /// The bundle being served without having been confirmed yet. Recorded before it is
-    /// served, so that a launch that finds it still here knows the trial failed.
+    /// The bundle a page was loaded from without it having been confirmed yet. Recorded before
+    /// that page is served, so that a launch that finds it still here knows the attempt failed.
     trial: Option<Version>,
+    /// Runs of the app in which a page was loaded from `trial`.
+    attempts: u32,
     /// Versions that failed a trial or were rolled back. They are never served or offered
     /// again; a fixed frontend needs a new version.
     rejected: BTreeSet<Version>,
@@ -211,6 +221,10 @@ pub(crate) struct Store {
     pub limits: Limits,
     /// With rollback off every bundle counts as confirmed as soon as it is served.
     pub rollback: bool,
+    /// Failed attempts after which a bundle on trial is rejected.
+    pub trial_attempts: u32,
+    /// The bundle whose trial this run of the app already counts as an attempt of.
+    pub shown: Mutex<Option<Version>>,
     pub binary: Version,
     pub comparator: VersionComparator,
     /// Serializes everything that reads and then writes the state.
@@ -244,6 +258,52 @@ impl Store {
 
     pub fn is_rejected(&self, version: &Version) -> bool {
         self.read_state().rejected.contains(version)
+    }
+
+    /// Whether serving `version` is a trial, i.e. it still has to be confirmed.
+    pub fn unproven(&self, version: &Version) -> bool {
+        self.rollback && self.read_state().confirmed.as_ref() != Some(version)
+    }
+
+    /// Records that a page is about to be loaded from the unconfirmed bundle `version`, which
+    /// puts it on trial and counts as one attempt per run of the app.
+    ///
+    /// On an error the trial is not on record and the bundle must not be served: it could not
+    /// be rolled back.
+    pub fn begin_trial(&self, version: &Version) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        let mut shown = self.shown.lock().unwrap();
+        let mut state = self.read_state();
+        if shown.as_ref() == Some(version) || state.confirmed.as_ref() == Some(version) {
+            return Ok(());
+        }
+        if state.trial.as_ref() == Some(version) {
+            state.attempts += 1;
+        } else {
+            state.trial = Some(version.clone());
+            state.attempts = 1;
+        }
+        self.write_state(&state)?;
+        *shown = Some(version.clone());
+        Ok(())
+    }
+
+    /// The last confirmed bundle, to serve when a trial cannot go ahead.
+    pub fn fallback(&self) -> Option<Bundle> {
+        let _guard = self.lock.lock().unwrap();
+        self.read_state()
+            .confirmed
+            .and_then(|version| self.load(&version).ok())
+    }
+
+    /// Whether `version` is stored with exactly this signature. With `verify` the stored
+    /// archive is also checked against it, which reads and unpacks the whole bundle.
+    pub fn is_stored(&self, version: &Version, signature: &str, verify: bool) -> bool {
+        let _guard = self.lock.lock().unwrap();
+        self.archive_path(version).is_file()
+            && fs::read_to_string(self.signature_path(version))
+                .is_ok_and(|stored| stored.trim() == signature.trim())
+            && (!verify || self.load(version).is_ok())
     }
 
     fn read_state(&self) -> State {
@@ -353,8 +413,8 @@ impl Store {
         Ok(())
     }
 
-    /// Loads the stored bundle `version` to switch to it while the app is running, recording
-    /// it as on trial before it is returned for serving.
+    /// Loads the stored bundle `version` to switch to it while the app is running. Its trial
+    /// starts with the first page loaded from it.
     pub fn activate(&self, version: &Version) -> Result<Bundle> {
         let _guard = self.lock.lock().unwrap();
         let mut state = self.read_state();
@@ -362,24 +422,31 @@ impl Store {
             return Err(Error::Rejected(version.to_string()));
         }
         let bundle = self.load(version)?;
+        let old_state = state.clone();
         if !self.rollback {
             state.confirmed = Some(version.clone());
-            state.trial = None;
-        } else if state.confirmed.as_ref() != Some(version) {
-            state.trial = Some(version.clone());
         }
-        self.write_state(&state)?;
+        if !self.rollback || state.trial.as_ref() != Some(version) {
+            // an earlier trial is superseded
+            state.trial = None;
+            state.attempts = 0;
+        }
+        if state != old_state {
+            self.write_state(&state)?;
+        }
         self.prune(&state, version);
         Ok(bundle)
     }
 
     /// Records that the frontend of `serving` works. It becomes the fallback and the previous
-    /// one is deleted.
+    /// one is deleted. Only a bundle on trial can be confirmed: before a page was loaded from
+    /// it, nothing can vouch for it.
     pub fn confirm(&self, serving: &Version) -> Result<()> {
         let _guard = self.lock.lock().unwrap();
         let mut state = self.read_state();
         if state.trial.as_ref() == Some(serving) {
             state.confirmed = state.trial.take();
+            state.attempts = 0;
             self.write_state(&state)?;
             self.prune(&state, serving);
         }
@@ -389,22 +456,40 @@ impl Store {
     /// Picks the bundle to serve: the newest stored one that is compatible with the binary, was
     /// not rejected and passes verification.
     ///
-    /// Called at startup, where a trial left unconfirmed by the previous run is rejected, and
-    /// to roll back, where `reject` is the version to abandon. A bundle chosen without having
-    /// been confirmed before goes on trial. Bundles that are incompatible (e.g. left over from
+    /// Called at startup, where a trial that earlier runs left unconfirmed is rejected once its
+    /// attempts are used up, and to roll back, where `reject` is the version to abandon. A
+    /// bundle chosen without having been confirmed goes on trial when the first page is loaded
+    /// from it, see [`Self::begin_trial`]. Bundles that are incompatible (e.g. left over from
     /// before a full update), rejected, invalid or superseded are deleted. Never fails: with no
     /// usable bundle the built-in assets are used.
     pub fn select(&self, reject: Option<&Version>) -> Option<Bundle> {
         let _guard = self.lock.lock().unwrap();
+        self.select_locked(reject)
+    }
+
+    /// Rejects `version` and [selects](Self::select) its replacement, unless it was confirmed
+    /// or replaced in the meantime, in which case nothing happens and `None` is returned.
+    pub fn fail_trial(&self, version: &Version) -> Option<Option<Bundle>> {
+        let _guard = self.lock.lock().unwrap();
+        (self.read_state().trial.as_ref() == Some(version))
+            .then(|| self.select_locked(Some(version)))
+    }
+
+    fn select_locked(&self, reject: Option<&Version>) -> Option<Bundle> {
         let old_state = self.read_state();
         let mut state = old_state.clone();
 
-        if let Some(version) = state.trial.take() {
-            log::warn!("frontend bundle {version} was not confirmed to work; rejecting it");
-            state.rejected.insert(version);
-        }
         if let Some(version) = reject {
             state.rejected.insert(version.clone());
+        }
+        if state.attempts >= self.trial_attempts.max(1)
+            && let Some(version) = &state.trial
+            && state.rejected.insert(version.clone())
+        {
+            log::warn!(
+                "frontend bundle {version} was not confirmed to work in {} attempt(s); rejecting it",
+                state.attempts
+            );
         }
         // a full update makes the history of the previous binary irrelevant
         state.rejected.retain(|version| self.compatible(version));
@@ -434,30 +519,36 @@ impl Store {
             }
         }
 
-        match &chosen {
-            Some(bundle) if !self.rollback => state.confirmed = Some(bundle.version.clone()),
-            Some(bundle) if state.confirmed.as_ref() != Some(&bundle.version) => {
-                state.trial = Some(bundle.version.clone());
-            }
-            _ => {}
+        let serving = chosen.as_ref().map(|bundle| &bundle.version);
+        if !self.rollback && serving.is_some() {
+            state.confirmed = serving.cloned();
+        }
+        if state.trial.as_ref() != serving || state.confirmed.as_ref() == serving {
+            // a trial goes on only if the same bundle gets another attempt
+            state.trial = None;
+            state.attempts = 0;
         }
         if state != old_state
             && let Err(error) = self.write_state(&state)
         {
-            // a trial that is not on record could not be rolled back
+            // nothing is lost: the same conclusions are reached at the next launch
             log::warn!("could not record the OTA state: {error}");
-            if state.trial.take().is_some() {
-                chosen = state.confirmed.as_ref().and_then(|v| self.load(v).ok());
-            }
         }
         if let Some(bundle) = &chosen {
             self.prune(&state, &bundle.version);
         }
         if let Ok(entries) = fs::read_dir(&self.dir) {
-            // left behind by an interrupted write
+            // left behind by an interrupted write: partial files, and signatures whose archive
+            // was never completed
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().ends_with(PARTIAL_EXT) {
-                    let _ = fs::remove_file(entry.path());
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let orphan = name
+                    .strip_suffix(".sig")
+                    .is_some_and(|archive| !path.with_file_name(archive).exists());
+                if name.ends_with(PARTIAL_EXT) || orphan {
+                    let _ = fs::remove_file(path);
                 }
             }
         }
