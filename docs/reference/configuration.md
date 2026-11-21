@@ -1,0 +1,127 @@
+# Configuration reference
+
+- [Registration](#registration)
+- [`tauri.conf.json`](#tauriconfjson)
+- [Endpoint variables](#endpoint-variables)
+- [Builder](#builder)
+- [Permissions](#permissions)
+- [Fixed limits](#fixed-limits)
+
+## Registration
+
+| Item | |
+| --- | --- |
+| Crate | `tauri-plugin-ffp-ota-updater` |
+| npm package | `tauri-plugin-ffp-ota-updater-api` |
+| Plugin name (config block, permission prefix, command prefix) | `ffp-ota-updater` |
+| Platforms | Windows, macOS, Linux |
+| Minimum Rust | see `rust-version` in `Cargo.toml` |
+
+| Function | |
+| --- | --- |
+| `install(&mut context)` | Wraps the context's embedded assets so that a bundle can be served in their place. Call once, before `tauri::Builder::run(context)`. Without it the plugin works but never changes what is displayed, and logs a warning at startup. |
+| `init()` | The plugin with the configuration from `tauri.conf.json`. Same as `Builder::new().build()`. |
+| `Builder::new()…build()` | The plugin with settings from Rust; see [Builder](#builder). |
+
+The plugin selects the frontend while it is being set up, so it must be added
+with `tauri::Builder::plugin`, before any window exists.
+
+## `tauri.conf.json`
+
+Under `plugins.ffp-ota-updater`. All keys are optional in the file;
+`endpoints` and `pubkey` are needed for `check()` and for accepting a bundle
+and can be given on the [Builder](#builder) instead.
+
+| Key | Type | Default | |
+| --- | --- | --- | --- |
+| `endpoints` | string[] | `[]` | Manifest URLs, tried in order. May contain [variables](#endpoint-variables). Must be `https`. |
+| `pubkey` | string | `""` | Minisign public key: the content of the `.pub` file written by `tauri signer generate`. |
+| `dangerousInsecureTransportProtocol` | boolean | `false` | Allow non-`https` endpoints, bundle URLs and redirects. |
+| `requireSignedVersion` | boolean | `true` | Reject signatures that do not record the version they were made for. Needs bundles signed with `tauri signer sign --app-version` (Tauri CLI 2.12 or newer). |
+| `rollback` | boolean | `true` | Revert a bundle the frontend does not confirm with `notifyReady()`. With `false`, bundles are served without a trial. |
+| `trialAttempts` | integer | `2` | Runs of the app in which a new bundle may be shown without confirming itself before it is rejected. Values below 1 count as 1. |
+| `readyTimeout` | integer (ms) | off | Time a bundle on trial gets, from the first page loaded from it, to call `notifyReady()` before it is rejected and replaced while the app is running. `0` is off. |
+| `maxBundleSize` | integer (bytes) | `67108864` (64 MiB) | Largest `.tar.gz` accepted. |
+| `maxUnpackedSize` | integer (bytes) | `268435456` (256 MiB) | Largest total size of the files in a bundle. They are held in memory. |
+
+A non-`https` entry in `endpoints` without
+`dangerousInsecureTransportProtocol` is a setup error: the app does not start.
+
+```json
+{
+  "plugins": {
+    "ffp-ota-updater": {
+      "endpoints": ["https://releases.example.com/ota.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6…",
+      "readyTimeout": 20000
+    }
+  }
+}
+```
+
+## Endpoint variables
+
+Replaced in each endpoint URL before the request.
+
+| Variable | Value | Example |
+| --- | --- | --- |
+| `{{current_version}}` | Version of the frontend being served: the active bundle's, or else the app's. | `1.2.1` |
+| `{{binary_version}}` | Version of the app (`version` in `tauri.conf.json`). | `1.2.0` |
+| `{{target}}` | `linux`, `windows` or `darwin`. | `darwin` |
+| `{{arch}}` | `x86_64`, `aarch64`, `i686` or `armv7`. | `aarch64` |
+
+Versions are percent-encoded (`+` becomes `%2B`).
+
+Responses:
+
+| Status | Meaning |
+| --- | --- |
+| `204` | No update. No further endpoint is tried. |
+| other `2xx` with a valid [manifest](formats.md#manifest) | The release to consider. |
+| anything else, an unreachable host, an invalid body | The next endpoint is tried. |
+
+Requests carry `Accept: application/json` (manifest) or
+`Accept: application/octet-stream` (bundle) unless a header overrides it, and
+`User-Agent: tauri-plugin-ffp-ota-updater/<version>`.
+
+## Builder
+
+`tauri_plugin_ffp_ota_updater::Builder`. Values set here take precedence over
+`tauri.conf.json`.
+
+| Method | |
+| --- | --- |
+| `pubkey(impl Into<String>)` | Overrides `pubkey`. |
+| `endpoints(Vec<Url>)` | Overrides `endpoints`. |
+| `header(key, value) -> Result<Self>` | Adds a header sent with every manifest request and bundle download. |
+| `headers(HeaderMap)` | Replaces those headers. |
+| `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). |
+| `proxy(Url)` | Use this proxy instead of the system's. |
+| `no_proxy()` | Ignore the system's proxy settings. |
+| `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
+| `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. A bundle is additionally only offered if it is newer than the frontend being served. |
+| `build()` | The plugin. |
+
+Per-check settings: [`RequestOptions`](api.md#requestoptions).
+
+## Permissions
+
+| Permission | Allows |
+| --- | --- |
+| `ffp-ota-updater:default` | `check`, `download`, `install`, `download-and-install`, `current-version`, `notify-ready`, `status`, `discard` |
+| `ffp-ota-updater:allow-rollback` | `rollback()`. Not in `default`. |
+| `ffp-ota-updater:allow-reset` | `reset()`. Not in `default`. |
+
+Every command has an `allow-<command>` and a `deny-<command>` permission; the
+full list is in
+[`permissions/autogenerated/reference.md`](../../permissions/autogenerated/reference.md).
+Permissions apply to calls from the webview. The Rust API is not subject to
+them.
+
+## Fixed limits
+
+| | |
+| --- | --- |
+| Manifest size | 1 MiB |
+| Files and directories in a bundle | 20 000 |
+| Time without progress before a request is given up | 30 s |
