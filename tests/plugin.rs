@@ -125,31 +125,42 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
 }
 
 fn launch(data_dir: &Path, binary_version: &str, pubkey: &str, port: u16) -> App<MockRuntime> {
-    launch_with(data_dir, binary_version, pubkey, port, 64 << 20)
+    launch_with(
+        data_dir,
+        binary_version,
+        pubkey,
+        port,
+        serde_json::json!({}),
+    )
 }
 
+/// `overrides` are extra keys for the plugin configuration.
 fn launch_with(
     data_dir: &Path,
     binary_version: &str,
     pubkey: &str,
     port: u16,
-    max_bundle_size: u64,
+    overrides: serde_json::Value,
 ) -> App<MockRuntime> {
     let mut context = mock_context(BuiltIn);
     context.package_info_mut().version = binary_version.parse().unwrap();
     context.config_mut().app.app_directories_override =
         Some(AppDirectoriesOverride::Root(data_dir.into()));
-    context.config_mut().plugins.0.insert(
-        "ffp-ota-updater".into(),
-        serde_json::json!({
-            "endpoints": [format!(
-                "http://127.0.0.1:{port}/{{{{target}}}}/{{{{binary_version}}}}/{{{{current_version}}}}/ota.json"
-            )],
-            "pubkey": pubkey,
-            "dangerousInsecureTransportProtocol": true,
-            "maxBundleSize": max_bundle_size,
-        }),
-    );
+    let mut config = serde_json::json!({
+        "endpoints": [format!(
+            "http://127.0.0.1:{port}/{{{{target}}}}/{{{{binary_version}}}}/{{{{current_version}}}}/ota.json"
+        )],
+        "pubkey": pubkey,
+        "dangerousInsecureTransportProtocol": true,
+    });
+    for (key, value) in overrides.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    context
+        .config_mut()
+        .plugins
+        .0
+        .insert("ffp-ota-updater".into(), config);
     tauri_plugin_ffp_ota_updater::install(&mut context);
     mock_builder()
         .plugin(tauri_plugin_ffp_ota_updater::init())
@@ -158,10 +169,15 @@ fn launch_with(
 }
 
 fn served_index(app: &App<MockRuntime>) -> String {
+    served(app, "index.html")
+}
+
+/// What the webview gets for `path`, going through Tauri's own lookup rules.
+fn served(app: &App<MockRuntime>, path: &str) -> String {
     let asset = app
         .asset_resolver()
-        .get("index.html".into())
-        .expect("index.html is not served");
+        .get(path.into())
+        .unwrap_or_else(|| panic!("{path} is not served"));
     String::from_utf8(asset.bytes().to_vec()).unwrap()
 }
 
@@ -289,7 +305,27 @@ fn frontend_update_lifecycle() {
     block_on(update.download(|chunk, _| downloaded += chunk, || finished = true)).unwrap();
     assert_eq!(downloaded, v121.len());
     assert!(finished);
+    assert!(!update.downloaded);
     assert_eq!(served_index(&app), "built-in");
+
+    // ...and a staged bundle is not fetched a second time, as happens when every page of a
+    // multi-page app checks for updates
+    let fetches = |file: &str| {
+        let requests = requests.lock().unwrap();
+        requests.iter().filter(|path| path.ends_with(file)).count()
+    };
+    let before = fetches("1.2.1.tar.gz");
+    let again = block_on(updater.check()).unwrap().expect("no update");
+    assert!(again.downloaded);
+    let (mut chunks, mut finished) = (0, false);
+    block_on(again.download(|_, _| chunks += 1, || finished = true)).unwrap();
+    assert!(finished && chunks == 0);
+    assert_eq!(fetches("1.2.1.tar.gz"), before);
+    // unless what is stored is not what the release announces
+    std::fs::write(store.join("1.2.1.tar.gz"), archive("damaged on disk")).unwrap();
+    block_on(again.download(|_, _| {}, || {})).unwrap();
+    assert_eq!(fetches("1.2.1.tar.gz"), before + 1);
+    assert_eq!(std::fs::read(store.join("1.2.1.tar.gz")).unwrap(), v121);
 
     // ...activate swaps it in, without reloading anything
     update.activate().unwrap();
@@ -335,6 +371,7 @@ fn frontend_update_lifecycle() {
     };
     stage(&app, "1.2.2", "1.2.2.tar.gz");
     std::fs::write(store.join("1.2.5.tar.gz.part"), "interrupted").unwrap();
+    std::fs::write(store.join("1.2.6.tar.gz.sig"), "archive never written").unwrap();
     drop(app);
 
     let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
@@ -342,6 +379,8 @@ fn frontend_update_lifecycle() {
     // the confirmed bundle is kept to fall back on
     assert!(store.join("1.2.1.tar.gz").exists());
     assert!(!store.join("1.2.5.tar.gz.part").exists());
+    assert!(!store.join("1.2.6.tar.gz.sig").exists());
+    assert!(store.join("1.2.2.tar.gz.sig").exists());
     drop(app); // without notify_ready
 
     let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
@@ -398,6 +437,122 @@ fn frontend_update_lifecycle() {
 
     drop(app);
     oversized_bundles_are_refused();
+    multi_page_bundles_are_served_page_by_page();
+    unconfirmed_bundles_time_out();
+}
+
+/// A test server with one published release, and an app on binary 1.2.0 that sees it. The
+/// closure launches that app again.
+fn published(
+    entries: &[(&str, &str)],
+    version: &str,
+    overrides: serde_json::Value,
+) -> (App<MockRuntime>, impl Fn() -> App<MockRuntime>) {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let bundle = archive_of(entries);
+    let routes = Routes::default();
+    let port = serve(routes.clone(), Default::default());
+    let manifest = serde_json::json!({
+        "version": version,
+        "url": format!("http://127.0.0.1:{port}/bundle.tar.gz"),
+        "signature": sign(&key, &bundle, Some(version)),
+    });
+    routes.lock().unwrap().extend([
+        ("ota.json", manifest.to_string().into_bytes()),
+        ("bundle.tar.gz", bundle),
+    ]);
+    let launch = move || launch_with(data_dir.path(), "1.2.0", &pubkey, port, overrides.clone());
+    (launch(), launch)
+}
+
+/// The layout Vite writes for several HTML entry points.
+fn multi_page_bundles_are_served_page_by_page() {
+    let (app, _) = published(
+        &[
+            ("./index.html", "home"),
+            ("./about.html", "about"),
+            ("./settings/index.html", "settings"),
+            ("./assets/settings-C0ffee.js", "settings js"),
+        ],
+        "1.2.1",
+        serde_json::json!({}),
+    );
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+
+    for (path, content) in [
+        ("index.html", "home"),
+        ("about.html", "about"),
+        ("about", "about"),
+        ("settings/index.html", "settings"),
+        ("settings/", "settings"),
+        ("settings", "settings"),
+        ("assets/settings-C0ffee.js", "settings js"),
+        // Tauri answers a path it cannot find with the index page, also for a bundle: a page
+        // or chunk missing from it is not an error the webview sees
+        ("removed.html", "home"),
+        ("assets/settings-0ldHash.js", "home"),
+    ] {
+        assert_eq!(served(&app, path), content, "{path}");
+    }
+    let js = app
+        .asset_resolver()
+        .get("assets/settings-C0ffee.js".into())
+        .unwrap();
+    assert_eq!(js.mime_type(), "text/javascript");
+    app.ota_updater().reset().unwrap();
+}
+
+fn unconfirmed_bundles_time_out() {
+    let wait = || std::thread::sleep(std::time::Duration::from_millis(1500));
+    let overrides = serde_json::json!({ "readyTimeout": 300 });
+
+    // confirmed in time: kept
+    let (app, _) = published(&[("./index.html", "good")], "1.2.1", overrides.clone());
+    let updater = app.ota_updater();
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    assert_eq!(served_index(&app), "good");
+    updater.notify_ready().unwrap();
+    wait();
+    assert_eq!(served_index(&app), "good");
+    updater.reset().unwrap();
+    drop(app);
+
+    // never confirmed: rolled back while the app is running, and not offered again
+    let (app, _) = published(&[("./index.html", "broken")], "1.2.1", overrides.clone());
+    let updater = app.ota_updater();
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    update.activate().unwrap();
+    // the clock starts with the first page loaded from the bundle, not before
+    wait();
+    assert_eq!(updater.current_version().to_string(), "1.2.1");
+    assert_eq!(served_index(&app), "broken");
+    wait();
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(updater.current_version().to_string(), "1.2.0");
+    assert!(block_on(updater.check()).unwrap().is_none());
+    drop(app);
+
+    // the same goes for a bundle picked up at launch
+    let (app, relaunch) = published(&[("./index.html", "broken")], "1.2.2", overrides);
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    drop(app);
+    let app = relaunch();
+    assert_eq!(served_index(&app), "broken");
+    wait();
+    assert_eq!(served_index(&app), "built-in");
+    drop(app);
+    // ...which stays rejected
+    assert_eq!(served_index(&relaunch()), "built-in");
 }
 
 fn oversized_bundles_are_refused() {
@@ -425,7 +580,7 @@ fn oversized_bundles_are_refused() {
         "1.2.0",
         &pubkey,
         port,
-        bundle.len() as u64 - 1,
+        serde_json::json!({ "maxBundleSize": bundle.len() as u64 - 1 }),
     );
     let update = block_on(app.ota_updater().check())
         .unwrap()

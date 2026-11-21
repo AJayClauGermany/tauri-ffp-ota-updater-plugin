@@ -18,6 +18,7 @@ interface UpdateMetadata {
   kind: 'frontend'
   currentVersion: string
   version: string
+  downloaded: boolean
   date?: string
   body?: string
   rawJson: Record<string, unknown>
@@ -34,6 +35,12 @@ export class Update {
   currentVersion: string
   /** Version of the update. */
   version: string
+  /**
+   * Whether the bundle is already stored on this device, waiting for
+   * {@link install} or the next launch. {@link download} then returns without
+   * fetching it again.
+   */
+  downloaded: boolean
   date?: string
   /** Release notes. */
   body?: string
@@ -43,6 +50,7 @@ export class Update {
   constructor(metadata: UpdateMetadata) {
     this.currentVersion = metadata.currentVersion
     this.version = metadata.version
+    this.downloaded = metadata.downloaded
     this.date = metadata.date
     this.body = metadata.body
     this.rawJson = metadata.rawJson
@@ -51,12 +59,16 @@ export class Update {
   /**
    * Downloads, verifies and stores the frontend bundle. Without a following
    * {@link install} it takes effect the next time the app starts.
+   *
+   * Safe to call again for a bundle that is already stored: nothing is
+   * fetched and only the `Finished` event is sent.
    */
   async download(onEvent?: (progress: DownloadEvent) => void): Promise<void> {
     await invoke('plugin:ffp-ota-updater|download', {
       version: this.version,
       onEvent: channel(onEvent),
     })
+    this.downloaded = true
   }
 
   /**

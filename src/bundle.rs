@@ -246,6 +246,21 @@ impl Store {
         self.read_state().rejected.contains(version)
     }
 
+    /// The version being served without having been confirmed yet.
+    pub fn trial(&self) -> Option<Version> {
+        self.read_state().trial
+    }
+
+    /// Whether `version` is stored with exactly this signature. With `verify` the stored
+    /// archive is also checked against it, which reads and unpacks the whole bundle.
+    pub fn is_stored(&self, version: &Version, signature: &str, verify: bool) -> bool {
+        let _guard = self.lock.lock().unwrap();
+        self.archive_path(version).is_file()
+            && fs::read_to_string(self.signature_path(version))
+                .is_ok_and(|stored| stored.trim() == signature.trim())
+            && (!verify || self.load(version).is_ok())
+    }
+
     fn read_state(&self) -> State {
         match fs::read(self.dir.join(STATE_FILE)) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
@@ -396,6 +411,18 @@ impl Store {
     /// usable bundle the built-in assets are used.
     pub fn select(&self, reject: Option<&Version>) -> Option<Bundle> {
         let _guard = self.lock.lock().unwrap();
+        self.select_locked(reject)
+    }
+
+    /// Rejects `version` and [selects](Self::select) its replacement, unless it was confirmed
+    /// or replaced in the meantime, in which case nothing happens and `None` is returned.
+    pub fn fail_trial(&self, version: &Version) -> Option<Option<Bundle>> {
+        let _guard = self.lock.lock().unwrap();
+        (self.read_state().trial.as_ref() == Some(version))
+            .then(|| self.select_locked(Some(version)))
+    }
+
+    fn select_locked(&self, reject: Option<&Version>) -> Option<Bundle> {
         let old_state = self.read_state();
         let mut state = old_state.clone();
 
@@ -454,10 +481,17 @@ impl Store {
             self.prune(&state, &bundle.version);
         }
         if let Ok(entries) = fs::read_dir(&self.dir) {
-            // left behind by an interrupted write
+            // left behind by an interrupted write: partial files, and signatures whose archive
+            // was never completed
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().ends_with(PARTIAL_EXT) {
-                    let _ = fs::remove_file(entry.path());
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let orphan = name
+                    .strip_suffix(".sig")
+                    .is_some_and(|archive| !path.with_file_name(archive).exists());
+                if name.ends_with(PARTIAL_EXT) || orphan {
+                    let _ = fs::remove_file(path);
                 }
             }
         }

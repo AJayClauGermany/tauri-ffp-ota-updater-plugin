@@ -23,6 +23,11 @@ pub struct Config {
     pub require_signed_version: bool,
     /// Revert a bundle the frontend does not confirm with `notifyReady()`. Defaults to `true`.
     pub rollback: bool,
+    /// Milliseconds a bundle on trial gets, from the first page loaded from it, to be confirmed
+    /// with `notifyReady()` before it is rolled back while the app is running. Off by default:
+    /// an unconfirmed bundle is then only rolled back at the next launch.
+    #[serde(alias = "ready-timeout")]
+    pub ready_timeout: Option<u64>,
     /// Largest bundle (the `.tar.gz`) accepted, in bytes. Defaults to 64 MiB.
     #[serde(alias = "max-bundle-size")]
     pub max_bundle_size: u64,
@@ -40,6 +45,7 @@ impl Default for Config {
             dangerous_insecure_transport_protocol: false,
             require_signed_version: true,
             rollback: true,
+            ready_timeout: None,
             max_bundle_size: 64 << 20,
             max_unpacked_size: 256 << 20,
         }
