@@ -83,6 +83,7 @@ reuse its `pubkey`:
 | `dangerousInsecureTransportProtocol` | `false` | Allow non-`https` endpoints, bundle URLs and redirects. |
 | `requireSignedVersion` | `true` | Reject signatures that do not record the version they were made for. Needs Tauri CLI 2.12 or newer (`tauri signer sign --app-version`). |
 | `rollback` | `true` | Revert a bundle the frontend does not confirm with `notifyReady()`. See [Rollback](#rollback). |
+| `trialAttempts` | `2` | Runs of the app in which a new bundle may be shown without confirming itself before it is reverted. See [Rollback](#rollback). |
 | `readyTimeout` | off | Milliseconds a new bundle gets to call `notifyReady()` before it is reverted while the app is running. See [Rollback](#rollback). |
 | `maxBundleSize` | 64 MiB | Largest `.tar.gz` accepted, in bytes. |
 | `maxUnpackedSize` | 256 MiB | Largest total size of the files in a bundle, in bytes. They are held in memory. |
@@ -210,28 +211,34 @@ if let Some(update) = app.ota_updater().check().await? {
 
 ### Rollback
 
-A downloaded bundle is on trial from the first time it is served until the
-frontend calls `notifyReady()`. If the app starts again and the trial is still
-open, the bundle is taken to be broken: its version is rejected for good
-(`check()` no longer offers it; publish the fix as a new version) and the last
-confirmed bundle, or else the built-in frontend, is served. The trial is
-recorded on disk before the bundle is served, and the confirmed bundle is kept
-until its successor is confirmed.
+A downloaded bundle is on trial from the first page loaded from it until the
+frontend calls `notifyReady()`. A run of the app that shows the bundle and
+ends without that call is a failed attempt. One such run may be an app that
+was closed while it was starting, so the bundle is tried again; after the
+second (`trialAttempts`) it is taken to be broken: its version is rejected for
+good (`check()` no longer offers it; publish the fix as a new version) and the
+last confirmed bundle, or else the built-in frontend, is served. The confirmed
+bundle is kept until its successor is confirmed.
+
+Runs in which no page was loaded from the bundle, such as an app that starts
+hidden in the tray or is closed before its window appears, are not attempts
+and leave the bundle as it was. The attempt is recorded on disk before the
+page is served.
 
 **Every frontend you publish must call `notifyReady()`**, or it is reverted on
-the second launch. Call it once the app got far enough that it could update
+the third launch. Call it once the app got far enough that it could update
 itself again. Set `"rollback": false` to serve bundles without a trial.
 
 Without `readyTimeout` a broken bundle stays on screen until the user restarts
-the app. Set it, for example `"readyTimeout": 20000`, and a bundle that has not
+the app, twice with the default `trialAttempts`. Set it, for example `"readyTimeout": 20000`, and a bundle that has not
 confirmed itself that many milliseconds after the first page was loaded from
-it is rejected and replaced right away, by reloading into the previous
-frontend. Choose a value well above the slowest start you expect, and do not
+it is rejected and replaced right away, whatever attempts it has left, by
+reloading into the previous frontend. Choose a value well above the slowest start you expect, and do not
 make `notifyReady()` wait for the user (a login, say).
 
 From Rust, `app.ota_updater().rollback()` abandons the bundle being served
 without help from the frontend (for example from a menu item), and
-`notify_ready()` confirms it.
+`notify_ready()` confirms it once a page was loaded from it.
 
 To take back a frontend that was confirmed but turned out to be wrong, publish
 the previous build again under a new, higher version.
@@ -352,11 +359,10 @@ A patch release must then never contain Rust changes.
 - **Rollback happens at the next launch** unless `readyTimeout` is set, and
   `notifyReady()` is not tied to a particular page: any window can confirm
   the trial.
-- **A trial starts when the app launches, not when a window opens.** An app
-  that is closed before its frontend could call `notifyReady()` (quit within
-  the first moments, or started hidden in the tray and shut down) has that
-  bundle rejected at the next launch. The device then stays on the previous
-  frontend until the next version is published.
+- **A good bundle can still be rejected** if the app is closed between
+  showing it and its `notifyReady()` call in `trialAttempts` runs in a row.
+  The device then stays on the previous frontend until the next version is
+  published.
 - One running instance per user is assumed; the bundle store is not locked
   against a second process.
 - The manifest itself is not signed, the bundle is. `requireSignedVersion`

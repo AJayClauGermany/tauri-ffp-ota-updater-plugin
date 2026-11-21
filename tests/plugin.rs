@@ -357,7 +357,8 @@ fn frontend_update_lifecycle() {
     assert!(!store.join("1.2.0-rc.1.tar.gz").exists());
     assert!(store.join("1.2.1.tar.gz").exists());
 
-    // --- a bundle that is never confirmed is rolled back on the launch after its trial
+    // --- a bundle that is shown but never confirmed is rolled back once its attempts are used
+    // up
     let stage = |app: &App<MockRuntime>, version: &'static str, file: &'static str| {
         let bundle = archive(&format!("ota {version}"));
         let signature = sign(&key, &bundle, Some(version));
@@ -374,8 +375,25 @@ fn frontend_update_lifecycle() {
     std::fs::write(store.join("1.2.6.tar.gz.sig"), "archive never written").unwrap();
     drop(app);
 
+    // launches that end before a page was loaded from it are not attempts, however many
+    let state = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(store.join("state.json")).unwrap()).unwrap()
+    };
+    for _ in 0..3 {
+        let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+        assert_eq!(app.ota_updater().current_version().to_string(), "1.2.2");
+        // and a frontend that was not shown cannot be vouched for
+        app.ota_updater().notify_ready().unwrap();
+        assert_eq!(state()["confirmed"], "1.2.1");
+        assert!(state()["trial"].is_null());
+    }
+
     let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
     assert_eq!(served_index(&app), "ota 1.2.2");
+    // loading more pages in the same run is the same attempt
+    assert_eq!(served_index(&app), "ota 1.2.2");
+    assert_eq!(state()["trial"], "1.2.2");
+    assert_eq!(state()["attempts"], 1);
     // the confirmed bundle is kept to fall back on
     assert!(store.join("1.2.1.tar.gz").exists());
     assert!(!store.join("1.2.5.tar.gz.part").exists());
@@ -383,9 +401,16 @@ fn frontend_update_lifecycle() {
     assert!(store.join("1.2.2.tar.gz.sig").exists());
     drop(app); // without notify_ready
 
+    // once could be an app that was closed while starting: it gets a second attempt
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    assert_eq!(served_index(&app), "ota 1.2.2");
+    assert_eq!(state()["attempts"], 2);
+    drop(app);
+
     let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
     let updater = app.ota_updater();
     assert_eq!(served_index(&app), "ota 1.2.1");
+    assert_eq!(state()["rejected"], serde_json::json!(["1.2.2"]));
     assert!(!store.join("1.2.2.tar.gz").exists());
     // the rejected version is not offered again, the next one is
     assert!(block_on(updater.check()).unwrap().is_none());
@@ -439,6 +464,32 @@ fn frontend_update_lifecycle() {
     oversized_bundles_are_refused();
     multi_page_bundles_are_served_page_by_page();
     unconfirmed_bundles_time_out();
+    trial_attempts_are_configurable();
+}
+
+fn trial_attempts_are_configurable() {
+    let overrides = serde_json::json!({ "trialAttempts": 1 });
+    let (app, relaunch) = published(&[("./index.html", "strict")], "1.2.1", overrides);
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    drop(app);
+    assert_eq!(served_index(&relaunch()), "strict");
+    assert_eq!(served_index(&relaunch()), "built-in");
+
+    // a trial that goes well ends the counting: later runs do not have to confirm again
+    let (app, relaunch) = published(&[("./index.html", "fine")], "1.2.1", serde_json::json!({}));
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    assert_eq!(served_index(&app), "fine");
+    app.ota_updater().notify_ready().unwrap();
+    drop(app);
+    for _ in 0..3 {
+        assert_eq!(served_index(&relaunch()), "fine");
+    }
 }
 
 /// A test server with one published release, and an app on binary 1.2.0 that sees it. The

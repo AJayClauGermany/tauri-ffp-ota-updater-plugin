@@ -103,6 +103,8 @@ impl Builder {
                         unpacked: config.max_unpacked_size,
                     },
                     rollback: config.rollback,
+                    trial_attempts: config.trial_attempts,
+                    shown: Mutex::new(None),
                     binary: binary_version.clone(),
                     comparator: self
                         .comparator

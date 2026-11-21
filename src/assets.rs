@@ -28,8 +28,8 @@ pub(crate) fn active() -> Option<Arc<Bundle>> {
     ACTIVE.read().unwrap().clone()
 }
 
-/// Switches the frontend being served. `on_document` is called once, the first time a page is
-/// loaded from `bundle`, and replaces a hook that has not run yet.
+/// Switches the frontend being served. `on_document` is called once, right before the first
+/// page is loaded from `bundle`, and replaces a hook that has not run yet. It may switch again.
 pub(crate) fn set_active(bundle: Option<Bundle>, on_document: Option<DocumentHook>) {
     let mut active = ACTIVE.write().unwrap();
     *ON_DOCUMENT.lock().unwrap() = on_document;
@@ -60,6 +60,8 @@ impl<R: Runtime> Assets<R> for OtaAssets<R> {
                     let hook = ON_DOCUMENT.lock().unwrap().take();
                     if let Some(hook) = hook {
                         hook();
+                        // the hook may have decided against serving this bundle
+                        return self.get(key);
                     }
                 }
                 Some(Cow::Owned(file.clone()))

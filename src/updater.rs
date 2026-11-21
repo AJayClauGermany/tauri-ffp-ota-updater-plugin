@@ -172,11 +172,12 @@ impl<R: Runtime> OtaUpdater<R> {
 
     /// Tells the updater that the frontend being served works.
     ///
-    /// A bundle is on trial from the moment it is first served until this is called. A trial
-    /// that is still open when the app starts the next time has failed: that version is
-    /// rejected for good and the last confirmed bundle, or else the built-in frontend, is
-    /// served instead. Does nothing when there is no trial, so call it on every start, once the
-    /// frontend got far enough that it could update itself again.
+    /// A bundle is on trial from the first page loaded from it until this is called. A run of
+    /// the app that ends with the trial still open is a failed attempt; after `trialAttempts`
+    /// of them (2 by default) that version is rejected for good and the last confirmed bundle,
+    /// or else the built-in frontend, is served instead. Does nothing when there is no trial,
+    /// which includes a bundle no page was loaded from yet, so call it on every start, once
+    /// the frontend got far enough that it could update itself again.
     pub fn notify_ready(&self) -> Result<()> {
         match assets::active() {
             Some(bundle) => self.store.confirm(&bundle.version),
@@ -197,17 +198,31 @@ impl<R: Runtime> OtaUpdater<R> {
 
     /// Makes `bundle` (or the built-in frontend) what is served from now on.
     ///
-    /// With `readyTimeout` set, a bundle on trial is rolled back if it is still unconfirmed
-    /// that long after the first page was loaded from it.
+    /// The trial of an unconfirmed bundle starts when the first page is loaded from it, not
+    /// here: an app that is closed before it showed the bundle has learned nothing about it.
+    /// With `readyTimeout` set, the bundle is rolled back if it is still unconfirmed that long
+    /// after that page load.
     pub(crate) fn serve(&self, bundle: Option<Bundle>) {
         let timeout = self.config.ready_timeout.filter(|ms| *ms > 0);
-        let on_trial = bundle
+        let unproven = bundle
             .as_ref()
             .map(|bundle| bundle.version.clone())
-            .filter(|version| self.store.trial().as_ref() == Some(version));
-        let watchdog = timeout.zip(on_trial).map(|(timeout, version)| {
+            .filter(|version| self.store.unproven(version));
+        let on_document = unproven.map(|version| {
             let app = self.app.clone();
             Box::new(move || {
+                let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
+                    return;
+                };
+                if let Err(error) = updater.store.begin_trial(&version) {
+                    // a trial that is not on record could not be rolled back
+                    log::warn!("not serving frontend bundle {version}: {error}");
+                    updater.serve(updater.store.fallback());
+                    return;
+                }
+                let Some(timeout) = timeout else {
+                    return;
+                };
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(timeout));
                     let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
@@ -225,7 +240,7 @@ impl<R: Runtime> OtaUpdater<R> {
                 });
             }) as assets::DocumentHook
         });
-        assets::set_active(bundle, watchdog);
+        assets::set_active(bundle, on_document);
     }
 
     /// Deletes every downloaded bundle and goes back to the built-in frontend, reloading the
@@ -431,8 +446,8 @@ impl<R: Runtime> Update<R> {
     /// must not be interrupted, call this, then reload or recreate each window (see
     /// [`OtaUpdater::reload`]) before the old documents load more of their assets.
     ///
-    /// The bundle is verified again as it is loaded from disk, and is on trial until
-    /// [`OtaUpdater::notify_ready`].
+    /// The bundle is verified again as it is loaded from disk, and is on trial from the first
+    /// page loaded from it until [`OtaUpdater::notify_ready`].
     pub fn activate(&self) -> Result<()> {
         let updater = self.app.ota_updater();
         updater.serve(Some(updater.store.activate(&self.version)?));
