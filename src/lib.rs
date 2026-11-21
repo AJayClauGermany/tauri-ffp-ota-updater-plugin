@@ -197,6 +197,11 @@ impl Builder {
                         "tauri_plugin_ffp_ota_updater::install(&mut context) was not called; downloaded frontends will not be served"
                     );
                 }
+                if !app.webview_windows().is_empty() {
+                    log::warn!(
+                        "tauri-plugin-ffp-ota-updater was registered after a window was created (from a `setup` hook?); register it with `tauri::Builder::plugin` so that the first page is loaded from the selected frontend"
+                    );
+                }
                 let updater = OtaUpdater {
                     app: app.clone(),
                     config,
