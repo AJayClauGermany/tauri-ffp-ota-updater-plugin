@@ -58,7 +58,7 @@ shown there. To see an update applied, follow the
 ## Testing
 
 ```bash
-cargo test                                    # Rust tests (mock Tauri runtime; not on Windows)
+cargo test                                    # Rust tests (mock Tauri runtime)
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 npm run check                                 # TypeScript type-check

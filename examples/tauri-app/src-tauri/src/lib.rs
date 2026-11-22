@@ -2,7 +2,7 @@
 pub fn run() {
     let mut context = tauri::generate_context!();
     // lets the plugin serve a downloaded frontend instead of the embedded one
-    tauri_plugin_ffp_ota_updater::install(&mut context);
+    tauri_plugin_ffp_ota_updater::wrap_assets(&mut context);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_ffp_ota_updater::init())

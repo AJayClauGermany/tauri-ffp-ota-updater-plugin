@@ -25,15 +25,16 @@ These are the ones that cost people time.
 | | Updater plugin | This plugin |
 | --- | --- | --- |
 | Install | `tauri add updater` | add the crate and `tauri-plugin-ffp-ota-updater-api` by hand |
-| Register | usually inside `.setup()` with `app.handle().plugin(…)` | on `tauri::Builder` with `.plugin(…)`, **plus** `install(&mut context)` before `.run(context)`. Registered from `.setup()` it is too late: the window already exists. |
+| Register | usually inside `.setup()` with `app.handle().plugin(…)` | on `tauri::Builder` with `.plugin(…)`, **plus** `wrap_assets(&mut context)` before `.run(context)`. Registered from `.setup()` it is too late: the window already exists. |
 | Config block | `plugins.updater` | `plugins.ffp-ota-updater` (its own `endpoints`; the `pubkey` can be the same) |
 | Permission | `updater:default` | `ffp-ota-updater:default`; `rollback()` and `reset()` need `allow-rollback` / `allow-reset` |
 | Extra duty | none | every frontend must call `notifyReady()` |
 | `tauri dev` | checks work | checks work, but a downloaded frontend is never shown; test with a release build |
 
-Forgetting `install(&mut context)` is not an error: downloads succeed and
-nothing ever changes on screen. The log has one warning,
-`install(&mut context) was not called`.
+Forgetting `wrap_assets(&mut context)` does not stop the app: checks and
+downloads succeed, but nothing ever changes on screen and `install()` fails
+with `cannotServe`. The log has a warning saying that
+`wrap_assets(&mut context)` was not called.
 
 ### Building and signing
 
@@ -100,7 +101,7 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        tauri_plugin_ffp_ota_updater::install(&mut context);
+        tauri_plugin_ffp_ota_updater::wrap_assets(&mut context);
         builder = builder
             .plugin(tauri_plugin_ffp_ota_updater::init())
             .plugin(tauri_plugin_updater::Builder::new().build())

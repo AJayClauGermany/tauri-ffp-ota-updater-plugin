@@ -15,12 +15,12 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 | Function | Returns | |
 | --- | --- | --- |
 | `check(options?)` | `Promise<Update \| null>` | Asks the endpoints for a release. `null` when there is none, when it is not newer than the frontend being served, when it is not compatible with the binary, or when its version was rejected on this device. |
-| `notifyReady()` | `Promise<void>` | Confirms the frontend being served. Does nothing when there is no trial. |
+| `notifyReady()` | `Promise<void>` | Confirms the frontend being served. Does nothing when there is no trial, or when the calling page was not loaded from the bundle on trial (a window that still shows the previous frontend). |
 | `status()` | `Promise<Status>` | State of the updater. Makes no request. |
 | `currentVersion()` | `Promise<string>` | Version of the frontend being served: the active bundle's, or else the app's. |
-| `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview. Makes no request. |
+| `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview. Makes no request. Rejects with `cannotServe` under `tauri dev` or without `wrap_assets`. |
 | `discard(version)` | `Promise<void>` | Deletes the stored bundle `version`. Does nothing if it is not stored; the version stays available to `check()`. Rejects with `inUse` for the bundle being served and for the confirmed fallback. |
-| `rollback()` | `Promise<void>` | Rejects the bundle being served and reloads into the last confirmed bundle or the built-in frontend. Does nothing when the built-in frontend is served. Needs `allow-rollback`. |
+| `rollback()` | `Promise<void>` | Rejects the bundle being served and reloads into the last confirmed bundle or the built-in frontend. A newer stored bundle that was never shown is kept for the next launch. Does nothing when the built-in frontend is served. Needs `allow-rollback`. |
 | `reset()` | `Promise<void>` | Deletes every stored bundle and returns to the built-in frontend, reloading if a bundle was served. Rejected versions stay rejected. Needs `allow-reset`. |
 
 ### `CheckOptions`
@@ -93,9 +93,9 @@ the same run of the app returned (`noPendingUpdate` otherwise).
 
 | Item | |
 | --- | --- |
-| `install(&mut Context<R>)` | See [Registration](configuration.md#registration). |
+| `wrap_assets(&mut Context<R>)` | See [Registration](configuration.md#registration). |
 | `init() -> TauriPlugin<R, Option<Config>>` | |
-| `default_compatibility(binary: &Version, bundle: &Version) -> bool` | `true` when `bundle` has the major and minor version of `binary` and is greater than it. |
+| `default_compatibility(binary: &Version, bundle: &Version) -> bool` | `true` when `bundle` has the major and minor version of `binary`. That a bundle is newer than the binary is checked by the plugin, whatever the rule. |
 | `OtaUpdaterExt::ota_updater(&self) -> &OtaUpdater<R>` | On `App`, `AppHandle` and windows. Panics if the plugin is not registered. |
 
 ### `OtaUpdater`
@@ -106,12 +106,12 @@ the same run of the app returned (`noPendingUpdate` otherwise).
 | `check_with(RequestOptions)` | `Result<Option<Update<R>>>` (async) | With other endpoints, headers, timeout or proxy. |
 | `current_version()` | `Version` | |
 | `status()` | `Status` | Fields as in JavaScript, in snake case, as `Version`. |
-| `stage(archive: &[u8], signature: &str, version: &Version)` | `Result<()>` | Verifies and stores a bundle obtained by other means. Same checks as a download. `NotNewer` for a version older than the one being served. |
-| `activate(&Version)` | `Result<()>` | Serves the stored bundle from now on, without touching the webviews. |
+| `stage(archive: &[u8], signature: &str, version: &Version)` | `Result<()>` | Verifies and stores a bundle obtained by other means. Same checks as a download. `NotNewer` for a version that is not newer than the one being served (other than that very version). |
+| `activate(&Version)` | `Result<()>` | Serves the stored bundle from now on, without touching the webviews. `CannotServe` under `tauri dev` or without `wrap_assets`. |
 | `install(&Version)` | `Result<()>` | `activate`, then `reload`. |
 | `discard(&Version)` | `Result<()>` | |
-| `notify_ready()` | `Result<()>` | |
-| `rollback()` | `Result<()>` | |
+| `notify_ready()` | `Result<()>` | Confirms whatever is being served, unlike the JavaScript `notifyReady()`, which only counts from a page of the bundle on trial. |
+| `rollback()` | `Result<()>` | As the JavaScript `rollback()`. |
 | `reset()` | `Result<()>` | |
 | `reload()` | `Result<()>` | Reloads every webview window. |
 
@@ -157,6 +157,8 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 | `network` | `Reqwest` | No endpoint or download host could be reached, a timeout, a non-success status for the bundle. |
 | `releaseNotFound` | `ReleaseNotFound` | An endpoint answered, but none with a usable manifest. |
 | `emptyEndpoints` | `EmptyEndpoints` | No endpoints are configured. |
+| `emptyPubkey` | `EmptyPubkey` | No public key is configured. |
+| `cannotServe` | `CannotServe` | `install`/`activate` while bundles cannot be served: under `tauri dev`, or without `wrap_assets`. |
 | `insecureTransportProtocol` | `InsecureTransportProtocol` | An endpoint or bundle URL is not `https`. |
 | `signature` | `InvalidSignature` | The public key or signature is unreadable, or the signature is not this key's for this bundle. |
 | `missingSignedVersion` | `MissingSignedVersion` | `requireSignedVersion` is on and the signature records no version. |
@@ -167,7 +169,7 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 | `rejected` | `Rejected` | The version failed a trial or was rolled back before. |
 | `noPendingUpdate` | `NoPendingUpdate` | `download` for a version `check` did not return. |
 | `notDownloaded` | `NotDownloaded` | `install` for a version that is not stored. |
-| `notNewer` | `NotNewer` | The version is older than the frontend being served. |
+| `notNewer` | `NotNewer` | The version is not newer than the frontend being served. |
 | `inUse` | `InUse` | `discard` of the bundle being served or of the confirmed fallback. |
 | `invalidHeader` | `InvalidHeaderName`, `InvalidHeaderValue`, `Http` | |
 | `invalidUrl` | `UrlParse` | |

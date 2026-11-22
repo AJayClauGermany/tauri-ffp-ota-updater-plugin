@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use semver::Version;
 use serde::Serialize;
-use tauri::{AppHandle, Runtime, command, ipc::Channel};
+use tauri::{AppHandle, Runtime, Webview, command, ipc::Channel};
 use url::Url;
 
 use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Status, Update};
@@ -13,6 +13,7 @@ use crate::{Error, OtaUpdaterExt, RequestOptions, Result, Status, Update};
 pub(crate) enum DownloadEvent {
     #[serde(rename_all = "camelCase")]
     Started {
+        #[serde(skip_serializing_if = "Option::is_none")]
         content_length: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
@@ -28,7 +29,9 @@ pub(crate) struct Metadata {
     current_version: String,
     version: String,
     downloaded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
     raw_json: serde_json::Value,
 }
@@ -104,7 +107,7 @@ pub(crate) async fn check<R: Runtime>(
         // still hold the object it got for it.
         let current = updater.current_version();
         let mut pending = updater.pending.lock().unwrap();
-        pending.retain(|version, _| *version > current);
+        pending.retain(|version, _| updater.store.order.newer(version, &current));
         pending.insert(update.version.clone(), update);
     }
     Ok(metadata)
@@ -152,12 +155,13 @@ pub(crate) async fn reset<R: Runtime>(app: AppHandle<R>) -> Result<()> {
 }
 
 #[command]
-pub(crate) async fn notify_ready<R: Runtime>(app: AppHandle<R>) -> Result<()> {
-    app.ota_updater().notify_ready()
+pub(crate) async fn notify_ready<R: Runtime>(app: AppHandle<R>, webview: Webview<R>) -> Result<()> {
+    app.ota_updater().notify_ready_from(webview.label())
 }
 
+// async: a sync command would run on the main thread
 #[command]
-pub(crate) fn status<R: Runtime>(app: AppHandle<R>) -> Status {
+pub(crate) async fn status<R: Runtime>(app: AppHandle<R>) -> Status {
     app.ota_updater().status()
 }
 

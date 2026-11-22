@@ -5,7 +5,7 @@ authors = [ "Suraj S Singh" ]
 description = "Tauri plugin for over-the-air (OTA) updates of the frontend assets"
 edition = "2024"
 rust-version = "1.90"
-repository = "https://github.com/SurajSSingh/tauri-ffp-ota-updater-plugin"
+repository = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin"
 license = "BSL-1.0"
 exclude = ["/.github", "/examples", "/dist-js", "/guest-js", "/node_modules", "/package.json", "/rollup.config.js", "/tsconfig*.json"]
 links = "tauri-plugin-ffp-ota-updater"
@@ -27,6 +27,8 @@ futures-util = "0.3"
 percent-encoding = "2.3"
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+sha2 = "0.10"
+dom_query = "0.28"
 
 [build-dependencies]
 tauri-plugin = { version = "2.7.2", features = ["build"] }

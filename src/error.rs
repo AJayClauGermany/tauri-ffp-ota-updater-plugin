@@ -29,6 +29,15 @@ pub enum Error {
     /// No endpoints are configured under `plugins.ffp-ota-updater.endpoints`.
     #[error("no OTA update endpoints are configured")]
     EmptyEndpoints,
+    /// No public key is configured under `plugins.ffp-ota-updater.pubkey` or with
+    /// [`Builder::pubkey`](crate::Builder::pubkey), so no bundle can be verified.
+    #[error("no OTA public key is configured")]
+    EmptyPubkey,
+    /// A downloaded frontend cannot be shown in this run of the app: the assets were not wrapped
+    /// with [`wrap_assets`](crate::wrap_assets), or the app runs in development mode from `devUrl`.
+    /// Checking for, downloading and staging bundles still works.
+    #[error("downloaded frontends cannot be served: {0}")]
+    CannotServe(&'static str),
     /// An endpoint or bundle URL is not `https` and `dangerousInsecureTransportProtocol` is
     /// not enabled.
     #[error(
@@ -96,6 +105,8 @@ impl Error {
             }
             Self::UrlParse(_) => "invalidUrl",
             Self::EmptyEndpoints => "emptyEndpoints",
+            Self::EmptyPubkey => "emptyPubkey",
+            Self::CannotServe(_) => "cannotServe",
             Self::InsecureTransportProtocol(_) => "insecureTransportProtocol",
             Self::ReleaseNotFound(_) => "releaseNotFound",
             Self::MissingSignedVersion => "missingSignedVersion",
@@ -109,6 +120,22 @@ impl Error {
             Self::InUse(_) => "inUse",
             Self::NotDownloaded(_) => "notDownloaded",
         }
+    }
+}
+
+impl Error {
+    /// Whether a stored bundle that failed to load with this error is unusable for good, as
+    /// opposed to unreadable for now (an I/O error, say), and may be deleted.
+    pub(crate) fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidSignature(_)
+                | Self::MissingSignedVersion
+                | Self::SignedVersionMismatch { .. }
+                | Self::InvalidBundle(_)
+                | Self::TooLarge(..)
+                | Self::Incompatible(_)
+        )
     }
 }
 

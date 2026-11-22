@@ -19,7 +19,7 @@
 
 | Function | |
 | --- | --- |
-| `install(&mut context)` | Wraps the context's embedded assets so that a bundle can be served in their place. Call once, before `tauri::Builder::run(context)`. Without it the plugin works but never changes what is displayed, and logs a warning at startup. |
+| `wrap_assets(&mut context)` | Wraps the context's embedded assets so that a bundle can be served in their place. Call once, before `tauri::Builder::run(context)`. Without it, checking for and downloading bundles works, but none is ever served: `install()` fails with `cannotServe`, `currentVersion()` is the app's version, and a warning is logged at startup. |
 | `init()` | The plugin with the configuration from `tauri.conf.json`. Same as `Builder::new().build()`. |
 | `Builder::new()…build()` | The plugin with settings from Rust; see [Builder](#builder). |
 
@@ -35,12 +35,13 @@ and can be given on the [Builder](#builder) instead.
 | Key | Type | Default | |
 | --- | --- | --- | --- |
 | `endpoints` | string[] | `[]` | Manifest URLs, tried in order. May contain [variables](#endpoint-variables). Must be `https`. |
-| `pubkey` | string | `""` | Minisign public key: the content of the `.pub` file written by `tauri signer generate`. |
+| `pubkey` | string | `""` | Minisign public key: the content of the `.pub` file written by `tauri signer generate`. A key that cannot be read is a setup error. Without a key, `check()` fails with `emptyPubkey` and stored bundles are neither served nor deleted. |
 | `dangerousInsecureTransportProtocol` | boolean | `false` | Allow non-`https` endpoints, bundle URLs and redirects. |
 | `requireSignedVersion` | boolean | `true` | Reject signatures that do not record the version they were made for. Needs bundles signed with `tauri signer sign --app-version` (Tauri CLI 2.12 or newer). |
 | `rollback` | boolean | `true` | Revert a bundle the frontend does not confirm with `notifyReady()`. With `false`, bundles are served without a trial. |
 | `trialAttempts` | integer | `2` | Runs of the app in which a new bundle may be shown without confirming itself before it is rejected. Values below 1 count as 1. |
 | `readyTimeout` | integer (ms) | off | Time a bundle on trial gets, from the first page loaded from it, to call `notifyReady()` before it is rejected and replaced while the app is running. `0` is off. |
+| `compareBuildMetadata` | boolean | `false` | Order versions that differ only in build metadata by it (`1.2.1+2` after `1.2.1+1`, `1.2.0+1` after the binary `1.2.0`). By default build metadata is ignored when deciding what is newer. See [Versions](../explanation/how-it-works.md#versions). |
 | `maxBundleSize` | integer (bytes) | `67108864` (64 MiB) | Largest `.tar.gz` accepted. |
 | `maxUnpackedSize` | integer (bytes) | `268435456` (256 MiB) | Largest total size of the files in a bundle. They are held in memory. |
 
@@ -99,7 +100,14 @@ Requests carry `Accept: application/json` (manifest) or
 | `proxy(Url)` | Use this proxy instead of the system's. |
 | `no_proxy()` | Ignore the system's proxy settings. |
 | `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
-| `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. A bundle is additionally only offered if it is newer than the frontend being served. |
+| `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. Independently of the rule, a bundle has to be newer than the binary, and is only offered if it is newer than the frontend being served. |
+
+### TLS
+
+Requests use [rustls](https://docs.rs/rustls). If no process-wide rustls
+crypto provider is installed when the first request is made, the plugin
+installs *ring*'s, as `tauri-plugin-updater` does. An app that wants another
+provider installs it before then, for example at the start of `main`.
 | `build()` | The plugin. |
 
 Per-check settings: [`RequestOptions`](api.md#requestoptions).

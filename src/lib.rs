@@ -15,6 +15,7 @@ use semver::Version;
 use tauri::{
     Manager, Runtime,
     plugin::{Builder as PluginBuilder, TauriPlugin},
+    webview::PageLoadEvent,
 };
 use url::Url;
 
@@ -22,10 +23,11 @@ mod assets;
 mod bundle;
 mod commands;
 mod config;
+mod csp;
 mod error;
 mod updater;
 
-pub use assets::install;
+pub use assets::wrap_assets;
 pub use bundle::{Compatibility, default_compatibility};
 pub use config::Config;
 pub use error::{Error, Result};
@@ -187,15 +189,24 @@ impl Builder {
                     compatibility: self
                         .compatibility
                         .unwrap_or_else(|| Arc::new(default_compatibility)),
+                    order: bundle::Order {
+                        build_metadata: config.compare_build_metadata,
+                    },
                     lock: Mutex::new(()),
                 };
 
-                // Plugins are set up before any window is created, so the bundle chosen here is
-                // what the first page load gets.
-                if !assets::is_installed() {
-                    log::warn!(
-                        "tauri_plugin_ffp_ota_updater::install(&mut context) was not called; downloaded frontends will not be served"
-                    );
+                let cannot_serve = if !assets::is_wrapped() {
+                    Some("`tauri_plugin_ffp_ota_updater::wrap_assets(&mut context)` was not called")
+                } else if tauri::is_dev() && app.config().build.dev_url.is_some() {
+                    Some("the app is loading its frontend from `devUrl` (development mode)")
+                } else {
+                    None
+                };
+                if let Some(reason) = cannot_serve {
+                    log::warn!("downloaded frontends will not be served: {reason}");
+                } else if config.pubkey.trim().is_empty() {
+                    // stored bundles are left alone: they cannot be verified, but are not invalid
+                    log::warn!("no OTA public key is configured; downloaded frontends will not be served");
                 }
                 if !app.webview_windows().is_empty() {
                     log::warn!(
@@ -210,10 +221,26 @@ impl Builder {
                     binary_version,
                     pending: Default::default(),
                     downloading: Default::default(),
+                    cannot_serve,
+                    documents: Default::default(),
                 };
-                updater.serve(updater.store.select(None));
+                // Plugins are set up before any window is created, so the bundle chosen here is
+                // what the first page load gets. When none can be served, the store is left as
+                // it is for a run of the app that can.
+                if updater.cannot_serve.is_none() && !updater.config.pubkey.trim().is_empty() {
+                    updater.serve(updater.store.select(None));
+                } else {
+                    updater.serve(None);
+                }
                 app.manage(updater);
                 Ok(())
+            })
+            .on_page_load(|webview, payload| {
+                if payload.event() == PageLoadEvent::Started
+                    && let Some(updater) = webview.try_state::<OtaUpdater<R>>()
+                {
+                    updater.record_document(webview.label(), payload.url());
+                }
             })
             .build()
     }

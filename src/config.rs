@@ -34,6 +34,12 @@ pub struct Config {
     /// an unconfirmed bundle is then only rolled back at the next launch.
     #[serde(alias = "ready-timeout")]
     pub ready_timeout: Option<u64>,
+    /// Treat versions that differ only in build metadata as different versions, ordered by it:
+    /// `1.2.1+2` is then newer than `1.2.1+1`, and `1.2.0+1` newer than the binary `1.2.0`.
+    /// Off by default, where build metadata is ignored when deciding what is newer, as semantic
+    /// versioning prescribes, so a release that only changes it is not an update.
+    #[serde(alias = "compare-build-metadata")]
+    pub compare_build_metadata: bool,
     /// Largest bundle (the `.tar.gz`) accepted, in bytes. Defaults to 64 MiB.
     #[serde(alias = "max-bundle-size")]
     pub max_bundle_size: u64,
@@ -53,6 +59,7 @@ impl Default for Config {
             rollback: true,
             trial_attempts: 2,
             ready_timeout: None,
+            compare_build_metadata: false,
             max_bundle_size: 64 << 20,
             max_unpacked_size: 256 << 20,
         }
@@ -65,6 +72,10 @@ impl Config {
             && let Some(url) = self.endpoints.iter().find(|u| u.scheme() != "https")
         {
             return Err(crate::Error::InsecureTransportProtocol(url.to_string()));
+        }
+        if !self.pubkey.trim().is_empty() {
+            // a key that cannot be read would make every bundle fail verification
+            crate::bundle::parse_pubkey(&self.pubkey)?;
         }
         Ok(())
     }

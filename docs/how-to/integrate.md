@@ -167,7 +167,7 @@ at once, for example from an error boundary. Grant
 ```js
 import { rollback } from "tauri-plugin-ffp-ota-updater-api";
 
-await rollback(); // rejects this version and reloads into the previous one
+await rollback(); // rejects this version and reloads into the last confirmed one
 ```
 
 From Rust, `app.ota_updater().rollback()` does the same without help from the
@@ -280,7 +280,7 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        tauri_plugin_ffp_ota_updater::install(&mut context);
+        tauri_plugin_ffp_ota_updater::wrap_assets(&mut context);
         builder = builder.plugin(tauri_plugin_ffp_ota_updater::init());
     }
 

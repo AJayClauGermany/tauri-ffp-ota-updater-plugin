@@ -47,7 +47,7 @@ npm install github:AJayClauGermany/tauri-ffp-ota-updater-plugin
 
 ### 2. Register
 
-Unlike most plugins this one needs an extra line, `install(&mut context)`,
+Unlike most plugins this one needs an extra line, `wrap_assets(&mut context)`,
 which is what allows it to replace the embedded assets. That means the context
 has to be a variable instead of being created inside `.run(...)`:
 
@@ -55,7 +55,7 @@ has to be a variable instead of being created inside `.run(...)`:
 // src-tauri/src/lib.rs
 pub fn run() {
     let mut context = tauri::generate_context!();
-    tauri_plugin_ffp_ota_updater::install(&mut context);
+    tauri_plugin_ffp_ota_updater::wrap_assets(&mut context);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_ffp_ota_updater::init())

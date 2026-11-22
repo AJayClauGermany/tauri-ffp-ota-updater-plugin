@@ -1,7 +1,4 @@
-// Windows test binaries that link the Tauri runtime crash at startup with
-// STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) unless an application manifest is
-// embedded, so these runtime-backed tests only run on Linux and macOS.
-#![cfg(not(windows))]
+// On Windows these need the application manifest `build.rs` embeds in test binaries.
 
 use std::{
     borrow::Cow,
@@ -15,7 +12,7 @@ use std::{
 use base64::Engine;
 use semver::Version;
 use tauri::{
-    App, Assets,
+    App, Assets, Context,
     async_runtime::block_on,
     test::{MockRuntime, mock_builder, mock_context},
     utils::{
@@ -170,6 +167,28 @@ fn launch_built(
     overrides: serde_json::Value,
     builder: Builder,
 ) -> App<MockRuntime> {
+    try_launch(
+        data_dir,
+        binary_version,
+        pubkey,
+        port,
+        overrides,
+        builder,
+        |_| {},
+    )
+    .expect("failed to build app with plugin")
+}
+
+/// [`launch_built`], with `tweak` applied to the app's context, and failing instead of panicking.
+fn try_launch(
+    data_dir: &Path,
+    binary_version: &str,
+    pubkey: &str,
+    port: u16,
+    overrides: serde_json::Value,
+    builder: Builder,
+    tweak: impl FnOnce(&mut Context<MockRuntime>),
+) -> tauri::Result<App<MockRuntime>> {
     let mut context = mock_context(BuiltIn);
     context.package_info_mut().version = binary_version.parse().unwrap();
     context.config_mut().app.app_directories_override =
@@ -189,11 +208,22 @@ fn launch_built(
         .plugins
         .0
         .insert("ffp-ota-updater".into(), config);
-    tauri_plugin_ffp_ota_updater::install(&mut context);
-    mock_builder()
-        .plugin(builder.build())
-        .build(context)
-        .expect("failed to build app with plugin")
+    tweak(&mut context);
+    tauri_plugin_ffp_ota_updater::wrap_assets(&mut context);
+    mock_builder().plugin(builder.build()).build(context)
+}
+
+/// The files in the store, apart from the lock file.
+fn stored_files(store: &Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(store)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".lock")
+        .collect();
+    files.sort();
+    files
 }
 
 fn served_index(app: &App<MockRuntime>) -> String {
@@ -210,11 +240,11 @@ fn served(app: &App<MockRuntime>, path: &str) -> String {
 }
 
 #[test]
-fn default_compatibility_only_accepts_newer_patches() {
+fn default_compatibility_accepts_the_same_minor_version() {
+    // that a bundle is newer than the binary is enforced by the plugin, not the rule
     let v = |s: &str| Version::parse(s).unwrap();
     assert!(default_compatibility(&v("1.2.0"), &v("1.2.1")));
-    assert!(!default_compatibility(&v("1.2.1"), &v("1.2.1")));
-    assert!(!default_compatibility(&v("1.2.1"), &v("1.2.0")));
+    assert!(default_compatibility(&v("1.2.0"), &v("1.2.0+1")));
     assert!(!default_compatibility(&v("1.2.0"), &v("1.3.0")));
     assert!(!default_compatibility(&v("1.2.0"), &v("2.2.1")));
 }
@@ -266,6 +296,13 @@ fn frontend_update_lifecycle() {
     let status = updater.status();
     assert_eq!(status.binary_version.to_string(), "1.2.0");
     assert!(status.confirmed && status.staged.is_none() && status.rejected.is_empty());
+    // what is absent is left out, as the JavaScript types declare it
+    assert!(
+        serde_json::to_value(&status)
+            .unwrap()
+            .get("staged")
+            .is_none()
+    );
 
     // an endpoint that cannot be reached is told apart from one that has no usable manifest
     let check_at = |url: String| {
@@ -330,7 +367,7 @@ fn frontend_update_lifecycle() {
             "{file} was accepted"
         );
     }
-    assert_eq!(std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0), 0);
+    assert!(stored_files(&store).is_empty());
 
     // a patch bump is a frontend update
     publish("v1.2.1", "1.2.1.tar.gz", &v121_signature);
@@ -526,6 +563,290 @@ fn frontend_update_lifecycle() {
     trial_attempts_are_configurable();
     builder_overrides_the_configuration();
     bundles_are_staged_applied_and_discarded_without_a_check();
+    rollbacks_return_to_the_confirmed_bundle();
+    unreadable_bundles_are_kept();
+    keys_are_required_and_checked();
+    development_mode_does_not_serve_bundles();
+    build_metadata_is_ignored_unless_asked_for();
+    bundles_get_the_csp_processing_of_built_in_frontends();
+}
+
+/// A key pair, and a function staging `own <version>` signed with it in an app.
+fn signer() -> (
+    String,
+    impl Fn(&App<MockRuntime>, &str, &str) -> tauri_plugin_ffp_ota_updater::Result<()>,
+) {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let stage = move |app: &App<MockRuntime>, version: &str, index: &str| {
+        let archive = archive_of(&[("./index.html", index), ("./assets/app.js", "js")]);
+        let signature = sign(&key, &archive, Some(version));
+        app.ota_updater()
+            .stage(&archive, &signature, &Version::parse(version).unwrap())
+    };
+    (pubkey, stage)
+}
+
+fn v(version: &str) -> Version {
+    Version::parse(version).unwrap()
+}
+
+/// A rollback goes back to what is known to work, and leaves a newer download for later.
+fn rollbacks_return_to_the_confirmed_bundle() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.notify_ready().unwrap();
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    updater.install(&v("1.2.2")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.2");
+    // downloaded while 1.2.2 is on trial, never shown
+    stage(&app, "1.2.3", "own 1.2.3").unwrap();
+
+    updater.rollback().unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    let status = updater.status();
+    assert!(status.confirmed);
+    assert_eq!(status.staged, Some(v("1.2.3")));
+    assert_eq!(status.rejected, vec![v("1.2.2")]);
+
+    // abandoning the confirmed bundle goes back to the built-in frontend
+    updater.rollback().unwrap();
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(updater.status().staged, Some(v("1.2.3")));
+
+    // and the bundle that was kept is tried at the next launch
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.3");
+    app.ota_updater().reset().unwrap();
+}
+
+/// A bundle that cannot be read for now is skipped, not deleted.
+fn unreadable_bundles_are_kept() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    drop(app);
+    // reading a directory fails like a file locked by another program does
+    std::fs::create_dir(store.join("1.2.2.tar.gz")).unwrap();
+    std::fs::write(store.join("1.2.2.tar.gz.sig"), "sig").unwrap();
+
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.1");
+    assert!(store.join("1.2.2.tar.gz").is_dir());
+    assert!(store.join("1.2.2.tar.gz.sig").exists());
+    app.ota_updater().reset().unwrap();
+}
+
+fn keys_are_required_and_checked() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    drop(app);
+
+    // without a key nothing can be verified, so nothing is served, and nothing is deleted
+    let app = launch(data_dir.path(), "1.2.0", "", 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(stored_files(&store), ["1.2.1.tar.gz", "1.2.1.tar.gz.sig"]);
+    let error = block_on(updater.check()).err().unwrap();
+    assert!(matches!(error, Error::EmptyPubkey));
+    assert_eq!(serde_json::to_value(&error).unwrap()["kind"], "emptyPubkey");
+    assert!(matches!(stage(&app, "1.2.2", "x"), Err(Error::EmptyPubkey)));
+    assert!(matches!(
+        updater.install(&v("1.2.1")),
+        Err(Error::EmptyPubkey)
+    ));
+    drop(app);
+
+    // a key that cannot be read stops the app from starting, before it can delete anything
+    let unreadable = b64("not a minisign key");
+    let launched = try_launch(
+        data_dir.path(),
+        "1.2.0",
+        &unreadable,
+        1,
+        serde_json::json!({}),
+        Builder::new(),
+        |_| {},
+    );
+    assert!(launched.is_err());
+    assert_eq!(stored_files(&store), ["1.2.1.tar.gz", "1.2.1.tar.gz.sig"]);
+
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.1");
+    app.ota_updater().reset().unwrap();
+}
+
+/// `tauri dev` shows the dev server, so the plugin does not pretend to serve a bundle.
+fn development_mode_does_not_serve_bundles() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    drop(app);
+
+    let app = try_launch(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        1,
+        serde_json::json!({}),
+        Builder::new(),
+        |context| {
+            context.config_mut().build.dev_url = Some("http://localhost:1420".parse().unwrap())
+        },
+    )
+    .unwrap();
+    let updater = app.ota_updater();
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    assert!(updater.status().confirmed);
+    let error = updater.install(&v("1.2.1")).err().unwrap();
+    assert!(matches!(error, Error::CannotServe(_)));
+    assert_eq!(serde_json::to_value(&error).unwrap()["kind"], "cannotServe");
+    // still staged for a run that can serve it
+    assert_eq!(updater.status().staged, Some(v("1.2.1")));
+    assert_eq!(stored_files(&store), ["1.2.1.tar.gz", "1.2.1.tar.gz.sig"]);
+}
+
+/// By default `1.2.1+2` is the same version as `1.2.1+1`; `compareBuildMetadata` orders them.
+fn build_metadata_is_ignored_unless_asked_for() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let routes = Routes::default();
+    let port = serve(routes.clone(), Default::default());
+    let publish = |version: &str| {
+        let bundle = archive(&format!("ota {version}"));
+        let manifest = serde_json::json!({
+            "version": version,
+            "url": format!("http://127.0.0.1:{port}/bundle.tar.gz"),
+            "signature": sign(&key, &bundle, Some(version)),
+        });
+        routes.lock().unwrap().extend([
+            ("ota.json", manifest.to_string().into_bytes()),
+            ("bundle.tar.gz", bundle),
+        ]);
+    };
+    let offered = |app: &App<MockRuntime>| {
+        block_on(app.ota_updater().check())
+            .unwrap()
+            .map(|update| update.version.to_string())
+    };
+    let install = |app: &App<MockRuntime>| {
+        let update = block_on(app.ota_updater().check()).unwrap().unwrap();
+        block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    };
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    publish("1.2.0+1");
+    assert_eq!(offered(&app), None);
+    assert!(matches!(
+        app.ota_updater().stage(
+            &archive("x"),
+            &sign(&key, &archive("x"), Some("1.2.0+1")),
+            &v("1.2.0+1")
+        ),
+        Err(Error::NotNewer(_))
+    ));
+    publish("1.2.1+1");
+    install(&app);
+    assert_eq!(served_index(&app), "ota 1.2.1+1");
+    publish("1.2.1+2");
+    assert_eq!(offered(&app), None);
+    app.ota_updater().reset().unwrap();
+    drop(app);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let overrides = serde_json::json!({ "compareBuildMetadata": true });
+    let app = launch_with(data_dir.path(), "1.2.0", &pubkey, port, overrides.clone());
+    publish("1.2.0+1");
+    assert_eq!(offered(&app).as_deref(), Some("1.2.0+1"));
+    publish("1.2.1+9");
+    install(&app);
+    // compared as numbers, as semantic versioning does for pre-releases
+    publish("1.2.1+10");
+    assert_eq!(offered(&app).as_deref(), Some("1.2.1+10"));
+    install(&app);
+    assert_eq!(served_index(&app), "ota 1.2.1+10");
+    drop(app);
+    let app = launch_with(data_dir.path(), "1.2.0", &pubkey, port, overrides);
+    assert_eq!(served_index(&app), "ota 1.2.1+10");
+    app.ota_updater().reset().unwrap();
+}
+
+fn sha256_source(script: &str) -> String {
+    use sha2::Digest;
+    format!("'sha256-{}'", b64(sha2::Sha256::digest(script.as_bytes())))
+}
+
+/// With a CSP, a bundle gets the nonces and hashes `tauri build` gives the built-in frontend.
+fn bundles_get_the_csp_processing_of_built_in_frontends() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let page = "<html><head><style>body { margin: 0 }</style>\
+        <script src=\"https://cdn.example.com/lib.js\"></script>\
+        <script>window.inline = 1</script>\
+        <script type=\"module\" src=\"/assets/app.js\"></script></head><body></body></html>";
+    let bundle = archive_of(&[
+        ("./index.html", page),
+        ("./assets/app.js", "window.app = 1"),
+    ]);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    app.ota_updater()
+        .stage(&bundle, &sign(&key, &bundle, Some("1.2.1")), &v("1.2.1"))
+        .unwrap();
+    drop(app);
+
+    let app = try_launch(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        1,
+        serde_json::json!({}),
+        Builder::new(),
+        |context| {
+            context.config_mut().app.security.csp = Some(tauri::utils::config::Csp::Policy(
+                "default-src 'self'".into(),
+            ))
+        },
+    )
+    .unwrap();
+    let asset = app.asset_resolver().get("index.html".into()).unwrap();
+    let html = String::from_utf8(asset.bytes().to_vec()).unwrap();
+    let csp = asset.csp_header().unwrap().to_string();
+    let directive = |name: &str| {
+        csp.split(';')
+            .map(str::trim)
+            .find(|directive| directive.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} in {csp}"))
+            .to_string()
+    };
+    let scripts = directive("script-src");
+    assert!(
+        scripts.contains(&sha256_source("window.inline = 1")),
+        "{csp}"
+    );
+    assert!(scripts.contains(&sha256_source("window.app = 1")), "{csp}");
+    // the style element and the script from another origin carry a fresh nonce
+    let nonces = html.matches("nonce=\"").count();
+    assert_eq!(nonces, 2, "{html}");
+    assert!(!html.contains("__TAURI_"), "{html}");
+    assert!(directive("style-src").contains("'nonce-"), "{csp}");
+    assert!(scripts.contains("'nonce-"), "{csp}");
+    app.ota_updater().reset().unwrap();
 }
 
 /// The store on its own: the app brings the bundles, and no endpoint is ever asked.
@@ -559,7 +880,7 @@ fn bundles_are_staged_applied_and_discarded_without_a_check() {
         updater.stage(&v130, &v130_signature, &v("1.3.0")),
         Err(Error::Incompatible(_))
     ));
-    assert!(!store.exists());
+    assert!(stored_files(&store).is_empty());
     assert!(matches!(
         updater.install(&v("1.2.1")),
         Err(Error::NotDownloaded(_))
@@ -846,5 +1167,5 @@ fn oversized_bundles_are_refused() {
         block_on(update.download(|_, _| {}, || {})),
         Err(Error::TooLarge("bundle", _))
     ));
-    assert!(!data_dir.path().join("ffp-ota-updater").exists());
+    assert!(stored_files(&data_dir.path().join("ffp-ota-updater")).is_empty());
 }
