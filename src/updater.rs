@@ -143,6 +143,7 @@ pub struct Status {
     /// A stored bundle newer than the one being served, which the next launch (or
     /// [`OtaUpdater::install`]) switches to and [`OtaUpdater::discard`] removes. It is verified
     /// only when it is loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub staged: Option<Version>,
     /// Versions that failed their trial or were rolled back, oldest first. They are not
     /// offered or served again. The record is dropped once a full update makes them
@@ -162,6 +163,27 @@ pub struct OtaUpdater<R: Runtime> {
     /// Held for the length of a download, so that concurrent requests for the same bundle
     /// (two windows, or two pages of a multi-page app in a row) fetch it once.
     pub(crate) downloading: tauri::async_runtime::Mutex<()>,
+    /// Why no bundle can be served in this run of the app, if that is the case.
+    pub(crate) cannot_serve: Option<&'static str>,
+    /// For each webview, by label, the bundle its current page was loaded from (`None` for the
+    /// built-in frontend or another site). Only a page of the bundle on trial may confirm it.
+    pub(crate) documents: Mutex<HashMap<String, Option<Version>>>,
+}
+
+/// Whether a page whose recorded origin is `shown` (see [`OtaUpdater::documents`]; `None` when
+/// nothing was recorded) may confirm the bundle `serving`.
+pub(crate) fn may_confirm(shown: Option<&Option<Version>>, serving: &Version) -> bool {
+    shown.is_none_or(|shown| shown.as_ref() == Some(serving))
+}
+
+/// Whether `url` is a page of the app's own frontend: `tauri://localhost` or, on Windows,
+/// `http(s)://tauri.localhost`.
+pub(crate) fn is_app_url(url: &Url) -> bool {
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => url.host_str() == Some("tauri.localhost"),
+        _ => false,
+    }
 }
 
 impl<R: Runtime> OtaUpdater<R> {
@@ -207,6 +229,7 @@ impl<R: Runtime> OtaUpdater<R> {
         {
             return Err(Error::InsecureTransportProtocol(url.to_string()));
         }
+        self.ensure_pubkey()?;
 
         // what the download of the release found here is made with, too
         let mut headers = self.client.headers.clone();
@@ -284,7 +307,7 @@ impl<R: Runtime> OtaUpdater<R> {
             });
         };
 
-        if release.version <= current_version
+        if !self.store.order.newer(&release.version, &current_version)
             || !self.store.compatible(&release.version)
             || self.store.is_rejected(&release.version)
         {
@@ -316,10 +339,26 @@ impl<R: Runtime> OtaUpdater<R> {
     /// The bundle is then staged like a downloaded one: served from the next launch on, or at
     /// once with [`Self::install`].
     pub fn stage(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
-        if *version < self.current_version() {
+        self.ensure_pubkey()?;
+        self.ensure_not_older(version)?;
+        self.store.save(archive, signature, version)
+    }
+
+    fn ensure_pubkey(&self) -> Result<()> {
+        if self.config.pubkey.trim().is_empty() {
+            return Err(Error::EmptyPubkey);
+        }
+        Ok(())
+    }
+
+    /// Fails with [`Error::NotNewer`] unless `version` is newer than the frontend being served or
+    /// is exactly that one.
+    fn ensure_not_older(&self, version: &Version) -> Result<()> {
+        let current = self.current_version();
+        if *version != current && !self.store.order.newer(version, &current) {
             return Err(Error::NotNewer(version.to_string()));
         }
-        self.store.save(archive, signature, version)
+        Ok(())
     }
 
     /// Switches to the stored bundle `version` without touching the webviews: documents that
@@ -333,10 +372,15 @@ impl<R: Runtime> OtaUpdater<R> {
     ///
     /// The bundle is verified again as it is loaded from disk, and is on trial from the first
     /// page loaded from it until [`Self::notify_ready`].
+    ///
+    /// Fails with [`Error::CannotServe`] when the assets were not wrapped with
+    /// [`wrap_assets`](crate::wrap_assets) or the app runs from `devUrl` in development mode.
     pub fn activate(&self, version: &Version) -> Result<()> {
-        if *version < self.current_version() {
-            return Err(Error::NotNewer(version.to_string()));
+        if let Some(reason) = self.cannot_serve {
+            return Err(Error::CannotServe(reason));
         }
+        self.ensure_pubkey()?;
+        self.ensure_not_older(version)?;
         self.serve(Some(self.store.activate(version)?));
         Ok(())
     }
@@ -364,6 +408,10 @@ impl<R: Runtime> OtaUpdater<R> {
     /// or else the built-in frontend, is served instead. Does nothing when there is no trial,
     /// which includes a bundle no page was loaded from yet, so call it on every start, once
     /// the frontend got far enough that it could update itself again.
+    ///
+    /// This vouches for the bundle without asking which page works: call it from Rust only once
+    /// something has shown that the new frontend runs. The `notifyReady()` of the JavaScript API
+    /// is only accepted from a page that was loaded from the bundle on trial.
     pub fn notify_ready(&self) -> Result<()> {
         match assets::active() {
             Some(bundle) => self.store.confirm(&bundle.version),
@@ -371,9 +419,39 @@ impl<R: Runtime> OtaUpdater<R> {
         }
     }
 
+    /// [`Self::notify_ready`] on behalf of the page in the webview `label`. Ignored when that
+    /// page was not loaded from the bundle being served, for instance a window that still shows
+    /// the previous frontend while the others reload into a new one.
+    pub(crate) fn notify_ready_from(&self, label: &str) -> Result<()> {
+        let Some(bundle) = assets::active() else {
+            return Ok(());
+        };
+        if !may_confirm(self.documents.lock().unwrap().get(label), &bundle.version) {
+            log::debug!(
+                "ignoring notifyReady from `{label}`: its page is not from frontend {}",
+                bundle.version
+            );
+            return Ok(());
+        }
+        self.store.confirm(&bundle.version)
+    }
+
+    /// Records which frontend a page that starts loading in the webview `label` comes from.
+    pub(crate) fn record_document(&self, label: &str, url: &Url) {
+        let version = is_app_url(url)
+            .then(assets::active)
+            .flatten()
+            .map(|bundle| bundle.version.clone());
+        self.documents
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), version);
+    }
+
     /// Abandons the bundle being served, whether on trial or confirmed, without help from the
     /// frontend: its version is rejected, the app switches to the last confirmed bundle or the
-    /// built-in frontend and the webviews are reloaded.
+    /// built-in frontend and the webviews are reloaded. A newer bundle that is stored but was
+    /// never shown is kept, and is tried at the next launch.
     pub fn rollback(&self) -> Result<()> {
         if let Some(bundle) = assets::active() {
             self.serve(self.store.select(Some(&bundle.version)));
@@ -389,6 +467,12 @@ impl<R: Runtime> OtaUpdater<R> {
     /// With `readyTimeout` set, the bundle is rolled back if it is still unconfirmed that long
     /// after that page load.
     pub(crate) fn serve(&self, bundle: Option<Bundle>) {
+        let bundle = bundle
+            .filter(|_| self.cannot_serve.is_none())
+            .map(|mut bundle| {
+                crate::csp::prepare(&mut bundle, &self.app.config().app.security);
+                bundle
+            });
         let timeout = self.config.ready_timeout.filter(|ms| *ms > 0);
         let unproven = bundle
             .as_ref()
@@ -653,5 +737,41 @@ impl<R: Runtime> Update<R> {
     ) -> Result<()> {
         self.download(on_chunk, on_download_finish).await?;
         self.install()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_pages_of_the_bundle_on_trial_confirm_it() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        // nothing recorded (no page load seen for that webview): trusted
+        assert!(may_confirm(None, &v("1.2.1")));
+        assert!(may_confirm(Some(&Some(v("1.2.1"))), &v("1.2.1")));
+        // a page still showing the previous bundle or the built-in frontend
+        assert!(!may_confirm(Some(&Some(v("1.2.0"))), &v("1.2.1")));
+        assert!(!may_confirm(Some(&None), &v("1.2.1")));
+    }
+
+    #[test]
+    fn app_urls_are_recognized() {
+        for url in [
+            "tauri://localhost/",
+            "tauri://localhost/settings/index.html",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/about.html",
+        ] {
+            assert!(is_app_url(&url.parse().unwrap()), "{url}");
+        }
+        for url in [
+            "https://example.com/",
+            "http://localhost:1420/",
+            "tauri://example.com/",
+            "about:blank",
+        ] {
+            assert!(!is_app_url(&url.parse().unwrap()), "{url}");
+        }
     }
 }

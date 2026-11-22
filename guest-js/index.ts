@@ -30,6 +30,8 @@ export type OtaUpdateErrorKind =
   | 'notNewer'
   | 'inUse'
   | 'emptyEndpoints'
+  | 'emptyPubkey'
+  | 'cannotServe'
   | 'insecureTransportProtocol'
   | 'invalidHeader'
   | 'invalidUrl'
@@ -223,6 +225,9 @@ export async function status(): Promise<Status> {
  * Switches to the stored bundle `version` now by reloading the app's
  * webviews, like {@link Update.install}, but without a {@link check}: a bundle
  * that {@link status} reports as `staged` can be applied offline.
+ *
+ * Rejects with kind `cannotServe` where no downloaded frontend can be shown:
+ * under `tauri dev`, or when the app did not call `wrap_assets`.
  */
 export async function install(version: string): Promise<void> {
   await call('install', { version })
@@ -241,8 +246,9 @@ export async function discard(version: string): Promise<void> {
 /**
  * Abandons the frontend being served: its version is rejected for good and
  * the app reloads into the last confirmed bundle, or else the built-in
- * frontend. For a frontend that notices it is broken. Does nothing when the
- * built-in frontend is being served.
+ * frontend. A newer bundle that was downloaded but never shown is kept, and
+ * is tried at the next launch. For a frontend that notices it is broken. Does
+ * nothing when the built-in frontend is being served.
  *
  * Not part of the default permission set: grant
  * `ffp-ota-updater:allow-rollback`.
@@ -265,6 +271,10 @@ export async function reset(): Promise<void> {
 /**
  * Confirms that the frontend being served works. Call it on every start, once
  * the app got far enough that it could update itself again.
+ *
+ * Only a page that was loaded from the bundle on trial confirms it: while
+ * {@link install} reloads the windows one after the other, a window that still
+ * shows the previous frontend cannot vouch for the new one.
  *
  * A downloaded bundle that was shown in two runs of the app (`trialAttempts`)
  * without confirming itself is reverted to the last confirmed one (or the

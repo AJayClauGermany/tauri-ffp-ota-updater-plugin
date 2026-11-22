@@ -87,6 +87,7 @@ Directory `ffp-ota-updater/` in the app's local data directory
 | `<version>.tar.gz.sig` | The `signature` it was announced with. |
 | `state.json` | `confirmed` (version or null), `trial` (version or null), `attempts` (number), `rejected` (versions). |
 | `*.part` | A write in progress. Removed at the next launch if left behind. |
+| `.lock` | Locked by the process that is changing the store. |
 
 Bundles are never extracted to disk. A bundle is verified against its
 signature and unpacked into memory each time it is loaded: at every launch and
@@ -94,10 +95,15 @@ on `activate` / `install`.
 
 At launch the newest stored bundle that is compatible with the binary, not
 rejected and valid is served. Bundles that are incompatible, rejected, invalid
-or older than the one served (except the confirmed fallback) are deleted.
+or not newer than the one served (except the confirmed fallback) are deleted.
+A bundle that cannot be read for now (an I/O error) is skipped and kept.
 
-One running instance per user is assumed. The store is not locked against a
-second process.
+Newest is by semantic versioning precedence, which ignores build metadata,
+unless `compareBuildMetadata` is set. A version that is rejected rejects every
+version that counts as the same.
+
+Processes of the same app take turns: each locks `.lock` while it changes the
+store. Where the file system cannot lock files, the store is used unlocked.
 
 ## Stability
 

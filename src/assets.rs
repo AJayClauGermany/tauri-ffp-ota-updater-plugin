@@ -18,7 +18,7 @@ use crate::bundle::Bundle;
 // The asset provider has to be installed on the `Context` before the app (and so the plugin)
 // exists, so the two halves share the active bundle through process-wide state.
 static ACTIVE: RwLock<Option<Arc<Bundle>>> = RwLock::new(None);
-static INSTALLED: AtomicBool = AtomicBool::new(false);
+static WRAPPED: AtomicBool = AtomicBool::new(false);
 /// Runs once, when the active bundle serves its next HTML document.
 static ON_DOCUMENT: Mutex<Option<DocumentHook>> = Mutex::new(None);
 
@@ -36,8 +36,9 @@ pub(crate) fn set_active(bundle: Option<Bundle>, on_document: Option<DocumentHoo
     *active = bundle.map(Arc::new);
 }
 
-pub(crate) fn is_installed() -> bool {
-    INSTALLED.load(Ordering::Relaxed)
+/// Whether [`wrap_assets`] was called, without which no bundle can be served.
+pub(crate) fn is_wrapped() -> bool {
+    WRAPPED.load(Ordering::Relaxed)
 }
 
 struct OtaAssets<R: Runtime> {
@@ -86,9 +87,32 @@ impl<R: Runtime> Assets<R> for OtaAssets<R> {
 
     fn csp_hashes(&self, html_path: &AssetKey) -> Box<dyn Iterator<Item = CspHash<'_>> + '_> {
         match active() {
-            // The embedded hashes were computed at build time for the embedded HTML and do not
-            // describe the bundle's inline scripts.
-            Some(_) => Box::new(std::iter::empty()),
+            // The embedded script hashes describe the embedded files, so the bundle brings its
+            // own (see `csp::prepare`). The embedded style hashes are kept: they are not of the
+            // frontend's files but of what Tauri itself adds, the isolation pattern's iframe.
+            Some(bundle) => {
+                let own = bundle
+                    .csp
+                    .scripts
+                    .iter()
+                    .chain(
+                        bundle
+                            .csp
+                            .inline_scripts
+                            .get(html_path.as_ref())
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .map(|hash| CspHash::Script(hash));
+                Box::new(
+                    self.embedded
+                        .csp_hashes(html_path)
+                        .filter(|hash| matches!(hash, CspHash::Style(_)))
+                        .chain(own)
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                )
+            }
             None => self.embedded.csp_hashes(html_path),
         }
     }
@@ -100,13 +124,13 @@ impl<R: Runtime> Assets<R> for OtaAssets<R> {
 ///
 /// ```ignore
 /// let mut context = tauri::generate_context!();
-/// tauri_plugin_ffp_ota_updater::install(&mut context);
+/// tauri_plugin_ffp_ota_updater::wrap_assets(&mut context);
 /// tauri::Builder::default()
 ///     .plugin(tauri_plugin_ffp_ota_updater::init())
 ///     .run(context)
 ///     .expect("error while running tauri application");
 /// ```
-pub fn install<R: Runtime>(context: &mut Context<R>) {
+pub fn wrap_assets<R: Runtime>(context: &mut Context<R>) {
     // `set_assets` needs the replacement up front and hands back the original, so park a
     // placeholder for the instant in between.
     struct Placeholder;
@@ -124,5 +148,5 @@ pub fn install<R: Runtime>(context: &mut Context<R>) {
 
     let embedded = context.set_assets(Box::new(Placeholder));
     context.set_assets(Box::new(OtaAssets { embedded }));
-    INSTALLED.store(true, Ordering::Relaxed);
+    WRAPPED.store(true, Ordering::Relaxed);
 }

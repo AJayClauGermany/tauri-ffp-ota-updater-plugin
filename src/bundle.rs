@@ -15,14 +15,18 @@
 //! - *confirmed* by the frontend ([`Store::confirm`]), which makes it the fallback, or
 //!   *rejected*: when the attempts are used up ([`Store::select`]), or at once by a rollback
 //!   or an expired ready timeout ([`Store::fail_trial`]).
+//!
+//! Everything that reads and then writes the store holds [`Store::guard`], which also locks the
+//! directory against other processes of the same app.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeSet, HashMap},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use base64::Engine;
@@ -36,6 +40,8 @@ const ARCHIVE_EXT: &str = ".tar.gz";
 const SIGNATURE_EXT: &str = ".tar.gz.sig";
 const PARTIAL_EXT: &str = ".part";
 const STATE_FILE: &str = "state.json";
+/// Held locked by the process that is changing the store.
+const LOCK_FILE: &str = ".lock";
 /// Entries (files and directories) a bundle may contain.
 const MAX_ENTRIES: usize = 20_000;
 
@@ -51,14 +57,43 @@ pub(crate) struct Limits {
 /// Decides whether a frontend bundle version may run on a given binary version.
 ///
 /// Receives `(binary_version, bundle_version)`. Unlike the updater plugin's version comparator
-/// this does not decide whether a release is an update: a bundle also has to be newer than the
-/// frontend being served.
+/// this does not decide whether a release is an update: the plugin only considers bundles that
+/// are newer than the binary and than the frontend being served, whatever the rule says.
 pub type Compatibility = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
 
-/// The default [`Compatibility`] rule: a bundle is frontend-only when it is a newer *patch*
-/// release of the binary (same major and minor). Anything else needs a full update.
+/// The default [`Compatibility`] rule: a binary runs the bundles of its own major and minor
+/// version. Since bundles also have to be newer than the binary, that makes them its later
+/// *patch* releases (`1.2.0` runs `1.2.1`, not `1.3.0`). Anything else needs a full update.
 pub fn default_compatibility(binary: &Version, bundle: &Version) -> bool {
-    bundle.major == binary.major && bundle.minor == binary.minor && bundle > binary
+    bundle.major == binary.major && bundle.minor == binary.minor
+}
+
+/// How versions are compared to decide which is newer.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Order {
+    /// Order versions that differ only in build metadata by it, instead of treating them as
+    /// the same version.
+    pub build_metadata: bool,
+}
+
+impl Order {
+    pub fn cmp(&self, a: &Version, b: &Version) -> Ordering {
+        if self.build_metadata {
+            a.cmp(b)
+        } else {
+            a.cmp_precedence(b)
+        }
+    }
+
+    /// Whether `a` is newer than `b`.
+    pub fn newer(&self, a: &Version, b: &Version) -> bool {
+        self.cmp(a, b) == Ordering::Greater
+    }
+
+    /// Whether `a` and `b` count as the same version.
+    pub fn same(&self, a: &Version, b: &Version) -> bool {
+        self.cmp(a, b) == Ordering::Equal
+    }
 }
 
 /// A verified frontend bundle, unpacked in memory.
@@ -66,6 +101,8 @@ pub(crate) struct Bundle {
     pub version: Version,
     /// Keyed by normalized asset key (`/index.html`).
     pub files: HashMap<String, Vec<u8>>,
+    /// Filled in by [`crate::csp::prepare`] when the bundle is served.
+    pub csp: crate::csp::Hashes,
 }
 
 impl Bundle {
@@ -129,6 +166,7 @@ impl Bundle {
         Ok(Self {
             version: version.clone(),
             files,
+            csp: Default::default(),
         })
     }
 }
@@ -171,7 +209,7 @@ fn verify_signature(
     require_signed_version: bool,
 ) -> Result<()> {
     let bad = |error: minisign_verify::Error| Error::InvalidSignature(error.to_string());
-    let public_key = PublicKey::decode(&base64_to_string(pubkey)?).map_err(bad)?;
+    let public_key = parse_pubkey(pubkey)?;
     let signature = Signature::decode(&base64_to_string(signature)?).map_err(bad)?;
     public_key.verify(data, &signature, true).map_err(bad)?;
 
@@ -192,6 +230,15 @@ fn verify_signature(
             }),
         },
     }
+}
+
+/// Reads a public key as `tauri signer generate` prints it.
+pub(crate) fn parse_pubkey(pubkey: &str) -> Result<PublicKey> {
+    if pubkey.trim().is_empty() {
+        return Err(Error::EmptyPubkey);
+    }
+    PublicKey::decode(&base64_to_string(pubkey)?)
+        .map_err(|error| Error::InvalidSignature(format!("the public key: {error}")))
 }
 
 fn base64_to_string(value: &str) -> Result<String> {
@@ -233,8 +280,17 @@ pub(crate) struct Store {
     pub shown: Mutex<Option<Version>>,
     pub binary: Version,
     pub compatibility: Compatibility,
-    /// Serializes everything that reads and then writes the state.
+    pub order: Order,
+    /// Serializes everything that reads and then writes the store, within this process; see
+    /// [`Store::guard`].
     pub lock: Mutex<()>,
+}
+
+/// Exclusive access to the store, see [`Store::guard`].
+pub(crate) struct Guard<'a> {
+    _process: MutexGuard<'a, ()>,
+    /// Unlocked when closed.
+    _file: Option<fs::File>,
 }
 
 /// Writes `contents` so that `path` either keeps its old content or has all of the new one,
@@ -249,6 +305,28 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 impl Store {
+    /// Locks the store against other threads and against other processes of the same app, which
+    /// share the directory. If the directory cannot be locked (a file system without locks, say)
+    /// the store is used without, as if a single instance were running.
+    pub fn guard(&self) -> Guard<'_> {
+        let process = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let file = fs::create_dir_all(&self.dir)
+            .and_then(|()| {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(self.dir.join(LOCK_FILE))
+            })
+            .and_then(|file| file.lock().map(|()| file));
+        Guard {
+            _process: process,
+            _file: file
+                .inspect_err(|error| log::debug!("could not lock the OTA store: {error}"))
+                .ok(),
+        }
+    }
+
     fn archive_path(&self, version: &Version) -> PathBuf {
         self.dir.join(format!("{version}{ARCHIVE_EXT}"))
     }
@@ -257,13 +335,22 @@ impl Store {
         self.dir.join(format!("{version}{SIGNATURE_EXT}"))
     }
 
-    /// Whether `version` is a frontend-only update for this binary.
+    /// Whether `version` is a frontend-only update for this binary: newer than it, and allowed
+    /// by the compatibility rule.
     pub fn compatible(&self, version: &Version) -> bool {
-        (self.compatibility)(&self.binary, version)
+        self.order.newer(version, &self.binary) && (self.compatibility)(&self.binary, version)
     }
 
     pub fn is_rejected(&self, version: &Version) -> bool {
-        self.read_state().rejected.contains(version)
+        self.rejected_in(&self.read_state(), version)
+    }
+
+    /// Whether `state` rejects `version`, or a version that counts as the same.
+    fn rejected_in(&self, state: &State, version: &Version) -> bool {
+        state
+            .rejected
+            .iter()
+            .any(|rejected| self.order.same(rejected, version))
     }
 
     /// Versions that failed a trial or were rolled back, oldest first.
@@ -273,11 +360,15 @@ impl Store {
 
     /// The newest stored bundle that is newer than `current` and may be served, i.e. the one
     /// the next launch would pick. Goes by the files present; nothing is verified.
+    ///
+    /// Takes no lock: it only reads, and `status` should not wait for a download that is being
+    /// verified.
     pub fn staged(&self, current: &Version) -> Option<Version> {
-        let _guard = self.lock.lock().unwrap();
         let state = self.read_state();
         self.versions().into_iter().find(|version| {
-            version > current && self.compatible(version) && !state.rejected.contains(version)
+            self.order.newer(version, current)
+                && self.compatible(version)
+                && !self.rejected_in(&state, version)
         })
     }
 
@@ -292,7 +383,7 @@ impl Store {
     /// On an error the trial is not on record and the bundle must not be served: it could not
     /// be rolled back.
     pub fn begin_trial(&self, version: &Version) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         let mut shown = self.shown.lock().unwrap();
         let mut state = self.read_state();
         if shown.as_ref() == Some(version) || state.confirmed.as_ref() == Some(version) {
@@ -311,7 +402,7 @@ impl Store {
 
     /// The last confirmed bundle, to serve when a trial cannot go ahead.
     pub fn fallback(&self) -> Option<Bundle> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         self.read_state()
             .confirmed
             .and_then(|version| self.load(&version).ok())
@@ -320,7 +411,7 @@ impl Store {
     /// Whether `version` is stored with exactly this signature. With `verify` the stored
     /// archive is also checked against it, which reads and unpacks the whole bundle.
     pub fn is_stored(&self, version: &Version, signature: &str, verify: bool) -> bool {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         self.archive_path(version).is_file()
             && fs::read_to_string(self.signature_path(version))
                 .is_ok_and(|stored| stored.trim() == signature.trim())
@@ -359,7 +450,7 @@ impl Store {
 
     /// Verifies a downloaded archive and, only if it is valid, persists it.
     pub fn save(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         if self.is_rejected(version) {
             return Err(Error::Rejected(version.to_string()));
         }
@@ -385,11 +476,17 @@ impl Store {
             return Err(Error::TooLarge("bundle", self.limits.archive));
         }
         let archive = fs::read(path)?;
-        let signature = fs::read_to_string(self.signature_path(version))?;
+        let signature = match fs::read_to_string(self.signature_path(version)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::InvalidBundle("its signature is missing".into()));
+            }
+            other => other?,
+        };
         self.verify(&archive, &signature, version)
     }
 
-    /// Versions with an archive on disk, newest first.
+    /// Versions with an archive on disk, newest first. Versions that count as the same are
+    /// ordered by their build metadata.
     fn versions(&self) -> Vec<Version> {
         let mut versions: Vec<Version> = fs::read_dir(&self.dir)
             .into_iter()
@@ -400,7 +497,7 @@ impl Store {
                 Version::parse(name.to_str()?.strip_suffix(ARCHIVE_EXT)?).ok()
             })
             .collect();
-        versions.sort_by(|a, b| b.cmp(a));
+        versions.sort_by(|a, b| self.order.cmp(b, a).then_with(|| b.cmp(a)));
         versions
     }
 
@@ -409,10 +506,14 @@ impl Store {
         let _ = fs::remove_file(self.signature_path(version));
     }
 
-    /// Removes what `serving` supersedes: everything older, except the confirmed fallback.
+    /// Removes what `serving` supersedes: everything that is not newer, except the confirmed
+    /// fallback.
     fn prune(&self, state: &State, serving: &Version) {
         for version in self.versions() {
-            if version < *serving && state.confirmed.as_ref() != Some(&version) {
+            if version != *serving
+                && !self.order.newer(&version, serving)
+                && state.confirmed.as_ref() != Some(&version)
+            {
                 self.remove(&version);
             }
         }
@@ -420,7 +521,7 @@ impl Store {
 
     /// Removes every stored bundle. The rejected versions stay on record.
     pub fn clear(&self) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         for version in self.versions() {
             self.remove(&version);
         }
@@ -437,7 +538,7 @@ impl Store {
     /// Deletes the stored bundle `version`, unless it is `serving` or the confirmed fallback.
     /// A version that is not stored is not an error.
     pub fn discard(&self, version: &Version, serving: Option<&Version>) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         let mut state = self.read_state();
         if serving == Some(version) || state.confirmed.as_ref() == Some(version) {
             return Err(Error::InUse(version.to_string()));
@@ -454,9 +555,9 @@ impl Store {
     /// Loads the stored bundle `version` to switch to it while the app is running. Its trial
     /// starts with the first page loaded from it.
     pub fn activate(&self, version: &Version) -> Result<Bundle> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         let mut state = self.read_state();
-        if state.rejected.contains(version) {
+        if self.rejected_in(&state, version) {
             return Err(Error::Rejected(version.to_string()));
         }
         let bundle = self.load(version)?;
@@ -480,7 +581,7 @@ impl Store {
     /// one is deleted. Only a bundle on trial can be confirmed: before a page was loaded from
     /// it, nothing can vouch for it.
     pub fn confirm(&self, serving: &Version) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         let mut state = self.read_state();
         if state.trial.as_ref() == Some(serving) {
             state.confirmed = state.trial.take();
@@ -496,19 +597,23 @@ impl Store {
     ///
     /// Called at startup, where a trial that earlier runs left unconfirmed is rejected once its
     /// attempts are used up, and to roll back, where `reject` is the version to abandon. A
-    /// bundle chosen without having been confirmed goes on trial when the first page is loaded
+    /// rollback only goes back to the confirmed bundle, or else the built-in assets: a newer
+    /// bundle that is stored but was never shown stays stored for the next launch.
+    ///
+    /// A bundle chosen without having been confirmed goes on trial when the first page is loaded
     /// from it, see [`Self::begin_trial`]. Bundles that are incompatible (e.g. left over from
-    /// before a full update), rejected, invalid or superseded are deleted. Never fails: with no
-    /// usable bundle the built-in assets are used.
+    /// before a full update), rejected, invalid or superseded are deleted; one that cannot be
+    /// read for now (an I/O error) is skipped and kept. Never fails: with no usable bundle the
+    /// built-in assets are used.
     pub fn select(&self, reject: Option<&Version>) -> Option<Bundle> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         self.select_locked(reject)
     }
 
     /// Rejects `version` and [selects](Self::select) its replacement, unless it was confirmed
     /// or replaced in the meantime, in which case nothing happens and `None` is returned.
     pub fn fail_trial(&self, version: &Version) -> Option<Option<Bundle>> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.guard();
         (self.read_state().trial.as_ref() == Some(version))
             .then(|| self.select_locked(Some(version)))
     }
@@ -534,15 +639,24 @@ impl Store {
         if state
             .confirmed
             .as_ref()
-            .is_some_and(|v| !self.compatible(v) || state.rejected.contains(v))
+            .is_some_and(|v| !self.compatible(v) || self.rejected_in(&state, v))
         {
             state.confirmed = None;
         }
 
+        // a rollback goes back to what is known to work: the confirmed bundle or the built-in
+        // assets
+        let only = reject.map(|_| state.confirmed.clone());
         let mut chosen = None;
         for version in self.versions() {
-            if state.rejected.contains(&version) {
+            if self.rejected_in(&state, &version) {
                 self.remove(&version);
+                continue;
+            }
+            if only
+                .as_ref()
+                .is_some_and(|only| only.as_ref() != Some(&version))
+            {
                 continue;
             }
             match self.load(&version) {
@@ -550,10 +664,11 @@ impl Store {
                     chosen = Some(bundle);
                     break;
                 }
-                Err(error) => {
+                Err(error) if error.is_permanent() => {
                     log::warn!("discarding frontend bundle {version}: {error}");
                     self.remove(&version);
                 }
+                Err(error) => log::warn!("skipping frontend bundle {version} for now: {error}"),
             }
         }
 

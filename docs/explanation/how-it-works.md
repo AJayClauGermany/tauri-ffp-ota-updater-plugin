@@ -18,7 +18,7 @@ A Tauri app does not load its frontend from disk. `tauri build` embeds the
 files in the binary, and the webview's requests to `tauri://localhost` (or
 `http://tauri.localhost` on Windows) are answered from that embedded set.
 
-The plugin puts itself in front of that set. `install(&mut context)` swaps the
+The plugin puts itself in front of that set. `wrap_assets(&mut context)` swaps the
 context's assets for a wrapper that answers from a downloaded bundle when one
 is active and from the embedded files otherwise. This is why the plugin needs
 a line of setup that other plugins do not, and why it has to happen before the
@@ -81,8 +81,10 @@ them up:
 A release is offered when both of these hold:
 
 1. it is **newer than the frontend being served**, and
-2. it is **compatible with the binary**. By default that means a newer patch
-   of it: binary `1.2.0` accepts `1.2.1` and `1.2.7`, not `1.3.0` or `2.0.0`.
+2. it is **compatible with the binary**: newer than the binary, and allowed by
+   the compatibility rule. The default rule allows the binary's own major and
+   minor version, which makes these its later patches: binary `1.2.0` accepts
+   `1.2.1` and `1.2.7`, not `1.3.0` or `2.0.0`.
 
 The second rule encodes an assumption: a minor or major bump probably needs
 new Rust code, and a frontend that calls commands the binary does not have is
@@ -91,12 +93,20 @@ full update. The plugin cannot inspect your Rust code, so the version number
 is the contract: publishing a patch is your statement that the binary did not
 need to change.
 
-`Builder::compatibility` replaces rule 2 for projects with another convention.
-It is deliberately not a "version comparator" like the updater plugin's: it
-answers "can this binary run that frontend?", never "is this an update?".
-Rule 1 always applies, so versions only move forward. That keeps the store
-simple (the newest usable bundle wins) and makes a replayed old manifest
-harmless.
+`Builder::compatibility` replaces the rule in 2 for projects with another
+convention. It is deliberately not a "version comparator" like the updater
+plugin's: it answers "can this binary run that frontend?", never "is this an
+update?". Being newer, than the frontend being served and than the binary,
+always applies, so versions only move forward. That keeps the store simple
+(the newest usable bundle wins) and makes a replayed old manifest harmless.
+
+"Newer" follows semantic versioning, which ignores build metadata: `1.2.1+2`
+is the same version as `1.2.1+1`, so publishing it is not an update, and
+`1.2.0+1` is not newer than the binary `1.2.0`. Build numbers are not as
+dependable an order as the patch number (they may be dates, hashes or reset by
+a CI change), so ordering by them is opt-in: with `compareBuildMetadata`,
+versions that differ only in build metadata are ordered by it, numerically
+where it is a number (`+10` after `+9`).
 
 After a full update, bundles made for the previous binary no longer pass rule
 2 and are deleted at the first launch, together with the record of rejected
@@ -118,7 +128,8 @@ that call is a failed attempt.
 - A broken bundle's version is **rejected for good** on that device: it is
   deleted, never served and never offered by `check()` again. The app serves
   the last confirmed bundle, or else the built-in frontend. The fix has to be
-  published as a new version.
+  published as a new version. A newer bundle that was downloaded but never
+  shown is kept, and is tried at the next launch.
 - The confirmed bundle is kept as the fallback until its successor is
   confirmed.
 
@@ -132,7 +143,11 @@ Details that matter in practice:
   stays on screen until the user restarts the app, twice with the default
   settings. `readyTimeout` adds a deadline that reverts it while the app is
   running; `rollback()` lets the frontend or the Rust side give up at once.
-- **Confirmation is not tied to a page.** Any window can confirm the trial.
+- **Only a page of the bundle can confirm it.** Any window can, as long as its
+  page was loaded from the bundle on trial. While `install()` reloads the
+  windows one after the other, a window still showing the previous frontend
+  cannot vouch for the new one. `notify_ready()` in Rust is not subject to
+  this: from Rust it confirms whatever is being served.
 - **A good bundle can be rejected** if the app is closed between showing it
   and its `notifyReady()` call in `trialAttempts` runs in a row. The device
   then stays on the previous frontend until the next version is published.
@@ -172,13 +187,16 @@ one.
 
 ## Limitations
 
-- **Dev mode**: a downloaded bundle is never displayed under `tauri dev`.
-- **Strict CSP**: Tauri computes nonces and hashes for inline scripts and
-  styles at build time, for the embedded HTML only. A bundle should load
-  scripts and styles from files.
+- **Dev mode**: a downloaded bundle is never displayed under `tauri dev`, so
+  the plugin does not switch to one there: `install()` fails with
+  `cannotServe`, and `currentVersion()` is the app's version.
+- **CSP**: with a CSP, `tauri build` adds nonces and hashes for the embedded
+  HTML. The plugin does the same for a bundle when it is served, so inline
+  scripts and styles work as they do in the built-in frontend. Anything else
+  the policy has to allow, such as a new host, needs a full update.
 - **Rollback timing** and **false rejections**: see
   [Trial and rollback](#trial-and-rollback).
-- **One instance**: the bundle store is not locked against a second process of
-  the same app.
+- **Several instances**: processes of the same app take turns on the store
+  (it is locked while changed), but each counts its own runs for a trial.
 - **Memory**: the active bundle is held unpacked in memory.
 - **Desktop only.**

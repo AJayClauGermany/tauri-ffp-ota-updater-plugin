@@ -30,8 +30,9 @@ built-in frontend.
 
 | Cause | Fix |
 | --- | --- |
-| Running under `tauri dev`. The dev server's frontend is always shown. | Test with `tauri build` (add `-- --no-bundle` for a quick binary). |
-| `install(&mut context)` is missing. The log says `install(&mut context) was not called`. | Add it before `.run(context)`; see the [quick start](../../README.md#2-register). |
+| Running under `tauri dev`. The dev server's frontend is always shown, and `install()` fails with `cannotServe`. | Test with `tauri build` (add `-- --no-bundle` for a quick binary). |
+| `wrap_assets(&mut context)` is missing. `install()` fails with `cannotServe`, and the log says `wrap_assets(&mut context)` was not called. | Add it before `.run(context)`; see the [quick start](../../README.md#2-register). |
+| No `pubkey` is configured. `check()` fails with `emptyPubkey`. | Add it; see [Configuration](../reference/configuration.md#tauriconfjson). |
 | The plugin is registered inside `.setup()`. | Register it with `.plugin(…)` on `tauri::Builder`. |
 | Only `download()` was called. | That is how it works: the bundle is used from the next launch. Call `install()` or `downloadAndInstall()` to switch now. |
 
@@ -42,7 +43,7 @@ built-in frontend.
 | Cause | How to tell | Fix |
 | --- | --- | --- |
 | The version is not a newer **patch** of the installed binary (`1.3.0` for an app on `1.2.x`). | Compare the manifest's `version` with `binaryVersion`. | Publish it as a patch, ship it as a full update, or change the rule with [`Builder::compatibility`](../reference/configuration.md#builder). |
-| The version is not greater than the frontend already being served. | `currentVersion` in `status()`. | Use a higher version. |
+| The version is not greater than the frontend already being served. | `currentVersion` in `status()`. | Use a higher version. Build metadata does not count: `1.2.1+2` is not greater than `1.2.1+1` unless `compareBuildMetadata` is set. |
 | The version was rolled back on this device. | It is in `rejected`. | Publish the fix under a new version. A rejected version is never offered again. |
 | The app still sees the old manifest. | `curl -sL <endpoint>` | Wait for or purge the CDN cache. |
 | The endpoint answered `204`. | `curl -si <endpoint>` | Fix the server's condition. Remember that `{{current_version}}` is the frontend's version, `{{binary_version}}` the app's. |
@@ -94,7 +95,20 @@ redirect to `http`. Expected on a device without a connection; retry later.
 No `endpoints` under `plugins.ffp-ota-updater` (check the spelling of the
 block: it is not `plugins.updater`), or one of them is not `https`.
 
+### `emptyPubkey`
+
+No `pubkey` under `plugins.ffp-ota-updater` and none given to
+`Builder::pubkey`. Without it no bundle can be verified, so none is served
+either; bundles already stored are kept until a key is configured.
+
 ## Errors from `download()` and `install()`
+
+### `cannotServe`
+
+`install()` was called in a run of the app that cannot show a downloaded
+frontend: under `tauri dev`, or without `wrap_assets(&mut context)`. The
+bundle stays stored. See [the update downloads, but the app looks the
+same](#the-update-downloads-but-the-app-looks-the-same).
 
 ### `signature`
 
@@ -150,7 +164,7 @@ use `install(version)`.
 | Kind | Meaning |
 | --- | --- |
 | `notDownloaded` | `install()` for a version that is not stored. Download it first. |
-| `notNewer` | The version is older than the frontend being served. Versions only move forward. |
+| `notNewer` | The version is not newer than the frontend being served. Versions only move forward. |
 | `inUse` | `discard()` of the bundle being served, or of the confirmed one kept as the fallback. |
 | `rejected` | The version was rolled back on this device before. |
 | `incompatible` | The version is not a frontend update for this binary (see the first row of the `null` table above). |
@@ -165,9 +179,9 @@ The call did not reach the plugin.
 
 ## After the update, styles or scripts are blocked
 
-- **Inline scripts or styles with a strict CSP.** Tauri computes nonces and
-  hashes for inline code at build time, for the embedded HTML only. In a
-  bundle, load scripts and styles from files, which is what bundlers emit.
+- **`dangerousDisableAssetCspModification`** is set. Then neither Tauri nor
+  the plugin adds nonces or hashes, for the built-in frontend or a bundle, and
+  inline code needs `'unsafe-inline'` or a hash in the policy itself.
 - **A new host** (API, fonts, images) is not in the CSP. The CSP is part of
   the binary; adding a host needs a full release.
 
