@@ -618,6 +618,10 @@ impl Store {
             Ok(_) => {
                 let unusable = self.load(version).is_err_and(|error| error.is_permanent());
                 if recorded || !unusable {
+                    // a mistake in publishing, which the error alone does not explain
+                    log::warn!(
+                        "frontend version {version} was published with other contents than the bundle stored under it; keeping the stored one. A version names one bundle: publish a changed build under a new version"
+                    );
                     return Err(Error::InUse(name));
                 }
             }

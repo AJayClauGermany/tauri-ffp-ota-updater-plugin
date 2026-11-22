@@ -182,7 +182,14 @@ contents under that version are refused with `inUse`. That includes a bundle
 no page was loaded from yet. It may already be in memory, about to be shown
 and confirmed, and whatever replaced it on disk would start the next launch
 as confirmed without ever having run. To replace a bundle that was never
-shown, `discard()` it first.
+shown, `discard()` it first. The refusal is logged as a warning that says
+what happened, since it means a release was published twice.
+
+The plugin cannot stop a version from being published twice; it can only keep
+each device on the first one it stored. A rebuild that must keep its version
+number can carry a build number instead (`1.2.1+2`), which is a version of
+its own. Devices take it as an update only with `compareBuildMetadata`, see
+[Versions](#versions).
 
 The same goes for what a webview holds after `check()`: the `Update` object
 stands for a version, not for one particular answer of the endpoint. If two

@@ -160,6 +160,10 @@ If one form is refused, use the other.
   contains its version, a device that reads an older manifest after you
   published again gets a clean download error, not the wrong file, and
   succeeds at its next check.
+- **No credentials are involved.** The manifest and the tarball are public
+  and on the same origin, `cdn.crabnebula.app`. If you configure headers for
+  the endpoint anyway, they go to that origin only, not to a host a download
+  is redirected to.
 - **One line at a time**, as with any static manifest: the channel's latest
   `ota.json` describes one release. For parallel version lines use a channel
   per line (`ota-1.2`, `ota-1.3`) and choose the endpoint from Rust, as shown

@@ -32,18 +32,18 @@ and a local server, start to finish.
 ```toml
 # src-tauri/Cargo.toml
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", rev = "<commit>" }
+tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", tag = "v1.0.0" }
 ```
 
 ```bash
-npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#<commit>"
+npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#v1.0.0"
 ```
 
 > The crate and the npm package (`tauri-plugin-ffp-ota-updater-api`) are not
 > on crates.io / npm yet, so both are installed from git; the JS package is
-> built on your machine while it installs. Give both the same commit (or
-> release tag, with `tag = "…"`): the two halves talk to each other and have
-> to match, and without a revision each follows the branch on its own.
+> built on your machine while it installs. Give both the same release tag:
+> the two halves talk to each other and have to match, and without a tag each
+> follows the branch on its own.
 > `tauri add` does not know this plugin. Without a bundler, call the commands
 > through `invoke` as [`examples/tauri-app`](examples/tauri-app/src/main.js)
 > does.
