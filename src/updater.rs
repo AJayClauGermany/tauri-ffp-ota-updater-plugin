@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -67,8 +67,17 @@ pub struct RequestOptions {
     /// Manifest URLs to query instead of the configured ones, in order. This is how an app
     /// switches release channels while it is running.
     pub endpoints: Option<Vec<Url>>,
-    /// Extra headers sent with the manifest request and the bundle download.
+    /// Extra headers sent with the manifest request, and with the bundle download if the bundle
+    /// is on the same origin (scheme, host and port) as the manifest.
+    ///
+    /// They are not sent to another origin because the manifest is not signed: whoever can
+    /// change it could point the download at their own server and collect an `Authorization`
+    /// header before the signature check rejects what they serve.
     pub headers: HeaderMap,
+    /// Extra headers sent with the bundle download only, wherever the manifest says the bundle
+    /// is. For a download host that needs credentials of its own, or the manifest's, on
+    /// another origin; only add what that host may see.
+    pub download_headers: HeaderMap,
     /// Timeout applied to each request. Defaults to 30 seconds for the manifest and 30 minutes
     /// for the bundle; a connection that stalls for 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
@@ -102,6 +111,21 @@ impl RequestOptions {
         Ok(self)
     }
 
+    /// Adds a header to [`Self::download_headers`], replacing one of the same name.
+    pub fn download_header<K, V>(mut self, key: K, value: V) -> Result<Self>
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
+        let value: std::result::Result<HeaderValue, http::Error> =
+            value.try_into().map_err(Into::into);
+        self.download_headers.insert(key?, value?);
+        Ok(self)
+    }
+
     /// Sets [`Self::timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -119,6 +143,7 @@ impl RequestOptions {
 #[derive(Default)]
 pub(crate) struct ClientOptions {
     pub headers: HeaderMap,
+    pub download_headers: HeaderMap,
     pub timeout: Option<Duration>,
     pub proxy: Option<Url>,
     pub no_proxy: bool,
@@ -168,6 +193,8 @@ pub struct OtaUpdater<R: Runtime> {
     /// For each webview, by label, the bundle its current page was loaded from (`None` for the
     /// built-in frontend or another site). Only a page of the bundle on trial may confirm it.
     pub(crate) documents: Mutex<HashMap<String, Option<Version>>>,
+    /// Held while deciding on and switching the frontend being served, see [`Self::switching`].
+    pub(crate) switching: Mutex<()>,
 }
 
 /// Whether a page whose recorded origin is `shown` (see [`OtaUpdater::documents`]; `None` when
@@ -187,6 +214,19 @@ pub(crate) fn is_app_url(url: &Url) -> bool {
 }
 
 impl<R: Runtime> OtaUpdater<R> {
+    /// Serializes switches of the frontend being served. Each decides what to serve from the
+    /// store and from what is being served, and has to publish the result before another
+    /// switch looks: otherwise two installs racing each other, or an install racing an expired
+    /// ready timeout, could leave an older frontend served over a newer one, possibly one whose
+    /// files the other switch already deleted.
+    ///
+    /// Taken before [`Store::guard`], never while holding it. Not held while reloading.
+    fn switching(&self) -> MutexGuard<'_, ()> {
+        self.switching
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Version of the frontend being served: the active bundle's, or else the binary's.
     pub fn current_version(&self) -> Version {
         assets::active()
@@ -232,19 +272,11 @@ impl<R: Runtime> OtaUpdater<R> {
         self.ensure_pubkey()?;
 
         // what the download of the release found here is made with, too
-        let mut headers = self.client.headers.clone();
-        let mut replaced = None;
-        for (name, value) in std::mem::take(&mut options.headers) {
-            // `None` is another value for the name before it
-            if let Some(name) = name {
-                headers.remove(&name);
-                replaced = Some(name);
-            }
-            if let Some(name) = &replaced {
-                headers.append(name, value);
-            }
-        }
-        options.headers = headers;
+        options.headers = merge_headers(&self.client.headers, std::mem::take(&mut options.headers));
+        options.download_headers = merge_headers(
+            &self.client.download_headers,
+            std::mem::take(&mut options.download_headers),
+        );
         options.timeout = options.timeout.or(self.client.timeout);
         options.proxy = options.proxy.or_else(|| self.client.proxy.clone());
 
@@ -266,7 +298,12 @@ impl<R: Runtime> OtaUpdater<R> {
         for endpoint in endpoints {
             let url = self.resolve_endpoint(endpoint, &current_version)?;
             log::debug!("checking for frontend updates at {url}");
-            let response = match client.get(url).headers(headers.clone()).send().await {
+            let response = match client
+                .get(url.clone())
+                .headers(headers.clone())
+                .send()
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     last_error = error.to_string();
@@ -293,13 +330,13 @@ impl<R: Runtime> OtaUpdater<R> {
                 };
             match serde_json::from_value::<RemoteRelease>(raw_json.clone()) {
                 Ok(release) => {
-                    found = Some((release, raw_json));
+                    found = Some((release, raw_json, url));
                     break;
                 }
                 Err(error) => last_error = error.to_string(),
             }
         }
-        let Some((release, raw_json)) = found else {
+        let Some((release, raw_json, manifest_url)) = found else {
             return Err(match unreachable {
                 // offline, most likely: a different matter than a broken manifest
                 Some(error) if !responded => Error::Reqwest(error),
@@ -326,6 +363,7 @@ impl<R: Runtime> OtaUpdater<R> {
             raw_json,
             download_url: release.url,
             signature: release.signature,
+            manifest_url,
             options,
         }))
     }
@@ -338,6 +376,10 @@ impl<R: Runtime> OtaUpdater<R> {
     ///
     /// The bundle is then staged like a downloaded one: served from the next launch on, or at
     /// once with [`Self::install`].
+    ///
+    /// A version names one bundle: staging different contents under the version that is
+    /// confirmed or on trial fails with [`Error::InUse`]. Staging the same contents again
+    /// does nothing.
     pub fn stage(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
         self.ensure_pubkey()?;
         self.ensure_not_older(version)?;
@@ -374,12 +416,14 @@ impl<R: Runtime> OtaUpdater<R> {
     /// page loaded from it until [`Self::notify_ready`].
     ///
     /// Fails with [`Error::CannotServe`] when the assets were not wrapped with
-    /// [`wrap_assets`](crate::wrap_assets) or the app runs from `devUrl` in development mode.
+    /// [`wrap_assets`](crate::wrap_assets), the app runs from `devUrl` in development mode, or
+    /// its `frontendDist` is a URL.
     pub fn activate(&self, version: &Version) -> Result<()> {
         if let Some(reason) = self.cannot_serve {
             return Err(Error::CannotServe(reason));
         }
         self.ensure_pubkey()?;
+        let _switching = self.switching();
         self.ensure_not_older(version)?;
         self.serve(Some(self.store.activate(version)?));
         Ok(())
@@ -453,14 +497,20 @@ impl<R: Runtime> OtaUpdater<R> {
     /// built-in frontend and the webviews are reloaded. A newer bundle that is stored but was
     /// never shown is kept, and is tried at the next launch.
     pub fn rollback(&self) -> Result<()> {
-        if let Some(bundle) = assets::active() {
-            self.serve(self.store.select(Some(&bundle.version)));
+        let rolled_back = {
+            let _switching = self.switching();
+            assets::active()
+                .map(|bundle| self.serve(self.store.select(Some(&bundle.version))))
+                .is_some()
+        };
+        if rolled_back {
             self.reload()?;
         }
         Ok(())
     }
 
-    /// Makes `bundle` (or the built-in frontend) what is served from now on.
+    /// Makes `bundle` (or the built-in frontend) what is served from now on. Called with
+    /// [`Self::switching`] held, except at setup.
     ///
     /// The trial of an unconfirmed bundle starts when the first page is loaded from it, not
     /// here: an app that is closed before it showed the bundle has learned nothing about it.
@@ -484,11 +534,18 @@ impl<R: Runtime> OtaUpdater<R> {
                 let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
                     return;
                 };
-                if let Err(error) = updater.store.begin_trial(&version) {
-                    // a trial that is not on record could not be rolled back
-                    log::warn!("not serving frontend bundle {version}: {error}");
-                    updater.serve(updater.store.fallback());
-                    return;
+                {
+                    let _switching = updater.switching();
+                    if assets::active().is_none_or(|active| active.version != version) {
+                        // switched away from in the meantime
+                        return;
+                    }
+                    if let Err(error) = updater.store.begin_trial(&version) {
+                        // a trial that is not on record could not be rolled back
+                        log::warn!("not serving frontend bundle {version}: {error}");
+                        updater.serve(updater.store.fallback());
+                        return;
+                    }
                 }
                 let Some(timeout) = timeout else {
                     return;
@@ -498,11 +555,21 @@ impl<R: Runtime> OtaUpdater<R> {
                     let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
                         return;
                     };
-                    if let Some(fallback) = updater.store.fail_trial(&version) {
+                    let rolled_back = {
+                        let _switching = updater.switching();
+                        // a trial only ever runs for the bundle being served; anything else
+                        // means it was switched away from
+                        assets::active()
+                            .is_some_and(|active| active.version == version)
+                            .then(|| updater.store.fail_trial(&version))
+                            .flatten()
+                            .map(|fallback| updater.serve(fallback))
+                            .is_some()
+                    };
+                    if rolled_back {
                         log::warn!(
-                            "frontend bundle {version} was not confirmed within {timeout} ms; rolling it back"
+                            "frontend bundle {version} was not confirmed within {timeout} ms; rolled it back"
                         );
-                        updater.serve(fallback);
                         if let Err(error) = updater.reload() {
                             log::error!("could not reload after the rollback: {error}");
                         }
@@ -515,13 +582,23 @@ impl<R: Runtime> OtaUpdater<R> {
 
     /// Deletes every downloaded bundle and goes back to the built-in frontend, reloading the
     /// webviews if a bundle was being served.
+    ///
+    /// Fails if a bundle could not be deleted, which would be served again at the next launch;
+    /// this run of the app goes back to the built-in frontend all the same.
     pub fn reset(&self) -> Result<()> {
-        self.store.clear()?;
-        if assets::active().is_some() {
-            self.serve(None);
+        let (cleared, was_active) = {
+            let _switching = self.switching();
+            let cleared = self.store.clear();
+            let was_active = assets::active().is_some();
+            if was_active {
+                self.serve(None);
+            }
+            (cleared, was_active)
+        };
+        if was_active {
             self.reload()?;
         }
-        Ok(())
+        cleared
     }
 
     /// Reloads every webview, which makes them load the frontend that is active now.
@@ -574,6 +651,23 @@ impl<R: Runtime> OtaUpdater<R> {
         }
         Ok(url.parse()?)
     }
+}
+
+/// `overrides` on top of `base`: a name in `overrides` replaces all of its values in `base`.
+fn merge_headers(base: &HeaderMap, overrides: HeaderMap) -> HeaderMap {
+    let mut headers = base.clone();
+    let mut replaced = None;
+    for (name, value) in overrides {
+        // `None` is another value for the name before it
+        if let Some(name) = name {
+            headers.remove(&name);
+            replaced = Some(name);
+        }
+        if let Some(name) = &replaced {
+            headers.append(name, value);
+        }
+    }
+    headers
 }
 
 /// Reads a response body of at most `limit` bytes.
@@ -637,6 +731,9 @@ pub struct Update<R: Runtime> {
     pub download_url: Url,
     /// The bundle's signature.
     pub signature: String,
+    /// Where the manifest came from, which decides whether [`RequestOptions::headers`] are
+    /// sent with the download.
+    manifest_url: Url,
     options: RequestOptions,
 }
 
@@ -652,6 +749,7 @@ impl<R: Runtime> Clone for Update<R> {
             raw_json: self.raw_json.clone(),
             download_url: self.download_url.clone(),
             signature: self.signature.clone(),
+            manifest_url: self.manifest_url.clone(),
             options: self.options.clone(),
         }
     }
@@ -690,7 +788,20 @@ impl<R: Runtime> Update<R> {
             return Ok(());
         }
 
-        let mut headers = self.options.headers.clone();
+        let mut headers = if self.download_url.origin() == self.manifest_url.origin() {
+            self.options.headers.clone()
+        } else {
+            if !self.options.headers.is_empty() {
+                log::debug!(
+                    "not sending the manifest's headers to {}, which is another origin",
+                    self.download_url
+                );
+            }
+            HeaderMap::new()
+        };
+        for (name, value) in &self.options.download_headers {
+            headers.insert(name, value.clone());
+        }
         headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("application/octet-stream"));

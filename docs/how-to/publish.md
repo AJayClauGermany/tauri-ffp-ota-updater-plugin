@@ -114,7 +114,7 @@ previous version and let it update.
 from:
 
 ```bash
-grep -rqE 'ffp-ota-updater|notify_ready' dist   # fail if the build lost notifyReady()
+grep -rq notify_ready dist   # heuristic: fail if the build lost notifyReady()
 tar -czf "frontend-$VERSION.tar.gz" -C dist .
 npx tauri signer sign --app-version "$VERSION" "frontend-$VERSION.tar.gz"
 jq -n --arg v "$VERSION" --arg u "$BASE_URL/frontend-$VERSION.tar.gz" \

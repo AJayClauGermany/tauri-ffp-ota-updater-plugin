@@ -84,7 +84,8 @@ resolves to `null`, exactly as if there were no update.
 | | Updater plugin | This plugin |
 | --- | --- | --- |
 | JS `Update` | a resource: `close()` it; `install()` only on the object that downloaded | plain object; `install(version)` also works in a later run, offline |
-| JS `check()` options | `headers`, `timeout`, `proxy`, `target` | `headers`, `timeout`, `proxy` |
+| JS `check()` options | `headers`, `timeout`, `proxy`, `target` | `headers`, `downloadHeaders`, `timeout`, `proxy` |
+| Headers on the download | all of them, wherever the manifest points | `headers` only to the manifest's origin; `downloadHeaders` anywhere |
 | JS errors | strings | `OtaUpdateError` with a `kind` to branch on |
 | Rust entry point | `app.updater()?`, `app.updater_builder()` | `app.ota_updater()`; per-check options with `check_with(RequestOptions)` |
 | Rust download | `download()` returns the bytes, `install(bytes)` | `download()` stores the bundle, `install()` takes no bytes |

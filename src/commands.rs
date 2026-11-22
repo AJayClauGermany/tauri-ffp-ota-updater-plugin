@@ -76,20 +76,25 @@ async fn download_with_events<R: Runtime>(
 pub(crate) async fn check<R: Runtime>(
     app: AppHandle<R>,
     headers: Option<Vec<(String, String)>>,
+    download_headers: Option<Vec<(String, String)>>,
     timeout: Option<u64>,
     proxy: Option<Url>,
 ) -> Result<Option<Metadata>> {
     // no endpoints: where updates come from is not the webview's to decide
     let mut options = RequestOptions {
         headers: HeaderMap::new(),
+        download_headers: HeaderMap::new(),
         timeout: timeout.map(Duration::from_millis),
         proxy,
         ..Default::default()
     };
-    for (name, value) in headers.unwrap_or_default() {
-        options
-            .headers
-            .append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?);
+    for (map, pairs) in [
+        (&mut options.headers, headers),
+        (&mut options.download_headers, download_headers),
+    ] {
+        for (name, value) in pairs.unwrap_or_default() {
+            map.append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?);
+        }
     }
 
     let updater = app.ota_updater();

@@ -35,11 +35,17 @@ await notifyReady();
 - Do not make it wait for the user (a login screen, say).
 - It is a no-op when there is nothing to confirm, so no condition is needed.
 
-To make sure a build cannot be published without it, check the output in CI:
+To catch a build that lost it, check the output in CI:
 
 ```bash
-grep -rqE 'ffp-ota-updater|notify_ready' dist
+grep -rq notify_ready dist
 ```
+
+The command name survives minification, and bundlers drop `notifyReady` from
+the output when nothing imports it. This is a heuristic, not a proof: it
+passes for a build that imports `notifyReady()` but never reaches the call.
+Only starting the release build (see [publish](publish.md#6-check-it))
+shows that the confirmation actually happens.
 
 ## Update silently at the next launch
 
@@ -212,6 +218,21 @@ For one check, from the webview:
 ```js
 await check({ headers: { "X-Channel": "beta" }, timeout: 20000 });
 ```
+
+These headers go to the manifest endpoint, and to the bundle download only
+when the manifest points to the same origin (scheme, host and port). The
+manifest is not signed, so whoever can change it could otherwise send the
+download, and an `Authorization` header with it, to a server of their choosing;
+the signature check only rejects the bundle after that request. A download host
+elsewhere that needs credentials gets them explicitly:
+
+```rust
+tauri_plugin_ffp_ota_updater::Builder::new()
+    .header("Authorization", format!("Bearer {manifest_token}"))?
+    .download_header("Authorization", format!("Bearer {cdn_token}"))?
+```
+
+`check({ downloadHeaders })` does the same for one check.
 
 ## Switch without reloading at a bad moment
 

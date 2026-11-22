@@ -2,8 +2,17 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 
 /** Options used when checking for a frontend update. */
 export interface CheckOptions {
-  /** Request headers, also sent when downloading the bundle. */
+  /**
+   * Headers for the manifest request. Also sent with the bundle download when
+   * the bundle is on the same origin as the manifest; the manifest is not
+   * signed, so they do not follow it to another host.
+   */
   headers?: HeadersInit
+  /**
+   * Headers for the bundle download only, wherever the manifest says the
+   * bundle is.
+   */
+  downloadHeaders?: HeadersInit
   /** Timeout in milliseconds, applied to each request. */
   timeout?: number
   /** Proxy URL for the manifest request and the bundle download. */
@@ -194,10 +203,20 @@ function channel(onEvent?: (progress: DownloadEvent) => void) {
  * the published release needs a full application update instead.
  */
 export async function check(options?: CheckOptions): Promise<Update | null> {
+  const entries = (init?: HeadersInit) =>
+    init ? Array.from(new Headers(init).entries()) : undefined
+  let headers: [string, string][] | undefined
+  let downloadHeaders: [string, string][] | undefined
+  try {
+    headers = entries(options?.headers)
+    downloadHeaders = entries(options?.downloadHeaders)
+  } catch (error) {
+    // `Headers` throws a `TypeError` for a name or value it cannot send
+    throw new OtaUpdateError('invalidHeader', String(error))
+  }
   const metadata = await call<UpdateMetadata | null>('check', {
-    headers: options?.headers
-      ? Array.from(new Headers(options.headers).entries())
-      : undefined,
+    headers,
+    downloadHeaders,
     timeout: options?.timeout,
     proxy: options?.proxy,
   })
@@ -227,7 +246,8 @@ export async function status(): Promise<Status> {
  * that {@link status} reports as `staged` can be applied offline.
  *
  * Rejects with kind `cannotServe` where no downloaded frontend can be shown:
- * under `tauri dev`, or when the app did not call `wrap_assets`.
+ * under `tauri dev`, when the app did not call `wrap_assets`, or when its
+ * `frontendDist` is a remote URL.
  */
 export async function install(version: string): Promise<void> {
   await call('install', { version })

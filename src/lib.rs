@@ -79,8 +79,9 @@ impl Builder {
         self
     }
 
-    /// Adds a header sent with every manifest request and bundle download. A header of the
-    /// same name given to a single check replaces it.
+    /// Adds a header sent with every manifest request, and with bundle downloads from the
+    /// manifest's origin (see [`RequestOptions::headers`]). A header of the same name given to
+    /// a single check replaces it.
     pub fn header<K, V>(mut self, key: K, value: V) -> Result<Self>
     where
         HeaderName: TryFrom<K>,
@@ -95,9 +96,32 @@ impl Builder {
         Ok(self)
     }
 
-    /// Replaces the headers sent with every manifest request and bundle download.
+    /// Replaces the headers set with [`Self::header`].
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         self.client.headers = headers;
+        self
+    }
+
+    /// Adds a header sent with every bundle download, wherever the manifest says the bundle is
+    /// (see [`RequestOptions::download_headers`]). A header of the same name given to a single
+    /// check replaces it.
+    pub fn download_header<K, V>(mut self, key: K, value: V) -> Result<Self>
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
+        let value: std::result::Result<HeaderValue, http::Error> =
+            value.try_into().map_err(Into::into);
+        self.client.download_headers.insert(key?, value?);
+        Ok(self)
+    }
+
+    /// Replaces the headers set with [`Self::download_header`].
+    pub fn download_headers(mut self, headers: HeaderMap) -> Self {
+        self.client.download_headers = headers;
         self
     }
 
@@ -199,6 +223,12 @@ impl Builder {
                     Some("`tauri_plugin_ffp_ota_updater::wrap_assets(&mut context)` was not called")
                 } else if tauri::is_dev() && app.config().build.dev_url.is_some() {
                     Some("the app is loading its frontend from `devUrl` (development mode)")
+                } else if matches!(
+                    app.config().build.frontend_dist,
+                    Some(tauri::utils::config::FrontendDist::Url(_))
+                ) {
+                    // the webview loads that site, never the assets the bundle replaces
+                    Some("the app is loading its frontend from a URL (`build.frontendDist`)")
                 } else {
                     None
                 };
@@ -223,6 +253,7 @@ impl Builder {
                     downloading: Default::default(),
                     cannot_serve,
                     documents: Default::default(),
+                    switching: Default::default(),
                 };
                 // Plugins are set up before any window is created, so the bundle chosen here is
                 // what the first page load gets. When none can be served, the store is left as

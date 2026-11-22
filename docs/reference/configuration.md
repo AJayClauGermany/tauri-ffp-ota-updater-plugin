@@ -94,8 +94,10 @@ Requests carry `Accept: application/json` (manifest) or
 | --- | --- |
 | `pubkey(impl Into<String>)` | Overrides `pubkey`. |
 | `endpoints(Vec<Url>)` | Overrides `endpoints`. |
-| `header(key, value) -> Result<Self>` | Adds a header sent with every manifest request and bundle download. |
+| `header(key, value) -> Result<Self>` | Adds a header sent with every manifest request, and with bundle downloads on the manifest's origin (scheme, host and port). |
 | `headers(HeaderMap)` | Replaces those headers. |
+| `download_header(key, value) -> Result<Self>` | Adds a header sent with every bundle download, whatever its origin. |
+| `download_headers(HeaderMap)` | Replaces those headers. |
 | `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). |
 | `proxy(Url)` | Use this proxy instead of the system's. |
 | `no_proxy()` | Ignore the system's proxy settings. |

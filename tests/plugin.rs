@@ -17,7 +17,7 @@ use tauri::{
     test::{MockRuntime, mock_builder, mock_context},
     utils::{
         assets::{AssetKey, AssetsIter, CspHash},
-        config::AppDirectoriesOverride,
+        config::{AppDirectoriesOverride, FrontendDist},
     },
 };
 use tauri_plugin_ffp_ota_updater::{
@@ -569,6 +569,13 @@ fn frontend_update_lifecycle() {
     development_mode_does_not_serve_bundles();
     build_metadata_is_ignored_unless_asked_for();
     bundles_get_the_csp_processing_of_built_in_frontends();
+    headers_follow_the_download_only_to_the_manifests_origin();
+    a_bundle_reinstalled_after_a_reset_goes_on_trial_again();
+    failed_deletions_are_reported();
+    archive_metadata_counts_towards_the_unpacked_size();
+    remote_frontends_do_not_serve_bundles();
+    concurrent_installs_never_go_backwards();
+    a_version_names_one_bundle();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -643,6 +650,8 @@ fn unreadable_bundles_are_kept() {
     assert_eq!(served_index(&app), "own 1.2.1");
     assert!(store.join("1.2.2.tar.gz").is_dir());
     assert!(store.join("1.2.2.tar.gz.sig").exists());
+    // `reset` would report that it cannot delete it, see `failed_deletions_are_reported`
+    std::fs::remove_dir(store.join("1.2.2.tar.gz")).unwrap();
     app.ota_updater().reset().unwrap();
 }
 
@@ -1168,4 +1177,269 @@ fn oversized_bundles_are_refused() {
         Err(Error::TooLarge("bundle", _))
     ));
     assert!(stored_files(&data_dir.path().join("ffp-ota-updater")).is_empty());
+}
+
+/// The manifest is not signed, so it must not be able to send the manifest's credentials to a
+/// host of its choosing.
+fn headers_follow_the_download_only_to_the_manifests_origin() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let bundle = archive("elsewhere");
+    let manifest_routes = Routes::default();
+    let manifest_requests = Arc::new(Mutex::new(Vec::new()));
+    let manifest_port = serve(manifest_routes.clone(), manifest_requests.clone());
+    let bundle_routes = Routes::default();
+    let bundle_requests = Arc::new(Mutex::new(Vec::new()));
+    // another port is another origin
+    let bundle_port = serve(bundle_routes.clone(), bundle_requests.clone());
+    bundle_routes
+        .lock()
+        .unwrap()
+        .insert("bundle.tar.gz", bundle.clone());
+    let manifest = serde_json::json!({
+        "version": "1.2.1",
+        "url": format!("http://127.0.0.1:{bundle_port}/bundle.tar.gz"),
+        "signature": sign(&key, &bundle, Some("1.2.1")),
+    });
+    manifest_routes
+        .lock()
+        .unwrap()
+        .insert("ota.json", manifest.to_string().into_bytes());
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let builder = Builder::new().header("x-channel", "secret").unwrap();
+    let app = launch_built(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        manifest_port,
+        serde_json::json!({}),
+        builder,
+    );
+    let updater = app.ota_updater();
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    assert!(manifest_requests.lock().unwrap()[0].ends_with("#secret"));
+    assert_eq!(*bundle_requests.lock().unwrap(), ["/bundle.tar.gz"]);
+    updater.reset().unwrap();
+
+    // download headers go wherever the bundle is, and replace the builder's of that name
+    let options = RequestOptions::new()
+        .download_header("x-channel", "for the cdn")
+        .unwrap();
+    let update = block_on(updater.check_with(options))
+        .unwrap()
+        .expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    assert_eq!(
+        bundle_requests.lock().unwrap().last().unwrap(),
+        "/bundle.tar.gz#for the cdn"
+    );
+    updater.reset().unwrap();
+}
+
+/// A reset ends the trial of the bundle being shown; the same version installed again in the
+/// same run starts a new one, which `notifyReady` can end.
+fn a_bundle_reinstalled_after_a_reset_goes_on_trial_again() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.reset().unwrap();
+    assert_eq!(served_index(&app), "built-in");
+
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    assert!(!updater.status().confirmed);
+    updater.notify_ready().unwrap();
+    assert!(updater.status().confirmed);
+    updater.reset().unwrap();
+}
+
+/// `discard` and `reset` must not report a bundle as gone that would be served again.
+fn failed_deletions_are_reported() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    // a directory cannot be deleted as a file, much like a file another program holds open
+    std::fs::create_dir(store.join("1.2.2.tar.gz")).unwrap();
+    std::fs::write(store.join("1.2.2.tar.gz").join("x"), "x").unwrap();
+
+    assert!(matches!(updater.discard(&v("1.2.2")), Err(Error::Io(_))));
+    // the rest is reset, and this run goes back to the built-in frontend all the same
+    assert!(matches!(updater.reset(), Err(Error::Io(_))));
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.2.1.tar.gz").exists());
+    std::fs::remove_dir_all(store.join("1.2.2.tar.gz")).unwrap();
+    updater.reset().unwrap();
+}
+
+/// PAX headers and GNU long names are read into memory before the entry they describe, so they
+/// count towards what an archive may decompress to.
+fn archive_metadata_counts_towards_the_unpacked_size() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    let mut pax = tar::Header::new_ustar();
+    pax.set_entry_type(tar::EntryType::XHeader);
+    // more than the 20,000 entries a bundle may have could need for their headers
+    let metadata = vec![b'0'; 48 << 20];
+    pax.set_size(metadata.len() as u64);
+    pax.set_cksum();
+    tar.append(&pax, metadata.as_slice()).unwrap();
+    let mut index = tar::Header::new_ustar();
+    index.set_size(5);
+    index.set_cksum();
+    tar.append_data(&mut index, "index.html", b"index".as_slice())
+        .unwrap();
+    let archive = tar.into_inner().unwrap().finish().unwrap();
+    let signature = sign(&key, &archive, Some("1.2.1"));
+
+    let app = launch_with(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        1,
+        serde_json::json!({ "maxUnpackedSize": 1 << 20 }),
+    );
+    assert!(matches!(
+        app.ota_updater().stage(&archive, &signature, &v("1.2.1")),
+        Err(Error::TooLarge("unpacked bundle", _))
+    ));
+}
+
+/// With a URL as `frontendDist` the webview loads that site, never the bundle.
+fn remote_frontends_do_not_serve_bundles() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    drop(app);
+
+    let app = try_launch(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        1,
+        serde_json::json!({}),
+        Builder::new(),
+        |context| {
+            context.config_mut().build.frontend_dist = Some(FrontendDist::Url(
+                "https://app.example.com".parse().unwrap(),
+            ))
+        },
+    )
+    .unwrap();
+    let updater = app.ota_updater();
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    assert!(matches!(
+        updater.install(&v("1.2.1")),
+        Err(Error::CannotServe(_))
+    ));
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    assert_eq!(updater.status().staged, Some(v("1.2.1")));
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    app.ota_updater().reset().unwrap();
+}
+
+/// Whatever order two installs finish in, the newer frontend is the one served.
+fn concurrent_installs_never_go_backwards() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = try_launch(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        1,
+        serde_json::json!({}),
+        Builder::new(),
+        |context| {
+            context.config_mut().app.security.csp = Some(tauri::utils::config::Csp::Policy(
+                "default-src 'self'".into(),
+            ))
+        },
+    )
+    .unwrap();
+    let updater = app.ota_updater();
+    let stage = |version: &str, entries: &[(String, String)]| {
+        let entries: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let archive = archive_of(&entries);
+        updater
+            .stage(&archive, &sign(&key, &archive, Some(version)), &v(version))
+            .unwrap();
+    };
+    // With a CSP, every page is parsed before a bundle is served: many pages make that step
+    // slow for the older bundle, so the install of the newer one starts and ends meanwhile.
+    let page = format!(
+        "<html><body>{}</body></html>",
+        "<div><script>window.x = 1</script></div>".repeat(200)
+    );
+    let mut older: Vec<(String, String)> = (0..100)
+        .map(|i| (format!("./page{i}.html"), page.clone()))
+        .collect();
+    older.push(("./index.html".into(), "own 1.2.1".into()));
+    stage("1.2.1", &older);
+    stage("1.2.2", &[("./index.html".into(), "own 1.2.2".into())]);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let result = updater.activate(&v("1.2.1"));
+            // should the newer one go first after all, the older one is refused
+            assert!(
+                matches!(result, Ok(()) | Err(Error::NotNewer(_))),
+                "{result:?}"
+            );
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        scope.spawn(|| updater.activate(&v("1.2.2")).unwrap());
+    });
+    assert_eq!(updater.current_version(), v("1.2.2"));
+    assert!(served_index(&app).contains("own 1.2.2"));
+    updater.reset().unwrap();
+}
+
+/// What is on record for a version is about the bundle that was shown under it.
+fn a_version_names_one_bundle() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+
+    // never shown: can still be replaced
+    stage(&app, "1.2.1", "first 1.2.1").unwrap();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    // on trial, then confirmed: the same contents again are fine, others are not
+    for confirm in [false, true] {
+        if confirm {
+            updater.notify_ready().unwrap();
+        }
+        stage(&app, "1.2.1", "own 1.2.1").unwrap();
+        assert!(matches!(
+            stage(&app, "1.2.1", "other 1.2.1"),
+            Err(Error::InUse(_))
+        ));
+    }
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.1");
+    app.ota_updater().reset().unwrap();
 }
