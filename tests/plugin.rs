@@ -598,6 +598,10 @@ fn frontend_update_lifecycle() {
     remote_frontends_do_not_serve_bundles();
     concurrent_installs_never_go_backwards();
     a_version_names_one_bundle();
+    an_unreadable_state_leaves_the_store_alone();
+    rollbacks_that_are_not_recorded_are_reported();
+    a_lost_fallback_is_forgotten();
+    bundles_are_read_to_their_end();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -1148,6 +1152,30 @@ fn unconfirmed_bundles_time_out() {
     assert!(block_on(updater.check()).unwrap().is_none());
     drop(app);
 
+    // A deadline belongs to one trial: after a reset, a later trial of the same version gets
+    // its own, and is not ended by what is left of the first.
+    let (app, _) = published(
+        &[("./index.html", "again")],
+        "1.2.1",
+        serde_json::json!({ "readyTimeout": 2000 }),
+    );
+    let updater = app.ota_updater();
+    let install = || {
+        let update = block_on(updater.check()).unwrap().expect("no update");
+        block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+        assert_eq!(served_index(&app), "again");
+    };
+    install();
+    wait();
+    updater.reset().unwrap();
+    install();
+    // the first deadline has passed, the second has not
+    wait();
+    assert_eq!(served_index(&app), "again");
+    wait();
+    assert_eq!(served_index(&app), "built-in");
+    drop(app);
+
     // the same goes for a bundle picked up at launch
     let (app, relaunch) = published(&[("./index.html", "broken")], "1.2.2", overrides);
     let update = block_on(app.ota_updater().check())
@@ -1501,24 +1529,217 @@ fn a_version_names_one_bundle() {
     let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
     let updater = app.ota_updater();
 
-    // never shown: can still be replaced
-    stage(&app, "1.2.1", "first 1.2.1").unwrap();
-    stage(&app, "1.2.1", "own 1.2.1").unwrap();
-    updater.install(&v("1.2.1")).unwrap();
-    assert_eq!(served_index(&app), "own 1.2.1");
-    // on trial, then confirmed: the same contents again are fine, others are not
-    for confirm in [false, true] {
-        if confirm {
-            updater.notify_ready().unwrap();
-        }
-        stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let other = |app: &App<MockRuntime>| {
+        // the same contents again are fine, others are not
+        stage(app, "1.2.1", "own 1.2.1").unwrap();
         assert!(matches!(
-            stage(&app, "1.2.1", "other 1.2.1"),
+            stage(app, "1.2.1", "other 1.2.1"),
             Err(Error::InUse(_))
         ));
-    }
+    };
+
+    // To replace a bundle that was never shown, it has to be discarded first: left in place
+    // it could be in memory already, and be confirmed in the place of its replacement.
+    stage(&app, "1.2.1", "first 1.2.1").unwrap();
+    assert!(matches!(
+        stage(&app, "1.2.1", "own 1.2.1"),
+        Err(Error::InUse(_))
+    ));
+    updater.discard(&v("1.2.1")).unwrap();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    other(&app);
+    // activated, but no page was loaded from it yet
+    updater.activate(&v("1.2.1")).unwrap();
+    other(&app);
+    // on trial, then confirmed
+    assert_eq!(served_index(&app), "own 1.2.1");
+    other(&app);
+    updater.notify_ready().unwrap();
+    other(&app);
     drop(app);
     let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
     assert_eq!(served_index(&app), "own 1.2.1");
+    assert!(app.ota_updater().status().confirmed);
+
+    // two versions that would be one file where the file system ignores case
+    stage(&app, "1.2.2-RC", "own 1.2.2-RC").unwrap();
+    assert!(matches!(
+        stage(&app, "1.2.2-rc", "own 1.2.2-rc"),
+        Err(Error::InUse(_))
+    ));
+    // an archive that is no bundle does not hold on to its version
+    std::fs::write(store.join("1.2.3.tar.gz"), "damaged").unwrap();
+    stage(&app, "1.2.3", "own 1.2.3").unwrap();
+    app.ota_updater().install(&v("1.2.3")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.3");
+    app.ota_updater().reset().unwrap();
+}
+
+/// A state that cannot be read is not an empty one: nothing is served, deleted or offered on
+/// the strength of a guess, and all is as it was once it can be read again.
+fn an_unreadable_state_leaves_the_store_alone() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.notify_ready().unwrap();
+    // a newer one that fails its only attempt, and one staged after it
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    updater.install(&v("1.2.2")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.2");
+    updater.rollback().unwrap();
+    stage(&app, "1.2.3", "own 1.2.3").unwrap();
+    drop(app);
+    let files = stored_files(&store);
+    assert_eq!(
+        files,
+        [
+            "1.2.1.tar.gz",
+            "1.2.1.tar.gz.sig",
+            "1.2.3.tar.gz",
+            "1.2.3.tar.gz.sig",
+            "state.json"
+        ]
+    );
+
+    // reading a directory fails like a file another program has locked does
+    std::fs::rename(store.join("state.json"), store.join("state.kept")).unwrap();
+    std::fs::create_dir(store.join("state.json")).unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "built-in");
+    // with an empty state 1.2.3 would have been served and the fallback 1.2.1 deleted
+    assert!(store.join("1.2.1.tar.gz").exists() && store.join("1.2.3.tar.gz").exists());
+    // and the rejected 1.2.2 accepted again
+    assert!(matches!(
+        stage(&app, "1.2.2", "own 1.2.2"),
+        Err(Error::Io(_))
+    ));
+    assert!(matches!(updater.install(&v("1.2.3")), Err(Error::Io(_))));
+    assert_eq!(served_index(&app), "built-in");
+    drop(app);
+
+    std::fs::remove_dir(store.join("state.json")).unwrap();
+    std::fs::rename(store.join("state.kept"), store.join("state.json")).unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.3");
+    assert_eq!(app.ota_updater().status().rejected, [v("1.2.2")]);
+    assert!(store.join("1.2.1.tar.gz").exists());
+    drop(app);
+
+    // A state that is read but makes no sense is lost for good. The bundles are still verified
+    // and the newest goes on trial; the file is written anew.
+    std::fs::write(store.join("state.json"), "{ not json").unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.3");
+    assert!(!app.ota_updater().status().confirmed);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["trial"], "1.2.3");
+    app.ota_updater().reset().unwrap();
+}
+
+/// A rejection that could not be recorded is reported, and nothing is deleted for it.
+fn rollbacks_that_are_not_recorded_are_reported() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+
+    // the state is written to this file first
+    std::fs::create_dir(store.join("state.json.part")).unwrap();
+    assert!(matches!(updater.rollback(), Err(Error::Io(_))));
+    // this run has gone back all the same
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    assert!(store.join("1.2.1.tar.gz").exists());
+    assert!(updater.status().rejected.is_empty());
+
+    // the record is the old one, and what the next launch goes by
+    std::fs::remove_dir(store.join("state.json.part")).unwrap();
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.rollback().unwrap();
+    assert_eq!(updater.status().rejected, [v("1.2.1")]);
+    assert!(!store.join("1.2.1.tar.gz").exists());
+
+    // A bundle whose trial cannot be put on record is not served, to any of the pages that are
+    // requested at once.
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    updater.activate(&v("1.2.2")).unwrap();
+    std::fs::create_dir(store.join("state.json.part")).unwrap();
+    let handle = app.handle();
+    std::thread::scope(|scope| {
+        let pages: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| handle.asset_resolver().get("index.html".into())))
+            .collect();
+        for page in pages {
+            assert_eq!(page.join().unwrap().unwrap().bytes(), b"built-in");
+        }
+    });
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    std::fs::remove_dir(store.join("state.json.part")).unwrap();
+    updater.reset().unwrap();
+}
+
+/// A confirmed bundle whose archive is gone is no fallback, and does not keep its version from
+/// being stored again.
+fn a_lost_fallback_is_forgotten() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    app.ota_updater().install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    app.ota_updater().notify_ready().unwrap();
+    drop(app);
+
+    std::fs::write(store.join("1.2.1.tar.gz"), "damaged").unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.2.1.tar.gz").exists());
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    app.ota_updater().install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    // on trial like any bundle that was not confirmed
+    assert!(!app.ota_updater().status().confirmed);
+    app.ota_updater().reset().unwrap();
+}
+
+/// A bundle is a whole gzip stream: one that is cut short or damaged after the last file is
+/// refused, although every file could be unpacked.
+fn bundles_are_read_to_their_end() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let stage = |archive: &[u8]| {
+        app.ota_updater()
+            .stage(archive, &sign(&key, archive, Some("1.2.1")), &v("1.2.1"))
+    };
+
+    let whole = archive("own 1.2.1");
+    // the checksum the stream ends with
+    let mut damaged = whole.clone();
+    let checksum = damaged.len() - 8;
+    damaged[checksum] ^= 0xff;
+    assert!(matches!(stage(&damaged), Err(Error::InvalidBundle(_))));
+    assert!(matches!(
+        stage(&whole[..whole.len() - 4]),
+        Err(Error::InvalidBundle(_))
+    ));
+    stage(&whole).unwrap();
     app.ota_updater().reset().unwrap();
 }

@@ -188,8 +188,12 @@ pub struct OtaUpdater<R: Runtime> {
 
 /// Whether a page whose recorded origin is `shown` (see [`OtaUpdater::documents`]; `None` when
 /// nothing was recorded) may confirm the bundle `serving`.
+///
+/// A webview no page load was seen for cannot: nothing says its page is the new frontend. Tauri
+/// reports every navigation of every webview to the plugin, so this only leaves out pages
+/// that were loaded before the plugin was there to pick a bundle.
 pub(crate) fn may_confirm(shown: Option<&Option<Version>>, serving: &Version) -> bool {
-    shown.is_none_or(|shown| shown.as_ref() == Some(serving))
+    shown.is_some_and(|shown| shown.as_ref() == Some(serving))
 }
 
 /// Whether `url` is a page of the app's own frontend: `tauri://localhost` or, on Windows,
@@ -329,7 +333,7 @@ impl<R: Runtime> OtaUpdater<R> {
 
         if !self.store.order.newer(&release.version, &current_version)
             || !self.store.compatible(&release.version)
-            || self.store.is_rejected(&release.version)
+            || self.store.is_rejected(&release.version)?
         {
             return Ok(None);
         }
@@ -360,9 +364,10 @@ impl<R: Runtime> OtaUpdater<R> {
     /// The bundle is then staged like a downloaded one: served from the next launch on, or at
     /// once with [`Self::install`].
     ///
-    /// A version names one bundle: staging different contents under the version that is
-    /// confirmed or on trial fails with [`Error::InUse`]. Staging the same contents again
-    /// does nothing.
+    /// A version names one bundle: staging different contents under a version that is already
+    /// stored fails with [`Error::InUse`], as does a version that differs from a stored one
+    /// only in letter case. Staging the same contents again does nothing. To replace a bundle
+    /// that was never shown, [`Self::discard`] it first.
     pub fn stage(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
         self.ensure_pubkey()?;
         self.ensure_not_older(version)?;
@@ -413,6 +418,10 @@ impl<R: Runtime> OtaUpdater<R> {
     }
 
     /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    ///
+    /// An [`Error::Tauri`] is a webview that could not be reloaded: the switch has happened
+    /// ([`Self::current_version`] is `version`), and that webview shows the previous frontend
+    /// until it is reloaded or recreated. Any other error means nothing was switched.
     pub fn install(&self, version: &Version) -> Result<()> {
         self.activate(version)?;
         self.reload()
@@ -422,7 +431,12 @@ impl<R: Runtime> OtaUpdater<R> {
     /// update the user declined or the app decided to skip. The version is not rejected and
     /// can be downloaded again. Fails with [`Error::InUse`] for the bundle being served and
     /// for the confirmed one kept as the fallback; does nothing if the version is not stored.
+    ///
+    /// A download of that version that is still running is not cancelled, and stores the
+    /// bundle again when it completes: wait for it first. The same goes for [`Self::reset`].
     pub fn discard(&self, version: &Version) -> Result<()> {
+        // what is being served must not change between looking and deleting
+        let _switching = self.switching();
         let serving = assets::active().map(|bundle| bundle.version.clone());
         self.store.discard(version, serving.as_ref())
     }
@@ -464,6 +478,14 @@ impl<R: Runtime> OtaUpdater<R> {
     }
 
     /// Records which frontend a page that starts loading in the webview `label` comes from.
+    ///
+    /// This is the frontend being served when the navigation is reported, which is the one the
+    /// page is loaded from unless a switch falls between that report and the request for the
+    /// page. Tauri does not say which webview an asset is requested by, so the two cannot be
+    /// tied together more closely. The switch would have to be an [`OtaUpdater::activate`]
+    /// landing in the middle of a navigation, and for the wrong page to confirm anything, the
+    /// trial has to have begun in another window as well. `install` reloads every webview
+    /// right after switching, which records them all anew.
     pub(crate) fn record_document(&self, label: &str, url: &Url) {
         let version = is_app_url(url)
             .then(assets::active)
@@ -479,17 +501,23 @@ impl<R: Runtime> OtaUpdater<R> {
     /// frontend: its version is rejected, the app switches to the last confirmed bundle or the
     /// built-in frontend and the webviews are reloaded. A newer bundle that is stored but was
     /// never shown is kept, and is tried at the next launch.
+    ///
+    /// Fails if the rejection could not be recorded, in which case the version would be served
+    /// or offered again after a restart, or if a webview could not be reloaded. This run of the
+    /// app has gone back all the same.
     pub fn rollback(&self) -> Result<()> {
-        let rolled_back = {
+        let recorded = {
             let _switching = self.switching();
-            assets::active()
-                .map(|bundle| self.serve(self.store.select(Some(&bundle.version))))
-                .is_some()
+            assets::active().map(|bundle| {
+                let (fallback, recorded) = self.store.select(Some(&bundle.version));
+                self.serve(fallback);
+                recorded
+            })
         };
-        if rolled_back {
-            self.reload()?;
+        match recorded {
+            Some(recorded) => recorded.and(self.reload()),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Makes `bundle` (or the built-in frontend) what is served from now on. Called with
@@ -499,6 +527,13 @@ impl<R: Runtime> OtaUpdater<R> {
     /// here: an app that is closed before it showed the bundle has learned nothing about it.
     /// With `readyTimeout` set, the bundle is rolled back if it is still unconfirmed that long
     /// after that page load.
+    ///
+    /// What happens before that page load is therefore not covered by the trial: verifying and
+    /// unpacking the bundle, and preparing it for the CSP below. A bundle that is validly
+    /// signed and within `maxBundleSize` and `maxUnpackedSize`, yet takes the process down
+    /// there, would do so at every launch. Those limits are the guard against that. Counting
+    /// an interrupted preparation as an attempt is possible later without changing the store's
+    /// format (`state.json` ignores fields it does not know).
     pub(crate) fn serve(&self, bundle: Option<Bundle>) {
         let bundle = bundle
             .filter(|_| self.cannot_serve.is_none())
@@ -517,20 +552,23 @@ impl<R: Runtime> OtaUpdater<R> {
                 let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
                     return;
                 };
-                {
+                let trial = {
                     let _switching = updater.switching();
                     if assets::active().is_none_or(|active| active.version != version) {
                         // switched away from in the meantime
                         return;
                     }
-                    if let Err(error) = updater.store.begin_trial(&version) {
-                        // a trial that is not on record could not be rolled back
-                        log::warn!("not serving frontend bundle {version}: {error}");
-                        updater.serve(updater.store.fallback());
-                        return;
+                    match updater.store.begin_trial(&version) {
+                        Ok(trial) => trial,
+                        Err(error) => {
+                            // a trial that is not on record could not be rolled back
+                            log::warn!("not serving frontend bundle {version}: {error}");
+                            updater.serve(updater.store.fallback());
+                            return;
+                        }
                     }
-                }
-                let Some(timeout) = timeout else {
+                };
+                let (Some(trial), Some(timeout)) = (trial, timeout) else {
                     return;
                 };
                 std::thread::spawn(move || {
@@ -544,9 +582,17 @@ impl<R: Runtime> OtaUpdater<R> {
                         // means it was switched away from
                         assets::active()
                             .is_some_and(|active| active.version == version)
-                            .then(|| updater.store.fail_trial(&version))
+                            // not a later trial of the same version, after a reset
+                            .then(|| updater.store.fail_trial(&version, trial))
                             .flatten()
-                            .map(|fallback| updater.serve(fallback))
+                            .map(|(fallback, recorded)| {
+                                updater.serve(fallback);
+                                if let Err(error) = recorded {
+                                    log::error!(
+                                        "frontend bundle {version} may be served again after a restart: {error}"
+                                    );
+                                }
+                            })
                             .is_some()
                     };
                     if rolled_back {
@@ -584,12 +630,20 @@ impl<R: Runtime> OtaUpdater<R> {
         cleared
     }
 
-    /// Reloads every webview, which makes them load the frontend that is active now.
+    /// Reloads every webview window, which makes them load the frontend that is active now.
+    /// Each of them is tried; the first error is returned.
+    ///
+    /// Webviews that share a window (Tauri's `unstable` multi-webview windows) are not listed
+    /// by Tauri without that feature, and are not reloaded: an app that has them reloads them
+    /// itself with `Webview::reload` after [`Self::activate`] or [`Self::install`].
     pub fn reload(&self) -> Result<()> {
+        let mut result = Ok(());
         for window in self.app.webview_windows().values() {
-            window.reload()?;
+            if let Err(error) = window.reload() {
+                result = result.and(Err(error.into()));
+            }
         }
-        Ok(())
+        result
     }
 
     /// The HTTP client for one check or download. It follows no redirects: [`get`] does, to
@@ -886,9 +940,9 @@ mod tests {
     #[test]
     fn only_pages_of_the_bundle_on_trial_confirm_it() {
         let v = |s: &str| Version::parse(s).unwrap();
-        // nothing recorded (no page load seen for that webview): trusted
-        assert!(may_confirm(None, &v("1.2.1")));
         assert!(may_confirm(Some(&Some(v("1.2.1"))), &v("1.2.1")));
+        // nothing recorded (no page load seen for that webview): nothing to go by
+        assert!(!may_confirm(None, &v("1.2.1")));
         // a page still showing the previous bundle or the built-in frontend
         assert!(!may_confirm(Some(&Some(v("1.2.0"))), &v("1.2.1")));
         assert!(!may_confirm(Some(&None), &v("1.2.1")));

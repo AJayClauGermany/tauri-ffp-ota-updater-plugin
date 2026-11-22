@@ -18,6 +18,11 @@
 //!
 //! Everything that reads and then writes the store holds [`Store::guard`], which also locks the
 //! directory against other processes of the same app.
+//!
+//! Two rules keep the record and the files in step. A version names one bundle: once stored, its
+//! archive is not replaced by another ([`Store::save`]). And the record comes first: nothing is
+//! decided on a state that could not be read, and a bundle is only deleted for having been
+//! rejected once that rejection is on disk ([`Store::select`]).
 
 use std::{
     cmp::Ordering,
@@ -136,10 +141,19 @@ impl Bundle {
             exceeded: false,
         };
         let files = unpack(&mut stream, limits.unpacked);
+        // `tar` stops at the end of the archive. What follows it (padding, as a rule) is not
+        // used, but is read all the same, under the same cap: a bundle is a whole, sound gzip
+        // stream, not the start of one.
+        let rest = files
+            .is_ok()
+            .then(|| std::io::copy(&mut stream, &mut std::io::sink()));
         if stream.exceeded {
             return Err(Error::TooLarge("unpacked bundle", limits.unpacked));
         }
         let files = files?;
+        if let Some(Err(error)) = rest {
+            return Err(invalid(error));
+        }
 
         if !files.contains_key("/index.html") {
             return Err(Error::InvalidBundle(
@@ -329,14 +343,24 @@ pub(crate) struct Store {
     pub rollback: bool,
     /// Failed attempts after which a bundle on trial is rejected.
     pub trial_attempts: u32,
-    /// The bundle whose trial this run of the app already counts as an attempt of.
-    pub shown: Mutex<Option<Version>>,
+    /// The trial this run of the app already counts as an attempt of.
+    pub shown: Mutex<Shown>,
     pub binary: Version,
     pub compatibility: Compatibility,
     pub order: Order,
     /// Serializes everything that reads and then writes the store, within this process; see
     /// [`Store::guard`].
     pub lock: Mutex<()>,
+}
+
+/// See [`Store::shown`].
+#[derive(Default)]
+pub(crate) struct Shown {
+    /// The bundle on trial, or `None` once a reset ended that trial.
+    version: Option<Version>,
+    /// Counts the trials this process began. A deadline set for one of them
+    /// ([`Store::fail_trial`]) must not end a later one of the same version.
+    trial: u64,
 }
 
 /// Exclusive access to the store, see [`Store::guard`].
@@ -347,20 +371,34 @@ pub(crate) struct Guard<'a> {
 }
 
 /// Writes `contents` so that `path` either keeps its old content or has all of the new one,
-/// also across a crash or power loss.
+/// also across a crash or power loss, and has the new one once this returns.
 fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(PARTIAL_EXT);
     let mut file = fs::File::create(&tmp)?;
     file.write_all(contents)?;
     file.sync_all()?;
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    // The new name is an entry of the directory, which has to reach the disk as well. Windows
+    // has no such call for a directory.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 impl Store {
     /// Locks the store against other threads and against other processes of the same app, which
     /// share the directory. If the directory cannot be locked (a file system without locks, say)
-    /// the store is used without, as if a single instance were running.
+    /// the store is used without, as if a single instance were running: refusing to work there
+    /// would turn updates off for good on such a system.
+    ///
+    /// The lock covers one operation, not a trial. Several instances of the app each count
+    /// their own run as an attempt, so more of them than `trialAttempts`, started while a trial
+    /// is open, reject a bundle that may be fine. That errs on the safe side (the device goes
+    /// back to the frontend it had) and is documented as a limitation; an owner for a trial
+    /// across processes can be added without changing the store's format.
     pub fn guard(&self) -> Guard<'_> {
         let process = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let file = fs::create_dir_all(&self.dir)
@@ -394,8 +432,8 @@ impl Store {
         self.order.newer(version, &self.binary) && (self.compatibility)(&self.binary, version)
     }
 
-    pub fn is_rejected(&self, version: &Version) -> bool {
-        self.rejected_in(&self.read_state(), version)
+    pub fn is_rejected(&self, version: &Version) -> Result<bool> {
+        Ok(self.rejected_in(&self.read_state()?, version))
     }
 
     /// Whether `state` rejects `version`, or a version that counts as the same.
@@ -408,7 +446,9 @@ impl Store {
 
     /// Versions that failed a trial or were rolled back, oldest first.
     pub fn rejected(&self) -> Vec<Version> {
-        self.read_state().rejected.into_iter().collect()
+        self.read_state()
+            .map(|state| state.rejected.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// The newest stored bundle that is newer than `current` and may be served, i.e. the one
@@ -417,7 +457,7 @@ impl Store {
     /// Takes no lock: it only reads, and `status` should not wait for a download that is being
     /// verified.
     pub fn staged(&self, current: &Version) -> Option<Version> {
-        let state = self.read_state();
+        let state = self.read_state().ok()?;
         self.versions().into_iter().find(|version| {
             self.order.newer(version, current)
                 && self.compatible(version)
@@ -425,25 +465,32 @@ impl Store {
         })
     }
 
-    /// Whether serving `version` is a trial, i.e. it still has to be confirmed.
+    /// Whether serving `version` is a trial, i.e. it still has to be confirmed. It is unless
+    /// the record says otherwise.
     pub fn unproven(&self, version: &Version) -> bool {
-        self.rollback && self.read_state().confirmed.as_ref() != Some(version)
+        self.rollback
+            && !self
+                .read_state()
+                .is_ok_and(|state| state.confirmed.as_ref() == Some(version))
     }
 
     /// Records that a page is about to be loaded from the unconfirmed bundle `version`, which
     /// puts it on trial and counts as one attempt per run of the app.
     ///
-    /// On an error the trial is not on record and the bundle must not be served: it could not
-    /// be rolled back.
-    pub fn begin_trial(&self, version: &Version) -> Result<()> {
+    /// Returns the number of the trial, for [`Self::fail_trial`], or `None` for a bundle that
+    /// was confirmed in the meantime. On an error the trial is not on record and the bundle
+    /// must not be served: it could not be rolled back.
+    pub fn begin_trial(&self, version: &Version) -> Result<Option<u64>> {
         let _guard = self.guard();
         let mut shown = self.shown.lock().unwrap();
-        let mut state = self.read_state();
+        let mut state = self.read_state()?;
+        if state.confirmed.as_ref() == Some(version) {
+            return Ok(None);
+        }
         // `shown` alone is not enough: a reset or discard in the meantime ended that trial, and
         // a bundle of the same version installed since starts a new one
-        let counted = shown.as_ref() == Some(version) && state.trial.as_ref() == Some(version);
-        if counted || state.confirmed.as_ref() == Some(version) {
-            return Ok(());
+        if shown.version.as_ref() == Some(version) && state.trial.as_ref() == Some(version) {
+            return Ok(Some(shown.trial));
         }
         if state.trial.as_ref() == Some(version) {
             state.attempts += 1;
@@ -452,14 +499,16 @@ impl Store {
             state.attempts = 1;
         }
         self.write_state(&state)?;
-        *shown = Some(version.clone());
-        Ok(())
+        shown.version = Some(version.clone());
+        shown.trial += 1;
+        Ok(Some(shown.trial))
     }
 
     /// The last confirmed bundle, to serve when a trial cannot go ahead.
     pub fn fallback(&self) -> Option<Bundle> {
         let _guard = self.guard();
         self.read_state()
+            .ok()?
             .confirmed
             .and_then(|version| self.load(&version).ok())
     }
@@ -474,14 +523,38 @@ impl Store {
             && (!verify || self.load(version).is_ok())
     }
 
-    fn read_state(&self) -> State {
+    /// What `state.json` records. Three cases are told apart:
+    ///
+    /// - There is no file: the store is new, and the record empty.
+    /// - The file cannot be read (permissions, an I/O error). What it says is unknown, and may
+    ///   be readable again later, so this is an error: acting on an empty record instead would
+    ///   delete the confirmed fallback as superseded and offer rejected versions again.
+    /// - The file is read but makes no sense: `None`. What it said is lost for good, and waiting
+    ///   will not bring it back.
+    fn load_state(&self) -> Result<Option<State>> {
         match fs::read(self.dir.join(STATE_FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                log::warn!("ignoring unreadable OTA state: {error}");
-                State::default()
-            }),
-            Err(_) => State::default(),
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)
+                .inspect_err(|error| log::warn!("the OTA state is damaged, ignoring it: {error}"))
+                .ok()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Some(State::default()))
+            }
+            Err(error) => Err(error.into()),
         }
+    }
+
+    /// [`Self::load_state`], with a damaged file counting as an empty record. That is safe to
+    /// go on with: every stored bundle is still verified against its signature when loaded, and
+    /// one that is served without being on record as confirmed goes on trial. The next launch
+    /// writes the file anew ([`Self::select`]).
+    fn read_state(&self) -> Result<State> {
+        Ok(self.load_state()?.unwrap_or_default())
+    }
+
+    /// Whether the archive of `version` is known not to exist, as opposed to unreadable.
+    fn is_gone(&self, version: &Version) -> bool {
+        fs::metadata(self.archive_path(version))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     }
 
     fn write_state(&self, state: &State) -> Result<()> {
@@ -506,22 +579,54 @@ impl Store {
 
     /// Verifies a downloaded archive and, only if it is valid, persists it.
     ///
-    /// A version names one bundle. Different contents under the version that is confirmed or on
-    /// trial are refused with [`Error::InUse`]: they would inherit what is on record for the
-    /// bundle that was actually shown. A stored bundle no page was loaded from yet can be
-    /// replaced.
+    /// A version names one bundle, from the moment it is stored. Other contents under a version
+    /// that is stored are refused with [`Error::InUse`], whether or not a page was loaded from
+    /// it yet: the stored bundle may already be in memory, about to be shown and confirmed, and
+    /// what replaced it on disk would inherit that confirmation at the next launch without
+    /// having run. The exception is a stored archive that is unusable for good (it fails
+    /// verification), which is not a bundle and is replaced, unless it is on record as
+    /// confirmed or on trial; [`Self::select`] clears that record at the next launch.
     pub fn save(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
         let _guard = self.guard();
-        let state = self.read_state();
+        let state = self.read_state()?;
         if self.rejected_in(&state, version) {
             return Err(Error::Rejected(version.to_string()));
         }
         self.verify(archive, signature, version)?;
-        if [&state.confirmed, &state.trial].contains(&&Some(version.clone())) {
-            return match fs::read(self.archive_path(version)) {
-                Ok(stored) if stored == archive => Ok(()),
-                _ => Err(Error::InUse(version.to_string())),
-            };
+        // `1.2.1-RC` and `1.2.1-rc` are two versions but one file where the file system ignores
+        // case, as on Windows and macOS. Refused everywhere, so that a release behaves the same
+        // on every platform.
+        let name = version.to_string();
+        if self
+            .versions()
+            .iter()
+            .any(|stored| stored != version && stored.to_string().eq_ignore_ascii_case(&name))
+        {
+            return Err(Error::InUse(name));
+        }
+        let recorded = [&state.confirmed, &state.trial].contains(&&Some(version.clone()));
+        match fs::read(self.archive_path(version)) {
+            Ok(stored) if stored == archive => {
+                // the same bundle; its signature file may be missing, or be another valid one
+                let signed = fs::read_to_string(self.signature_path(version))
+                    .is_ok_and(|stored| stored.trim() == signature.trim());
+                if !signed {
+                    write_atomic(&self.signature_path(version), signature.as_bytes())?;
+                }
+                return Ok(());
+            }
+            Ok(_) => {
+                let unusable = self.load(version).is_err_and(|error| error.is_permanent());
+                if recorded || !unusable {
+                    return Err(Error::InUse(name));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if recorded {
+                    return Err(Error::InUse(name));
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
         fs::create_dir_all(&self.dir)?;
         // Each file appears complete or not at all, and the archive, which `versions` goes by,
@@ -611,17 +716,24 @@ impl Store {
     /// state is reset all the same.
     pub fn clear(&self) -> Result<()> {
         let _guard = self.guard();
-        *self.shown.lock().unwrap() = None;
-        let mut result = Ok(());
+        self.shown.lock().unwrap().version = None;
+        // a store that cannot be listed is not an empty one
+        let mut result = match fs::read_dir(&self.dir) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
         for version in self.versions() {
             if let Err(error) = self.remove(&version) {
                 result = result.and(Err(error));
             }
         }
-        let state = self.read_state();
-        if state.confirmed.is_some() || state.trial.is_some() {
+        let state = self.load_state()?;
+        if state
+            .as_ref()
+            .is_none_or(|state| state.confirmed.is_some() || state.trial.is_some())
+        {
             self.write_state(&State {
-                rejected: state.rejected,
+                rejected: state.map(|state| state.rejected).unwrap_or_default(),
                 ..State::default()
             })?;
         }
@@ -632,7 +744,7 @@ impl Store {
     /// A version that is not stored is not an error.
     pub fn discard(&self, version: &Version, serving: Option<&Version>) -> Result<()> {
         let _guard = self.guard();
-        let mut state = self.read_state();
+        let mut state = self.read_state()?;
         if serving == Some(version) || state.confirmed.as_ref() == Some(version) {
             return Err(Error::InUse(version.to_string()));
         }
@@ -649,7 +761,7 @@ impl Store {
     /// starts with the first page loaded from it.
     pub fn activate(&self, version: &Version) -> Result<Bundle> {
         let _guard = self.guard();
-        let mut state = self.read_state();
+        let mut state = self.read_state()?;
         if self.rejected_in(&state, version) {
             return Err(Error::Rejected(version.to_string()));
         }
@@ -675,7 +787,7 @@ impl Store {
     /// it, nothing can vouch for it.
     pub fn confirm(&self, serving: &Version) -> Result<()> {
         let _guard = self.guard();
-        let mut state = self.read_state();
+        let mut state = self.read_state()?;
         if state.trial.as_ref() == Some(serving) {
             state.confirmed = state.trial.take();
             state.attempts = 0;
@@ -696,23 +808,52 @@ impl Store {
     /// A bundle chosen without having been confirmed goes on trial when the first page is loaded
     /// from it, see [`Self::begin_trial`]. Bundles that are incompatible (e.g. left over from
     /// before a full update), rejected, invalid or superseded are deleted; one that cannot be
-    /// read for now (an I/O error) is skipped and kept. Never fails: with no usable bundle the
-    /// built-in assets are used.
-    pub fn select(&self, reject: Option<&Version>) -> Option<Bundle> {
+    /// read for now (an I/O error) is skipped and kept.
+    ///
+    /// Always says what to serve, `None` being the built-in assets. The second value is whether
+    /// that decision is on record. When it is not, what was decided still holds for this run of
+    /// the app, but nothing was deleted on the strength of it, and a version rejected here is
+    /// not rejected at the next launch. A state that cannot be read at all leaves the store
+    /// untouched and the built-in assets served.
+    pub fn select(&self, reject: Option<&Version>) -> (Option<Bundle>, Result<()>) {
         let _guard = self.guard();
         self.select_locked(reject)
     }
 
-    /// Rejects `version` and [selects](Self::select) its replacement, unless it was confirmed
-    /// or replaced in the meantime, in which case nothing happens and `None` is returned.
-    pub fn fail_trial(&self, version: &Version) -> Option<Option<Bundle>> {
+    /// Rejects `version` and [selects](Self::select) its replacement, if `trial` (from
+    /// [`Self::begin_trial`]) is still the trial going on. If the bundle was confirmed or
+    /// replaced in the meantime, or its trial ended and another began, nothing happens and
+    /// `None` is returned.
+    pub fn fail_trial(
+        &self,
+        version: &Version,
+        trial: u64,
+    ) -> Option<(Option<Bundle>, Result<()>)> {
         let _guard = self.guard();
-        (self.read_state().trial.as_ref() == Some(version))
-            .then(|| self.select_locked(Some(version)))
+        let current = {
+            let shown = self.shown.lock().unwrap();
+            shown.version.as_ref() == Some(version) && shown.trial == trial
+        };
+        (current
+            && self
+                .read_state()
+                .is_ok_and(|state| state.trial.as_ref() == Some(version)))
+        .then(|| self.select_locked(Some(version)))
     }
 
-    fn select_locked(&self, reject: Option<&Version>) -> Option<Bundle> {
-        let old_state = self.read_state();
+    fn select_locked(&self, reject: Option<&Version>) -> (Option<Bundle>, Result<()>) {
+        let stored = match self.load_state() {
+            Ok(stored) => stored,
+            Err(error) => {
+                log::warn!(
+                    "cannot read the OTA state; serving the built-in frontend and leaving the stored bundles alone: {error}"
+                );
+                return (None, Err(error));
+            }
+        };
+        // a damaged file is written anew, so that it is not in the way from here on
+        let rewrite = stored.is_none();
+        let old_state = stored.unwrap_or_default();
         let mut state = old_state.clone();
 
         if let Some(version) = reject {
@@ -741,9 +882,11 @@ impl Store {
         // assets
         let only = reject.map(|_| state.confirmed.clone());
         let mut chosen = None;
+        // deleted once the rejection is on record, not before
+        let mut rejected = Vec::new();
         for version in self.versions() {
             if self.rejected_in(&state, &version) {
-                self.remove_quietly(&version);
+                rejected.push(version);
                 continue;
             }
             if only
@@ -765,6 +908,11 @@ impl Store {
             }
         }
 
+        // A fallback whose archive is gone, deleted just now as invalid or by something else,
+        // is none. Left on record it would keep that version from being stored again.
+        if state.confirmed.as_ref().is_some_and(|v| self.is_gone(v)) {
+            state.confirmed = None;
+        }
         let serving = chosen.as_ref().map(|bundle| &bundle.version);
         if !self.rollback && serving.is_some() {
             state.confirmed = serving.cloned();
@@ -774,14 +922,24 @@ impl Store {
             state.trial = None;
             state.attempts = 0;
         }
-        if state != old_state
-            && let Err(error) = self.write_state(&state)
-        {
-            // nothing is lost: the same conclusions are reached at the next launch
-            log::warn!("could not record the OTA state: {error}");
-        }
-        if let Some(bundle) = &chosen {
-            self.prune(&state, &bundle.version);
+        let recorded = if state != old_state || rewrite {
+            self.write_state(&state)
+        } else {
+            Ok(())
+        };
+        match &recorded {
+            Ok(()) => {
+                for version in &rejected {
+                    self.remove_quietly(version);
+                }
+                if let Some(bundle) = &chosen {
+                    self.prune(&state, &bundle.version);
+                }
+            }
+            // What is served in this run is decided either way. At the next launch the record
+            // is the old one: a trial out of attempts is rejected again, a version rejected on
+            // request (a rollback) is not, which is why the caller is told.
+            Err(error) => log::warn!("could not record the OTA state: {error}"),
         }
         if let Ok(entries) = fs::read_dir(&self.dir) {
             // left behind by an interrupted write: partial files, and signatures whose archive
@@ -798,7 +956,7 @@ impl Store {
                 }
             }
         }
-        chosen
+        (chosen, recorded)
     }
 }
 

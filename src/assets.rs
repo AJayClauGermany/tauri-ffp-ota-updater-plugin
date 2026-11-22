@@ -3,7 +3,7 @@
 use std::{
     borrow::Cow,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -21,6 +21,10 @@ static ACTIVE: RwLock<Option<Arc<Bundle>>> = RwLock::new(None);
 static WRAPPED: AtomicBool = AtomicBool::new(false);
 /// Runs once, when the active bundle serves its next HTML document.
 static ON_DOCUMENT: Mutex<Option<DocumentHook>> = Mutex::new(None);
+/// Held while an HTML document is looked up, and so while [`ON_DOCUMENT`] runs. The hook puts
+/// the trial on record; a page requested by another window meanwhile has to wait for that, or
+/// it would be served from a bundle whose trial is not on record yet, and may never be.
+static DOCUMENTS: Mutex<()> = Mutex::new(());
 
 pub(crate) type DocumentHook = Box<dyn FnOnce() + Send>;
 
@@ -51,23 +55,26 @@ impl<R: Runtime> Assets<R> for OtaAssets<R> {
     }
 
     fn get(&self, key: &AssetKey) -> Option<Cow<'_, [u8]>> {
-        match active() {
+        let _documents = key
+            .as_ref()
+            .ends_with(".html")
+            .then(|| DOCUMENTS.lock().unwrap_or_else(PoisonError::into_inner));
+        loop {
+            let Some(bundle) = active() else {
+                return self.embedded.get(key);
+            };
             // A bundle replaces the frontend as a whole: files it lacks are not looked up in
             // the embedded assets, which would mix two versions.
-            Some(bundle) => {
-                let file = bundle.files.get(key.as_ref())?;
-                if key.as_ref().ends_with(".html") {
-                    // taken out first: the hook must not run under the lock
-                    let hook = ON_DOCUMENT.lock().unwrap().take();
-                    if let Some(hook) = hook {
-                        hook();
-                        // the hook may have decided against serving this bundle
-                        return self.get(key);
-                    }
-                }
-                Some(Cow::Owned(file.clone()))
+            let file = bundle.files.get(key.as_ref())?;
+            let hook = _documents
+                .as_ref()
+                // taken out first: the hook switches bundles, which sets the next hook
+                .and_then(|_| ON_DOCUMENT.lock().unwrap().take());
+            match hook {
+                // it may have decided against serving this bundle: look again
+                Some(hook) => hook(),
+                None => return Some(Cow::Owned(file.clone())),
             }
-            None => self.embedded.get(key),
         }
     }
 

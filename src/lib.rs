@@ -187,7 +187,7 @@ impl Builder {
                     },
                     rollback: config.rollback,
                     trial_attempts: config.trial_attempts,
-                    shown: Mutex::new(None),
+                    shown: Default::default(),
                     binary: binary_version.clone(),
                     compatibility: self
                         .compatibility
@@ -238,7 +238,8 @@ impl Builder {
                 // what the first page load gets. When none can be served, the store is left as
                 // it is for a run of the app that can.
                 if updater.cannot_serve.is_none() && !updater.config.pubkey.trim().is_empty() {
-                    updater.serve(updater.store.select(None));
+                    // whether the choice could be recorded only matters for a rollback
+                    updater.serve(updater.store.select(None).0);
                 } else {
                     updater.serve(None);
                 }
