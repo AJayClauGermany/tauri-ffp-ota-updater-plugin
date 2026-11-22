@@ -1,7 +1,4 @@
-// Windows test binaries that link the Tauri runtime crash at startup with
-// STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) unless an application manifest is
-// embedded, so these runtime-backed tests only run on Linux and macOS.
-#![cfg(not(windows))]
+// On Windows these need the application manifest `build.rs` embeds in test binaries.
 
 use std::{
     borrow::Cow,
