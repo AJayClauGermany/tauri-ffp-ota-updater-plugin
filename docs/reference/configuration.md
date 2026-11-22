@@ -85,6 +85,10 @@ Requests carry `Accept: application/json` (manifest) or
 `Accept: application/octet-stream` (bundle) unless a header overrides it, and
 `User-Agent: tauri-plugin-ffp-ota-updater/<version>`.
 
+Redirects (`301`, `302`, `303`, `307`, `308`) are followed, at most 10 for a
+request. A request that a redirect sends to another origin than the
+endpoint's carries none of the configured headers, and no `Referer`.
+
 ## Builder
 
 `tauri_plugin_ffp_ota_updater::Builder`. Values set here take precedence over
@@ -94,14 +98,12 @@ Requests carry `Accept: application/json` (manifest) or
 | --- | --- |
 | `pubkey(impl Into<String>)` | Overrides `pubkey`. |
 | `endpoints(Vec<Url>)` | Overrides `endpoints`. |
-| `header(key, value) -> Result<Self>` | Adds a header sent with every manifest request, and with bundle downloads on the manifest's origin (scheme, host and port). |
+| `header(key, value) -> Result<Self>` | Adds a header sent with every manifest request, and with bundle downloads on the endpoint's origin (scheme, host and port). Never sent to another origin, including by a redirect. |
 | `headers(HeaderMap)` | Replaces those headers. |
-| `download_header(key, value) -> Result<Self>` | Adds a header sent with every bundle download, whatever its origin. |
-| `download_headers(HeaderMap)` | Replaces those headers. |
-| `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). |
+| `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). A redirect starts a new request. |
 | `proxy(Url)` | Use this proxy instead of the system's. |
 | `no_proxy()` | Ignore the system's proxy settings. |
-| `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
+| `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. Not the handling of redirects: the plugin follows them itself. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
 | `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. Independently of the rule, a bundle has to be newer than the binary, and is only offered if it is newer than the frontend being served. |
 
 ### TLS
@@ -133,5 +135,6 @@ them.
 | | |
 | --- | --- |
 | Manifest size | 1 MiB |
+| Redirects followed for a request | 10 |
 | Files and directories in a bundle | 20 000 |
 | Time without progress before a request is given up | 30 s |

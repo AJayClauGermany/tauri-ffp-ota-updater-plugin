@@ -4,15 +4,11 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 export interface CheckOptions {
   /**
    * Headers for the manifest request. Also sent with the bundle download when
-   * the bundle is on the same origin as the manifest; the manifest is not
-   * signed, so they do not follow it to another host.
+   * the bundle is on the same origin as the endpoint. They never leave that
+   * origin: the manifest is not signed, so they follow neither it nor a
+   * redirect to another host.
    */
   headers?: HeadersInit
-  /**
-   * Headers for the bundle download only, wherever the manifest says the
-   * bundle is.
-   */
-  downloadHeaders?: HeadersInit
   /** Timeout in milliseconds, applied to each request. */
   timeout?: number
   /** Proxy URL for the manifest request and the bundle download. */
@@ -203,20 +199,17 @@ function channel(onEvent?: (progress: DownloadEvent) => void) {
  * the published release needs a full application update instead.
  */
 export async function check(options?: CheckOptions): Promise<Update | null> {
-  const entries = (init?: HeadersInit) =>
-    init ? Array.from(new Headers(init).entries()) : undefined
   let headers: [string, string][] | undefined
-  let downloadHeaders: [string, string][] | undefined
   try {
-    headers = entries(options?.headers)
-    downloadHeaders = entries(options?.downloadHeaders)
+    headers = options?.headers
+      ? Array.from(new Headers(options.headers).entries())
+      : undefined
   } catch (error) {
     // `Headers` throws a `TypeError` for a name or value it cannot send
     throw new OtaUpdateError('invalidHeader', String(error))
   }
   const metadata = await call<UpdateMetadata | null>('check', {
     headers,
-    downloadHeaders,
     timeout: options?.timeout,
     proxy: options?.proxy,
   })

@@ -27,12 +27,12 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 
 | Field | Type | |
 | --- | --- | --- |
-| `headers` | `HeadersInit` | Sent with the manifest request, and with the bundle download if it is on the manifest's origin. Replace builder headers of the same name. |
-| `downloadHeaders` | `HeadersInit` | Sent with the bundle download only, wherever it is. Replace builder download headers of the same name. |
+| `headers` | `HeadersInit` | Sent with the manifest request, and with the bundle download if it is on the endpoint's origin; never to another origin. Replace builder headers of the same name. |
 | `timeout` | `number` (ms) | Deadline for each request. |
-| `proxy` | `string` | Proxy URL for both requests. |
+| `proxy` | `string` | Proxy URL for both requests. `invalidUrl` if it is not a URL. |
 
-Endpoints cannot be set from the webview.
+These replace the builder's settings for one check. Endpoints cannot be set
+from the webview.
 
 ### `Update`
 
@@ -74,7 +74,7 @@ For `invoke("plugin:ffp-ota-updater|<command>", args)`. Errors are
 
 | Command | Arguments | Result |
 | --- | --- | --- |
-| `check` | `headers?: [string, string][]`, `downloadHeaders?: [string, string][]`, `timeout?: number`, `proxy?: string` | update metadata (`currentVersion`, `version`, `downloaded`, `date`, `body`, `rawJson`) or `null` |
+| `check` | `headers?: [string, string][]`, `timeout?: number`, `proxy?: string` | update metadata (`currentVersion`, `version`, `downloaded`, `date`, `body`, `rawJson`) or `null` |
 | `download` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `download_and_install` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `install` | `version: string` | |
@@ -155,7 +155,7 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 
 | `kind` | Rust variant | When |
 | --- | --- | --- |
-| `network` | `Reqwest` | No endpoint or download host could be reached, a timeout, a non-success status for the bundle. |
+| `network` | `Reqwest`, `TooManyRedirects` | No endpoint or download host could be reached, a timeout, a non-success status for the bundle, more than 10 redirects. |
 | `releaseNotFound` | `ReleaseNotFound` | An endpoint answered, but none with a usable manifest. |
 | `emptyEndpoints` | `EmptyEndpoints` | No endpoints are configured. |
 | `emptyPubkey` | `EmptyPubkey` | No public key is configured. |

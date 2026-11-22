@@ -186,10 +186,12 @@ Other measures:
 
 - `https` is required for endpoints, bundle URLs and redirects.
 - Headers given for the manifest request (an `Authorization` token, say) are
-  only sent with the download when it is on the manifest's origin. Otherwise
-  whoever can edit the unsigned manifest could point the download at their own
-  server and collect the token before the signature check fails.
-  `downloadHeaders` are for a download host elsewhere.
+  only ever sent to the origin of the endpoint: with the download when it is
+  there, and not along a redirect that leaves it. Otherwise whoever can edit
+  the unsigned manifest could point the download at their own server and
+  collect the token before the signature check fails. For the same reason
+  there is no option that sends headers wherever the manifest points, and a
+  redirect does not tell the next host which URL it came from.
 - The webview cannot choose endpoints or keys; only Rust can.
 - Archives are held to an unambiguous subset of tar: no links, no paths that
   climb out, no duplicate entries, and limits on size and entry count. What

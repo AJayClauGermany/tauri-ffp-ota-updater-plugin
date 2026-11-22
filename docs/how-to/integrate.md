@@ -220,19 +220,27 @@ await check({ headers: { "X-Channel": "beta" }, timeout: 20000 });
 ```
 
 These headers go to the manifest endpoint, and to the bundle download only
-when the manifest points to the same origin (scheme, host and port). The
-manifest is not signed, so whoever can change it could otherwise send the
-download, and an `Authorization` header with it, to a server of their choosing;
-the signature check only rejects the bundle after that request. A download host
-elsewhere that needs credentials gets them explicitly:
+when the manifest points to the same origin (scheme, host and port). They never
+leave that origin, not along a redirect either. The manifest is not signed, so
+whoever can change it could otherwise send the download, and an
+`Authorization` header with it, to a server of their choosing; the signature
+check only rejects the bundle after that request.
 
-```rust
-tauri_plugin_ffp_ota_updater::Builder::new()
-    .header("Authorization", format!("Bearer {manifest_token}"))?
-    .download_header("Authorization", format!("Bearer {cdn_token}"))?
-```
+There is no setting that sends headers to wherever the manifest points, for the
+same reason. If the bundles are on another origin and need credentials:
 
-`check({ downloadHeaders })` does the same for one check.
+- serve the manifest and the bundles from one origin, or
+- have the manifest name a URL that carries its own, short-lived authorization
+  (a pre-signed URL), or
+- fetch the bundle in Rust with a client of your own and hand it to
+  [`stage`](#bring-your-own-bundles).
+
+Options given to `check()` in the webview replace the builder's for that one
+check; they are defaults, not a policy the webview is held to. The webview
+cannot read a header set in Rust, and a proxy it names sees no more of an
+`https` request than the host it goes to. An app that must not let its
+frontend choose them leaves `ffp-ota-updater:allow-check` out of its
+capabilities and [checks from Rust](#check-from-rust).
 
 ## Switch without reloading at a bad moment
 

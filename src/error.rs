@@ -49,6 +49,10 @@ pub enum Error {
     /// at all (offline, say) the error is [`Error::Reqwest`] instead.
     #[error("could not fetch a valid OTA release manifest from any endpoint: {0}")]
     ReleaseNotFound(String),
+    /// A manifest or bundle request was redirected more often than the plugin follows, or to
+    /// nowhere. Holds the URL it stopped at.
+    #[error("the request was redirected too often, or nowhere, at `{0}`")]
+    TooManyRedirects(String),
     /// The public key or the signature cannot be read, or the signature is not one of this
     /// key for this bundle.
     #[error("the bundle signature is not valid: {0}")]
@@ -98,7 +102,7 @@ impl Error {
         match self {
             Self::Io(_) => "io",
             Self::Tauri(_) => "tauri",
-            Self::Reqwest(_) => "network",
+            Self::Reqwest(_) | Self::TooManyRedirects(_) => "network",
             Self::Json(_) => "json",
             Self::Semver(_) => "invalidVersion",
             Self::InvalidSignature(_) => "signature",

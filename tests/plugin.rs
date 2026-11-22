@@ -84,7 +84,8 @@ fn sign(key: &minisign::KeyPair, data: &[u8], version: Option<&str>) -> String {
 type Routes = Arc<Mutex<HashMap<&'static str, Vec<u8>>>>;
 
 /// Serves `routes` by the last path segment and records every requested path, followed by
-/// `#` and the value of the `x-channel` header if one was sent.
+/// `#` and the value of the `x-channel` header if one was sent, and by `!referer` if the
+/// request names where it came from. A route whose content is `-> ` and a URL redirects there.
 fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -96,10 +97,13 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
             reader.read_line(&mut request_line).unwrap();
             let mut line = String::new();
             let mut channel = None;
+            let mut referer = false;
             while reader.read_line(&mut line).unwrap() > 2 {
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("x-channel:") {
+                let header = line.to_ascii_lowercase();
+                if let Some(value) = header.strip_prefix("x-channel:") {
                     channel = Some(value.trim().to_string());
                 }
+                referer |= header.starts_with("referer:");
                 line.clear();
             }
             let path = request_line
@@ -110,15 +114,33 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
             let body = routes
                 .lock()
                 .unwrap()
-                .get(path.rsplit('/').next().unwrap())
+                .get(
+                    path.split('?')
+                        .next()
+                        .and_then(|path| path.rsplit('/').next())
+                        .unwrap(),
+                )
                 .cloned();
-            requests.lock().unwrap().push(match channel {
-                Some(channel) => format!("{path}#{channel}"),
-                None => path,
-            });
+            let mut request = path;
+            if let Some(channel) = channel {
+                request.push_str(&format!("#{channel}"));
+            }
+            if referer {
+                request.push_str("!referer");
+            }
+            requests.lock().unwrap().push(request);
             let (status, body) = match body {
-                Some(body) => ("200 OK", body),
-                None => ("404 Not Found", Vec::new()),
+                Some(body) => match body.strip_prefix(b"-> ") {
+                    Some(location) => (
+                        format!(
+                            "302 Found\r\nLocation: {}",
+                            String::from_utf8_lossy(location)
+                        ),
+                        Vec::new(),
+                    ),
+                    None => ("200 OK".into(), body),
+                },
+                None => ("404 Not Found".into(), Vec::new()),
             };
             let _ = write!(
                 stream,
@@ -569,7 +591,7 @@ fn frontend_update_lifecycle() {
     development_mode_does_not_serve_bundles();
     build_metadata_is_ignored_unless_asked_for();
     bundles_get_the_csp_processing_of_built_in_frontends();
-    headers_follow_the_download_only_to_the_manifests_origin();
+    headers_stay_on_the_endpoints_origin();
     a_bundle_reinstalled_after_a_reset_goes_on_trial_again();
     failed_deletions_are_reported();
     archive_metadata_counts_towards_the_unpacked_size();
@@ -1179,32 +1201,35 @@ fn oversized_bundles_are_refused() {
     assert!(stored_files(&data_dir.path().join("ffp-ota-updater")).is_empty());
 }
 
-/// The manifest is not signed, so it must not be able to send the manifest's credentials to a
-/// host of its choosing.
-fn headers_follow_the_download_only_to_the_manifests_origin() {
+/// Headers are for the endpoint the app was configured with. Neither the manifest, which is not
+/// signed, nor a redirect can send them to a host of its choosing.
+fn headers_stay_on_the_endpoints_origin() {
     let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
     let pubkey = b64(key.pk.to_box().unwrap().to_string());
     let bundle = archive("elsewhere");
-    let manifest_routes = Routes::default();
-    let manifest_requests = Arc::new(Mutex::new(Vec::new()));
-    let manifest_port = serve(manifest_routes.clone(), manifest_requests.clone());
-    let bundle_routes = Routes::default();
-    let bundle_requests = Arc::new(Mutex::new(Vec::new()));
+    let signature = sign(&key, &bundle, Some("1.2.1"));
+    let own_routes = Routes::default();
+    let own_requests = Arc::new(Mutex::new(Vec::new()));
+    let own_port = serve(own_routes.clone(), own_requests.clone());
+    let other_routes = Routes::default();
+    let other_requests = Arc::new(Mutex::new(Vec::new()));
     // another port is another origin
-    let bundle_port = serve(bundle_routes.clone(), bundle_requests.clone());
-    bundle_routes
+    let other_port = serve(other_routes.clone(), other_requests.clone());
+    other_routes
         .lock()
         .unwrap()
         .insert("bundle.tar.gz", bundle.clone());
-    let manifest = serde_json::json!({
-        "version": "1.2.1",
-        "url": format!("http://127.0.0.1:{bundle_port}/bundle.tar.gz"),
-        "signature": sign(&key, &bundle, Some("1.2.1")),
-    });
-    manifest_routes
-        .lock()
-        .unwrap()
-        .insert("ota.json", manifest.to_string().into_bytes());
+    let manifest = |bundle_port: u16| {
+        serde_json::json!({
+            "version": "1.2.1",
+            "url": format!("http://127.0.0.1:{bundle_port}/bundle.tar.gz?token=1"),
+            "signature": signature,
+        })
+        .to_string()
+        .into_bytes()
+    };
+    let requests =
+        |requests: &Arc<Mutex<Vec<String>>>| std::mem::take(&mut *requests.lock().unwrap());
 
     let data_dir = tempfile::tempdir().unwrap();
     let builder = Builder::new().header("x-channel", "secret").unwrap();
@@ -1212,29 +1237,83 @@ fn headers_follow_the_download_only_to_the_manifests_origin() {
         data_dir.path(),
         "1.2.0",
         &pubkey,
-        manifest_port,
+        own_port,
         serde_json::json!({}),
         builder,
     );
     let updater = app.ota_updater();
-    let update = block_on(updater.check()).unwrap().expect("no update");
-    block_on(update.download(|_, _| {}, || {})).unwrap();
-    assert!(manifest_requests.lock().unwrap()[0].ends_with("#secret"));
-    assert_eq!(*bundle_requests.lock().unwrap(), ["/bundle.tar.gz"]);
-    updater.reset().unwrap();
+    let download = || {
+        let update = block_on(updater.check()).unwrap().expect("no update");
+        block_on(update.download(|_, _| {}, || {})).unwrap();
+        assert_eq!(served_index(&app), "built-in");
+        updater.reset().unwrap();
+    };
 
-    // download headers go wherever the bundle is, and replace the builder's of that name
-    let options = RequestOptions::new()
-        .download_header("x-channel", "for the cdn")
-        .unwrap();
-    let update = block_on(updater.check_with(options))
+    // a manifest that names a bundle elsewhere
+    own_routes
+        .lock()
         .unwrap()
-        .expect("no update");
-    block_on(update.download(|_, _| {}, || {})).unwrap();
-    assert_eq!(
-        bundle_requests.lock().unwrap().last().unwrap(),
-        "/bundle.tar.gz#for the cdn"
-    );
+        .insert("ota.json", manifest(other_port));
+    download();
+    assert!(requests(&own_requests)[0].ends_with("/ota.json#secret"));
+    assert_eq!(requests(&other_requests), ["/bundle.tar.gz?token=1"]);
+
+    // a bundle on the endpoint's origin gets the headers, but a redirect does not take them
+    // along, nor does it tell the other host which URL, token included, it came from
+    own_routes.lock().unwrap().extend([
+        ("ota.json", manifest(own_port)),
+        (
+            "bundle.tar.gz",
+            format!("-> http://127.0.0.1:{other_port}/bundle.tar.gz").into_bytes(),
+        ),
+    ]);
+    download();
+    let own = requests(&own_requests);
+    assert!(own[0].ends_with("/ota.json#secret"), "{own:?}");
+    assert_eq!(own[1], "/bundle.tar.gz?token=1#secret");
+    assert_eq!(requests(&other_requests), ["/bundle.tar.gz"]);
+
+    // the same goes for an endpoint that redirects to a manifest elsewhere, and for the bundle
+    // that manifest names on the endpoint's origin, which gets them again
+    other_routes
+        .lock()
+        .unwrap()
+        .insert("moved.json", manifest(own_port));
+    own_routes.lock().unwrap().extend([
+        (
+            "ota.json",
+            // relative to the URL that redirects
+            b"-> moved.json".to_vec(),
+        ),
+        (
+            "moved.json",
+            format!("-> http://127.0.0.1:{other_port}/moved.json").into_bytes(),
+        ),
+        ("bundle.tar.gz", bundle.clone()),
+    ]);
+    download();
+    let own = requests(&own_requests);
+    assert!(own[0].ends_with("/ota.json#secret"), "{own:?}");
+    assert!(own[1].ends_with("/moved.json#secret"), "{own:?}");
+    assert_eq!(own[2], "/bundle.tar.gz?token=1#secret");
+    assert_eq!(requests(&other_requests), ["/moved.json"]);
+
+    // a redirect that never ends is given up on
+    own_routes
+        .lock()
+        .unwrap()
+        .insert("ota.json", b"-> ota.json".to_vec());
+    let lost = block_on(updater.check()).err().unwrap();
+    assert!(matches!(lost, Error::ReleaseNotFound(_)), "{lost}");
+    assert_eq!(requests(&own_requests).len(), 11);
+    own_routes.lock().unwrap().extend([
+        ("ota.json", manifest(own_port)),
+        ("bundle.tar.gz", b"-> bundle.tar.gz".to_vec()),
+    ]);
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    let lost = block_on(update.download(|_, _| {}, || {})).err().unwrap();
+    assert!(matches!(lost, Error::TooManyRedirects(_)), "{lost}");
+    assert_eq!(serde_json::to_value(&lost).unwrap()["kind"], "network");
     updater.reset().unwrap();
 }
 

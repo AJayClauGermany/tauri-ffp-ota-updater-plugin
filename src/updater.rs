@@ -5,7 +5,10 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::ACCEPT};
+use http::{
+    HeaderMap, HeaderName, HeaderValue, StatusCode,
+    header::{ACCEPT, LOCATION},
+};
 use percent_encoding::{AsciiSet, CONTROLS};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -25,6 +28,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Longest wait for a connection, and for more data once connected.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redirects followed for one request before it is given up on.
+const MAX_REDIRECTS: usize = 10;
 
 /// The release manifest an endpoint responds with.
 ///
@@ -67,19 +72,19 @@ pub struct RequestOptions {
     /// Manifest URLs to query instead of the configured ones, in order. This is how an app
     /// switches release channels while it is running.
     pub endpoints: Option<Vec<Url>>,
-    /// Extra headers sent with the manifest request, and with the bundle download if the bundle
-    /// is on the same origin (scheme, host and port) as the manifest.
+    /// Extra headers for the manifest request and the bundle download. They are only ever sent
+    /// to the origin (scheme, host and port) of the endpoint that is being asked: not to a
+    /// bundle on another origin, and not along a redirect that leaves it.
     ///
-    /// They are not sent to another origin because the manifest is not signed: whoever can
-    /// change it could point the download at their own server and collect an `Authorization`
-    /// header before the signature check rejects what they serve.
+    /// The manifest is not signed, so whoever can change it could otherwise point the download
+    /// at their own server and collect an `Authorization` header before the signature check
+    /// rejects what they serve. There is deliberately no way to send headers to wherever the
+    /// manifest points: an app whose bundles need credentials on another origin fetches them
+    /// itself and hands them to [`OtaUpdater::stage`].
     pub headers: HeaderMap,
-    /// Extra headers sent with the bundle download only, wherever the manifest says the bundle
-    /// is. For a download host that needs credentials of its own, or the manifest's, on
-    /// another origin; only add what that host may see.
-    pub download_headers: HeaderMap,
-    /// Timeout applied to each request. Defaults to 30 seconds for the manifest and 30 minutes
-    /// for the bundle; a connection that stalls for 30 seconds is given up on either way.
+    /// Timeout applied to each request, and to each request a redirect leads to. Defaults to
+    /// 30 seconds for the manifest and 30 minutes for the bundle; a connection that stalls for
+    /// 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
     /// Proxy for the manifest request and the bundle download.
     pub proxy: Option<Url>,
@@ -111,21 +116,6 @@ impl RequestOptions {
         Ok(self)
     }
 
-    /// Adds a header to [`Self::download_headers`], replacing one of the same name.
-    pub fn download_header<K, V>(mut self, key: K, value: V) -> Result<Self>
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
-        HeaderValue: TryFrom<V>,
-        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
-    {
-        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
-        let value: std::result::Result<HeaderValue, http::Error> =
-            value.try_into().map_err(Into::into);
-        self.download_headers.insert(key?, value?);
-        Ok(self)
-    }
-
     /// Sets [`Self::timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -143,7 +133,6 @@ impl RequestOptions {
 #[derive(Default)]
 pub(crate) struct ClientOptions {
     pub headers: HeaderMap,
-    pub download_headers: HeaderMap,
     pub timeout: Option<Duration>,
     pub proxy: Option<Url>,
     pub no_proxy: bool,
@@ -273,18 +262,10 @@ impl<R: Runtime> OtaUpdater<R> {
 
         // what the download of the release found here is made with, too
         options.headers = merge_headers(&self.client.headers, std::mem::take(&mut options.headers));
-        options.download_headers = merge_headers(
-            &self.client.download_headers,
-            std::mem::take(&mut options.download_headers),
-        );
         options.timeout = options.timeout.or(self.client.timeout);
         options.proxy = options.proxy.or_else(|| self.client.proxy.clone());
 
         let current_version = self.current_version();
-        let mut headers = options.headers.clone();
-        headers
-            .entry(ACCEPT)
-            .or_insert(HeaderValue::from_static("application/json"));
         let client = self.client(
             options.timeout.unwrap_or(CHECK_TIMEOUT),
             options.proxy.as_ref(),
@@ -298,19 +279,21 @@ impl<R: Runtime> OtaUpdater<R> {
         for endpoint in endpoints {
             let url = self.resolve_endpoint(endpoint, &current_version)?;
             log::debug!("checking for frontend updates at {url}");
-            let response = match client
-                .get(url.clone())
-                .headers(headers.clone())
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    last_error = error.to_string();
-                    unreachable = Some(error);
-                    continue;
-                }
-            };
+            let response =
+                match get(&client, &url, &url, &options.headers, "application/json").await {
+                    Ok(response) => response,
+                    Err(Error::Reqwest(error)) => {
+                        last_error = error.to_string();
+                        unreachable = Some(error);
+                        continue;
+                    }
+                    Err(error) => {
+                        // a redirect that leads nowhere: the endpoint did answer
+                        responded = true;
+                        last_error = error.to_string();
+                        continue;
+                    }
+                };
             responded = true;
             if response.status() == StatusCode::NO_CONTENT {
                 return Ok(None);
@@ -609,6 +592,8 @@ impl<R: Runtime> OtaUpdater<R> {
         Ok(())
     }
 
+    /// The HTTP client for one check or download. It follows no redirects: [`get`] does, to
+    /// decide for each one which headers go along.
     fn client(&self, timeout: Duration, proxy: Option<&Url>) -> Result<reqwest::Client> {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             // can only fail if another thread installed one in the meantime, which is just as
@@ -630,6 +615,12 @@ impl<R: Runtime> OtaUpdater<R> {
         if let Some(configure) = &self.client.configure {
             builder = configure(builder);
         }
+        // After `configure`, which may change everything else: were reqwest to follow redirects,
+        // it would take every header but a few standard ones (`Authorization`, `Cookie`) to
+        // another origin, and name the URL it came from, query included, in a `Referer`.
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false);
         Ok(builder.build()?)
     }
 
@@ -668,6 +659,53 @@ fn merge_headers(base: &HeaderMap, overrides: HeaderMap) -> HeaderMap {
         }
     }
     headers
+}
+
+/// Requests `url` and follows redirects, up to [`MAX_REDIRECTS`] of them.
+///
+/// `headers` are the caller's, and whoever receives them can keep them: they are sent only to
+/// the origin of `trusted`, the endpoint the app was configured to ask. Neither the unsigned
+/// manifest, which names `url` for a download, nor a redirect can take them elsewhere. A request
+/// to another origin carries nothing but `accept` and the client's defaults.
+async fn get(
+    client: &reqwest::Client,
+    url: &Url,
+    trusted: &Url,
+    headers: &HeaderMap,
+    accept: &'static str,
+) -> Result<reqwest::Response> {
+    let mut url = url.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        let mut request = if url.origin() == trusted.origin() {
+            headers.clone()
+        } else {
+            if !headers.is_empty() {
+                log::debug!("not sending the request's headers to {url}, which is another origin");
+            }
+            HeaderMap::new()
+        };
+        request
+            .entry(ACCEPT)
+            .or_insert(HeaderValue::from_static(accept));
+        let response = client.get(url.clone()).headers(request).send().await?;
+        let location = matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        )
+        .then(|| response.headers().get(LOCATION))
+        .flatten()
+        .and_then(|location| location.to_str().ok());
+        match location {
+            // relative to the URL that redirected; `https` is enforced by the client
+            Some(location) => url = url.join(location)?,
+            None => return Ok(response),
+        }
+    }
+    Err(Error::TooManyRedirects(url.to_string()))
 }
 
 /// Reads a response body of at most `limit` bytes.
@@ -731,8 +769,8 @@ pub struct Update<R: Runtime> {
     pub download_url: Url,
     /// The bundle's signature.
     pub signature: String,
-    /// Where the manifest came from, which decides whether [`RequestOptions::headers`] are
-    /// sent with the download.
+    /// The endpoint the manifest was asked from, which is where [`RequestOptions::headers`]
+    /// may go.
     manifest_url: Url,
     options: RequestOptions,
 }
@@ -788,33 +826,23 @@ impl<R: Runtime> Update<R> {
             return Ok(());
         }
 
-        let mut headers = if self.download_url.origin() == self.manifest_url.origin() {
-            self.options.headers.clone()
-        } else {
-            if !self.options.headers.is_empty() {
-                log::debug!(
-                    "not sending the manifest's headers to {}, which is another origin",
-                    self.download_url
-                );
-            }
-            HeaderMap::new()
-        };
-        for (name, value) in &self.options.download_headers {
-            headers.insert(name, value.clone());
+        let client = updater.client(
+            self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT),
+            self.options.proxy.as_ref(),
+        )?;
+        let response = get(
+            &client,
+            &self.download_url,
+            &self.manifest_url,
+            &self.options.headers,
+            "application/octet-stream",
+        )
+        .await?
+        .error_for_status()?;
+        if !response.status().is_success() {
+            // a redirect without a destination, say: its body is not the bundle
+            return Err(Error::TooManyRedirects(response.url().to_string()));
         }
-        headers
-            .entry(ACCEPT)
-            .or_insert(HeaderValue::from_static("application/octet-stream"));
-        let response = updater
-            .client(
-                self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT),
-                self.options.proxy.as_ref(),
-            )?
-            .get(self.download_url.clone())
-            .headers(headers)
-            .send()
-            .await?
-            .error_for_status()?;
 
         let content_length = response.content_length();
         let limit = updater.config.max_bundle_size;
