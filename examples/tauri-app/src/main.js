@@ -44,6 +44,7 @@ $("download").addEventListener("click", () =>
   run(async () => {
     await plugin("download", { version: update.version, onEvent: progressChannel() });
     log("Stored. It will be used the next time the app starts.");
+    await showStaged();
   }),
 );
 
@@ -56,22 +57,27 @@ $("install").addEventListener("click", () =>
 
 $("reset").addEventListener("click", () => run(() => plugin("reset")));
 
+// Offers what is stored for the next launch, whether it was downloaded just now
+// or in an earlier run. `status` makes no request, so this works offline.
+async function showStaged() {
+  const status = await plugin("status");
+  $("apply").disabled = $("discard").disabled = !status.staged;
+  // by version alone: no check is needed to apply a stored bundle
+  $("apply").onclick = () => run(() => plugin("install", { version: status.staged }));
+  $("discard").onclick = () =>
+    run(async () => {
+      await plugin("discard", { version: status.staged });
+      log(`Discarded ${status.staged}.`);
+      await showStaged();
+    });
+  return status;
+}
+
 run(async () => {
   // the page got this far, so a downloaded frontend is good to keep
   await plugin("notify_ready");
-  const status = await plugin("status");
+  const status = await showStaged();
   $("version").textContent = status.currentVersion;
-  if (status.staged) {
-    log(`${status.staged} is downloaded and will be used at the next launch.`);
-    $("apply").disabled = $("discard").disabled = false;
-    // by version alone: no check, so this works offline
-    $("apply").onclick = () => run(() => plugin("install", { version: status.staged }));
-    $("discard").onclick = () =>
-      run(async () => {
-        await plugin("discard", { version: status.staged });
-        $("apply").disabled = $("discard").disabled = true;
-        log(`Discarded ${status.staged}.`);
-      });
-  }
+  if (status.staged) log(`${status.staged} is downloaded and will be used at the next launch.`);
   if (status.rejected.length) log(`Rolled back earlier: ${status.rejected.join(", ")}`);
 });

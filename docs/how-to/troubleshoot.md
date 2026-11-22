@@ -60,6 +60,9 @@ version is now in `status().rejected`.
   network request).
 - `readyTimeout` is shorter than a slow start.
 - The permission for it is missing; see ["not allowed"](#unknown--command-not-allowed).
+- More instances of the app than `trialAttempts` were started before the
+  first one confirmed; see
+  [Limitations](../explanation/how-it-works.md#limitations).
 
 Publish the corrected frontend under a **new** version.
 [How the trial works](../explanation/how-it-works.md#trial-and-rollback).
@@ -89,6 +92,10 @@ last reason.
 
 No endpoint could be reached: offline, DNS, TLS, a proxy, a timeout, or a
 redirect to `http`. Expected on a device without a connection; retry later.
+
+From `download()` it is also a status other than success, or more than 10
+redirects. A `401` or `403` from a download host on another origin than the
+endpoint is by design: [headers stay on the endpoint's origin](integrate.md#send-headers-use-a-proxy-or-a-private-ca).
 
 ### `emptyEndpoints` / `insecureTransportProtocol`
 
@@ -141,7 +148,8 @@ The message says what is wrong with the archive.
 - `no index.html at the root of the archive`: the folder itself was packed.
   Use `tar -czf frontend.tar.gz -C dist .`, not `tar -czf frontend.tar.gz dist`.
 - A link or special file, a path with `..`, or the same file twice.
-- Not a gzipped tarball (a `.zip`, or an HTML error page saved as the file).
+- Not a gzipped tarball (a `.zip`, or an HTML error page saved as the file),
+  or one that is cut short.
 
 ### `tooLarge`
 
@@ -165,7 +173,7 @@ use `install(version)`.
 | --- | --- |
 | `notDownloaded` | `install()` for a version that is not stored. Download it first. |
 | `notNewer` | The version is not newer than the frontend being served. Versions only move forward. |
-| `inUse` | `discard()` of the bundle being served, or of the confirmed one kept as the fallback. |
+| `inUse` | `discard()` of the bundle being served, or of the confirmed one kept as the fallback. From `download()`: this device already stores other contents under that version. A version was published twice with different files; publish the new build under a new version. |
 | `rejected` | The version was rolled back on this device before. |
 | `incompatible` | The version is not a frontend update for this binary (see the first row of the `null` table above). |
 
@@ -176,6 +184,13 @@ The call did not reach the plugin.
 - The capability lacks `ffp-ota-updater:default`. `rollback()` and `reset()`
   additionally need `ffp-ota-updater:allow-rollback` / `allow-reset`.
 - The plugin is not registered (for example on mobile).
+
+### `io`
+
+A file in the [store](../reference/formats.md#store) could not be read or
+written: permissions, a full disk, a file held by another program. While
+`state.json` cannot be read, the app serves the built-in frontend and changes
+nothing, and goes back to normal at the first launch that can read it.
 
 ## After the update, styles or scripts are blocked
 

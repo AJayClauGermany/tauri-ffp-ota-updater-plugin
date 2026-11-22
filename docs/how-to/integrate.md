@@ -66,19 +66,26 @@ this on every start is cheap.
 ## Ask the user before updating
 
 `status()` makes no request, so it also tells you about a bundle downloaded in
-an earlier run, or while offline:
+an earlier run. Ask it whether or not the check worked, so that the bundle can
+be applied while offline:
 
 ```js
 import { check, status, install, discard } from "tauri-plugin-ffp-ota-updater-api";
 
-const update = await check();
-await update?.download();
+try {
+  const update = await check();
+  await update?.download();
+} catch (error) {
+  // offline, say: there may still be a bundle from an earlier run
+}
 
 const { staged } = await status();
 if (staged) {
-  if (await confirm(`Version ${staged} is ready. Reload now?`)) {
+  // `ask` is yours: a dialog with these three answers
+  const answer = await ask(`Version ${staged} is ready.`, ["Reload now", "Later", "Skip"]);
+  if (answer === "Reload now") {
     await install(staged);   // reloads every window
-  } else if (userSaidNever) {
+  } else if (answer === "Skip") {
     await discard(staged);   // otherwise it is applied at the next launch
   }
 }
@@ -86,7 +93,9 @@ if (staged) {
 
 Without `discard()` a downloaded bundle is used at the next launch whatever
 the user answered. Discarding is not a rejection: `check()` offers the version
-again.
+again, so remember the user's answer if it should not be asked again.
+Discard only once `download()` has settled: a download that is still running
+stores the bundle again.
 
 ## Show download progress
 
@@ -100,6 +109,9 @@ await update.downloadAndInstall((event) => {
   }
 });
 ```
+
+`Finished` ends the progress bar, not the update: the bundle is verified and
+stored after it. Whether that worked is what the promise says.
 
 ## Handle errors and being offline
 
@@ -176,6 +188,10 @@ import { rollback } from "tauri-plugin-ffp-ota-updater-api";
 await rollback(); // rejects this version and reloads into the last confirmed one
 ```
 
+If `rollback()` rejects with `io`, the app has gone back for this run but the
+rejection could not be written down (a full disk, say), and the version is
+served or offered again after a restart.
+
 From Rust, `app.ota_updater().rollback()` does the same without help from the
 frontend, for example from a menu item.
 
@@ -244,8 +260,8 @@ capabilities and [checks from Rust](#check-from-rust).
 
 ## Switch without reloading at a bad moment
 
-`install()` reloads every webview. An app that cannot be reloaded at an
-arbitrary moment can do the two steps itself from Rust:
+`install()` reloads every webview window. An app that cannot be reloaded at
+an arbitrary moment can do the two steps itself from Rust:
 
 ```rust
 // after finishing or blocking whatever must not be interrupted
@@ -289,6 +305,10 @@ updater.install(&version)?;                      // or leave it for the next lau
 `stage` applies every check a download gets (signature, signed version,
 compatibility, size limits, archive contents). `activate(&version)`,
 `install(&version)` and `discard(&version)` work on any stored bundle.
+
+A version is stored once: staging other contents under a version that is
+already stored fails with `InUse`. Staging the same archive again does
+nothing, so it is safe to repeat.
 
 ## Apps that also build for mobile
 

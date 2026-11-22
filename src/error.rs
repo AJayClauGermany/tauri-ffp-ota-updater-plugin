@@ -68,7 +68,9 @@ pub enum Error {
     /// The archive is not a usable frontend bundle.
     #[error("invalid frontend bundle: {0}")]
     InvalidBundle(String),
-    /// A manifest or bundle exceeds its size limit, in bytes.
+    /// A bundle, or what it unpacks to, exceeds its size limit, in bytes. A manifest that does
+    /// is an unusable one, reported as [`Error::ReleaseNotFound`] if no other endpoint has a
+    /// better one.
     #[error("the {0} is larger than the limit of {1} bytes")]
     TooLarge(&'static str, u64),
     /// The bundle version is not a frontend-only update for this binary.
@@ -85,8 +87,9 @@ pub enum Error {
     #[error("frontend version `{0}` is older than the one being served")]
     NotNewer(String),
     /// The bundle is being served, or is the confirmed one kept to fall back on, and cannot be
-    /// discarded; or different contents were staged under the version that is confirmed or on
-    /// trial, which a version cannot have.
+    /// discarded; or other contents were downloaded or staged under a version that is stored,
+    /// which a version cannot have; or a version that differs from a stored one only in letter
+    /// case, which would be the same file on Windows and macOS.
     #[error("the frontend bundle for version `{0}` is in use")]
     InUse(String),
     /// `install` was called before the bundle was downloaded.

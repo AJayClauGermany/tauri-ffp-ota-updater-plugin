@@ -6,7 +6,8 @@ for releases that change the binary, this plugin for releases that only change
 the frontend.
 
 The two plugins are independent. Each has its own configuration block, its own
-manifest and its own permission; they share the signing key.
+manifest and its own permission. They can share the signing key, which is
+what this page assumes, or [each have one](../explanation/how-it-works.md#security).
 
 - [If you know the updater plugin](#if-you-know-the-updater-plugin): what looks
   the same but is not

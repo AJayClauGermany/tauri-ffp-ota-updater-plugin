@@ -157,6 +157,12 @@ export class Update {
    *
    * Safe to call again for a bundle that is already stored: nothing is
    * fetched and only the `Finished` event is sent.
+   *
+   * `Finished` says the download is complete. The bundle is verified and
+   * stored after it, so it is only ready once this promise resolves.
+   *
+   * Rejects with kind `inUse` if this device already stores other contents
+   * under this version: a version names one bundle.
    */
   async download(onEvent?: (progress: DownloadEvent) => void): Promise<void> {
     await call('download', {
@@ -170,6 +176,9 @@ export class Update {
    * Switches to the downloaded bundle now by reloading the app's webviews.
    * In-memory page state is lost, as with any reload. The new frontend has to
    * call {@link notifyReady} or it is reverted.
+   *
+   * A rejection of kind `tauri` means the switch happened but a window could
+   * not be reloaded. With any other kind nothing was switched.
    */
   async install(): Promise<void> {
     await install(this.version)
@@ -251,6 +260,9 @@ export async function install(version: string): Promise<void> {
  * to it, for an update the user declined. The version can be downloaded
  * again. Rejects with kind `inUse` for the bundle being served and for the
  * confirmed one kept to fall back on.
+ *
+ * A {@link Update.download} of that version that is still running is not
+ * cancelled and stores the bundle again: wait for it first.
  */
 export async function discard(version: string): Promise<void> {
   await call('discard', { version })
@@ -262,6 +274,10 @@ export async function discard(version: string): Promise<void> {
  * frontend. A newer bundle that was downloaded but never shown is kept, and
  * is tried at the next launch. For a frontend that notices it is broken. Does
  * nothing when the built-in frontend is being served.
+ *
+ * Rejects with kind `io` if the rejection could not be recorded. The app has
+ * gone back for this run all the same, but the version is served or offered
+ * again after a restart.
  *
  * Not part of the default permission set: grant
  * `ffp-ota-updater:allow-rollback`.
@@ -287,7 +303,8 @@ export async function reset(): Promise<void> {
  *
  * Only a page that was loaded from the bundle on trial confirms it: while
  * {@link install} reloads the windows one after the other, a window that still
- * shows the previous frontend cannot vouch for the new one.
+ * shows the previous frontend cannot vouch for the new one. Neither can a
+ * webview the plugin saw no page load for.
  *
  * A downloaded bundle that was shown in two runs of the app (`trialAttempts`)
  * without confirming itself is reverted to the last confirmed one (or the

@@ -130,6 +130,31 @@ full list is in
 Permissions apply to calls from the webview. The Rust API is not subject to
 them.
 
+Each permission is for one command, not for what it does: `download-and-install`
+installs without `install` being allowed, so denying `install` alone does not
+keep a webview from switching frontends. A webview that may fetch updates but
+not apply them gets the commands by name instead of `default`:
+
+```json
+{
+  "permissions": [
+    "core:default",
+    "ffp-ota-updater:allow-check",
+    "ffp-ota-updater:allow-download",
+    "ffp-ota-updater:allow-status",
+    "ffp-ota-updater:allow-current-version",
+    "ffp-ota-updater:allow-notify-ready"
+  ]
+}
+```
+
+What it downloads is still applied at the next launch; only `discard` or a
+decision in Rust prevents that.
+
+The options a webview passes to `check` (`headers`, `timeout`, `proxy`)
+replace the builder's for that check. To keep them out of the webview's hands,
+leave out `allow-check` and check from Rust.
+
 ## Fixed limits
 
 | | |

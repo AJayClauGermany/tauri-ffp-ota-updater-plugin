@@ -54,8 +54,9 @@ npm run tauri signer sign -- --app-version 1.2.1 frontend-1.2.1.tar.gz
 ```
 
 This writes `frontend-1.2.1.tar.gz.sig`. The key is the one your `pubkey`
-belongs to, the same pair the updater plugin uses. The signer finds it in
-environment variables:
+belongs to: the pair the updater plugin uses, or
+[one of its own](../explanation/how-it-works.md#security). The signer finds it
+in environment variables:
 
 | Variable | Value |
 | --- | --- |
@@ -165,6 +166,12 @@ tarball:
 ```
 
 Sign each tarball with the same `--app-version`.
+
+Nothing in a signature says which platform a bundle is for, so the app cannot
+tell if an endpoint hands it another platform's: it accepts any bundle signed
+for that version. This layout is for builds that differ in detail, not for
+ones that break on the wrong platform. A device also keeps the first bundle
+it stored under a version.
 
 ## Taking a release back
 

@@ -43,8 +43,8 @@ npm run tauri signer generate -- -w ~/.tauri/ota-tutorial.key
 Press Enter twice when asked for a password. Two files are written: the
 private key `ota-tutorial.key`, and the public key `ota-tutorial.key.pub`.
 
-Open `src-tauri/tauri.conf.json` and replace `REPLACE_WITH_YOUR_PUBLIC_KEY`
-with the content of the `.pub` file (the content, not its path):
+Open `src-tauri/tauri.conf.json` and set `pubkey`, which is empty, to the
+content of the `.pub` file (the content, not its path):
 
 ```bash
 cat ~/.tauri/ota-tutorial.key.pub
