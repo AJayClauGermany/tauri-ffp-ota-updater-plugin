@@ -36,6 +36,10 @@ pub(crate) struct Metadata {
     raw_json: serde_json::Value,
 }
 
+/// Offers of a `check` kept for the webview at a time. An endpoint that announces a different
+/// version to every check does not get to fill the memory.
+const MAX_PENDING: usize = 8;
+
 fn parse(version: &str) -> Result<Version> {
     Ok(Version::parse(version.trim_start_matches('v'))?)
 }
@@ -76,25 +80,25 @@ async fn download_with_events<R: Runtime>(
 pub(crate) async fn check<R: Runtime>(
     app: AppHandle<R>,
     headers: Option<Vec<(String, String)>>,
-    download_headers: Option<Vec<(String, String)>>,
     timeout: Option<u64>,
-    proxy: Option<Url>,
+    // parsed here: a URL that `Url` refuses is the plugin's `invalidUrl`, not an IPC failure
+    proxy: Option<String>,
 ) -> Result<Option<Metadata>> {
-    // no endpoints: where updates come from is not the webview's to decide
+    // No endpoints: where updates come from is not the webview's to decide. What it can set are
+    // the builder's defaults for one check. Neither lets it read a header set in Rust, nor see
+    // inside an `https` request by naming a proxy.
     let mut options = RequestOptions {
         headers: HeaderMap::new(),
-        download_headers: HeaderMap::new(),
         timeout: timeout.map(Duration::from_millis),
-        proxy,
+        proxy: proxy.as_deref().map(Url::parse).transpose()?,
         ..Default::default()
     };
-    for (map, pairs) in [
-        (&mut options.headers, headers),
-        (&mut options.download_headers, download_headers),
-    ] {
-        for (name, value) in pairs.unwrap_or_default() {
-            map.append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?);
-        }
+    for (name, value) in headers.unwrap_or_default() {
+        // `append` panics once a map is full
+        options
+            .headers
+            .try_append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?)
+            .map_err(http::Error::from)?;
     }
 
     let updater = app.ota_updater();
@@ -110,10 +114,20 @@ pub(crate) async fn check<R: Runtime>(
     if let Some(update) = update {
         // Kept until that version is being served, whatever later checks return: the page may
         // still hold the object it got for it.
+        //
+        // By version, not by a handle for each check: a version names one bundle, so two checks
+        // that find the same version found the same update, and `install(version)` has to work
+        // without a check anyway. What can differ between them are the request options, and the
+        // release notes: the latest check for a version decides how it is downloaded.
         let current = updater.current_version();
         let mut pending = updater.pending.lock().unwrap();
         pending.retain(|version, _| updater.store.order.newer(version, &current));
         pending.insert(update.version.clone(), update);
+        while pending.len() > MAX_PENDING
+            && let Some(oldest) = pending.keys().min().cloned()
+        {
+            pending.remove(&oldest);
+        }
     }
     Ok(metadata)
 }

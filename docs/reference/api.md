@@ -15,24 +15,24 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 | Function | Returns | |
 | --- | --- | --- |
 | `check(options?)` | `Promise<Update \| null>` | Asks the endpoints for a release. `null` when there is none, when it is not newer than the frontend being served, when it is not compatible with the binary, or when its version was rejected on this device. |
-| `notifyReady()` | `Promise<void>` | Confirms the frontend being served. Does nothing when there is no trial, or when the calling page was not loaded from the bundle on trial (a window that still shows the previous frontend). |
+| `notifyReady()` | `Promise<void>` | Confirms the frontend being served. Does nothing when there is no trial, or when the calling page was not loaded from the bundle on trial (a window that still shows the previous frontend, or a webview the plugin saw no page load for). |
 | `status()` | `Promise<Status>` | State of the updater. Makes no request. |
 | `currentVersion()` | `Promise<string>` | Version of the frontend being served: the active bundle's, or else the app's. |
-| `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview. Makes no request. Rejects with `cannotServe` under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. |
-| `discard(version)` | `Promise<void>` | Deletes the stored bundle `version`. Does nothing if it is not stored; the version stays available to `check()`. Rejects with `inUse` for the bundle being served and for the confirmed fallback. |
-| `rollback()` | `Promise<void>` | Rejects the bundle being served and reloads into the last confirmed bundle or the built-in frontend. A newer stored bundle that was never shown is kept for the next launch. Does nothing when the built-in frontend is served. Needs `allow-rollback`. |
+| `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview window. Makes no request. Rejects with `cannotServe` under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. A rejection of kind `tauri` means the switch happened but a window could not be reloaded; with any other kind nothing was switched. |
+| `discard(version)` | `Promise<void>` | Deletes the stored bundle `version`. Does nothing if it is not stored; the version stays available to `check()`. Rejects with `inUse` for the bundle being served and for the confirmed fallback. Does not cancel a `download()` of that version that is still running, which stores it again. |
+| `rollback()` | `Promise<void>` | Rejects the bundle being served and reloads into the last confirmed bundle or the built-in frontend. A newer stored bundle that was never shown is kept for the next launch. Does nothing when the built-in frontend is served. Rejects with `io` if the rejection could not be recorded: the app has gone back for this run, but the version is served or offered again after a restart. Needs `allow-rollback`. |
 | `reset()` | `Promise<void>` | Deletes every stored bundle and returns to the built-in frontend, reloading if a bundle was served. Rejected versions stay rejected. Needs `allow-reset`. |
 
 ### `CheckOptions`
 
 | Field | Type | |
 | --- | --- | --- |
-| `headers` | `HeadersInit` | Sent with the manifest request, and with the bundle download if it is on the manifest's origin. Replace builder headers of the same name. |
-| `downloadHeaders` | `HeadersInit` | Sent with the bundle download only, wherever it is. Replace builder download headers of the same name. |
+| `headers` | `HeadersInit` | Sent with the manifest request, and with the bundle download if it is on the endpoint's origin; never to another origin. Replace builder headers of the same name. |
 | `timeout` | `number` (ms) | Deadline for each request. |
-| `proxy` | `string` | Proxy URL for both requests. |
+| `proxy` | `string` | Proxy URL for both requests. `invalidUrl` if it is not a URL. |
 
-Endpoints cannot be set from the webview.
+These replace the builder's settings for one check. Endpoints cannot be set
+from the webview.
 
 ### `Update`
 
@@ -57,6 +57,10 @@ Endpoints cannot be set from the webview.
 | `"Progress"` | `{ chunkLength: number }` |
 | `"Finished"` | none |
 
+`Finished` means the last byte arrived. The bundle is verified and stored
+after that: it is ready when the promise of `download()` resolves, and was
+refused when it rejects.
+
 ### `Status`
 
 | Field | Type | |
@@ -74,7 +78,7 @@ For `invoke("plugin:ffp-ota-updater|<command>", args)`. Errors are
 
 | Command | Arguments | Result |
 | --- | --- | --- |
-| `check` | `headers?: [string, string][]`, `downloadHeaders?: [string, string][]`, `timeout?: number`, `proxy?: string` | update metadata (`currentVersion`, `version`, `downloaded`, `date`, `body`, `rawJson`) or `null` |
+| `check` | `headers?: [string, string][]`, `timeout?: number`, `proxy?: string` | update metadata (`currentVersion`, `version`, `downloaded`, `date`, `body`, `rawJson`) or `null` |
 | `download` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `download_and_install` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `install` | `version: string` | |
@@ -86,7 +90,15 @@ For `invoke("plugin:ffp-ota-updater|<command>", args)`. Errors are
 | `reset` | | |
 
 `download` and `download_and_install` accept only a version that a `check` in
-the same run of the app returned (`noPendingUpdate` otherwise).
+the same run of the app returned (`noPendingUpdate` otherwise). The offers of
+the 8 newest versions are kept. An offer is kept by version, since
+[a version is one bundle](../explanation/how-it-works.md#a-version-is-one-bundle):
+if several checks return the same version, for instance from two windows, the
+latest of them decides the options (`headers`, `timeout`, `proxy`) and the
+URL that version is downloaded with.
+
+`download_and_install` installs as well, whether or not `install` is allowed:
+see [Permissions](configuration.md#permissions).
 
 ## Rust
 
@@ -107,14 +119,14 @@ the same run of the app returned (`noPendingUpdate` otherwise).
 | `check_with(RequestOptions)` | `Result<Option<Update<R>>>` (async) | With other endpoints, headers, timeout or proxy. |
 | `current_version()` | `Version` | |
 | `status()` | `Status` | Fields as in JavaScript, in snake case, as `Version`. |
-| `stage(archive: &[u8], signature: &str, version: &Version)` | `Result<()>` | Verifies and stores a bundle obtained by other means. Same checks as a download. `NotNewer` for a version that is not newer than the one being served (other than that very version). |
+| `stage(archive: &[u8], signature: &str, version: &Version)` | `Result<()>` | Verifies and stores a bundle obtained by other means. Same checks as a download. `NotNewer` for a version that is not newer than the one being served (other than that very version). `InUse` for other contents than those stored under that version. |
 | `activate(&Version)` | `Result<()>` | Serves the stored bundle from now on, without touching the webviews. `CannotServe` under `tauri dev` or without `wrap_assets`. |
-| `install(&Version)` | `Result<()>` | `activate`, then `reload`. |
+| `install(&Version)` | `Result<()>` | `activate`, then `reload`. `Error::Tauri` is a failed reload after the switch. |
 | `discard(&Version)` | `Result<()>` | |
 | `notify_ready()` | `Result<()>` | Confirms whatever is being served, unlike the JavaScript `notifyReady()`, which only counts from a page of the bundle on trial. |
 | `rollback()` | `Result<()>` | As the JavaScript `rollback()`. |
 | `reset()` | `Result<()>` | |
-| `reload()` | `Result<()>` | Reloads every webview window. |
+| `reload()` | `Result<()>` | Reloads every webview window. All are tried; the first error is returned. Webviews that share a window (Tauri's `unstable` feature) are not included: reload those with `Webview::reload`. |
 
 ### `Update`
 
@@ -155,8 +167,8 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 
 | `kind` | Rust variant | When |
 | --- | --- | --- |
-| `network` | `Reqwest` | No endpoint or download host could be reached, a timeout, a non-success status for the bundle. |
-| `releaseNotFound` | `ReleaseNotFound` | An endpoint answered, but none with a usable manifest. |
+| `network` | `Reqwest`, `TooManyRedirects` | No endpoint or download host could be reached, a timeout, a non-success status for the bundle, more than 10 redirects. |
+| `releaseNotFound` | `ReleaseNotFound` | An endpoint answered, but none with a usable manifest. That includes a manifest over 1 MiB; the message has the reason. |
 | `emptyEndpoints` | `EmptyEndpoints` | No endpoints are configured. |
 | `emptyPubkey` | `EmptyPubkey` | No public key is configured. |
 | `cannotServe` | `CannotServe` | `install`/`activate` while bundles cannot be served: under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. |
@@ -165,19 +177,19 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 | `missingSignedVersion` | `MissingSignedVersion` | `requireSignedVersion` is on and the signature records no version. |
 | `signedVersionMismatch` | `SignedVersionMismatch` | Signed for another version than the one announced. |
 | `invalidBundle` | `InvalidBundle` | The archive is not a usable frontend bundle. |
-| `tooLarge` | `TooLarge` | A manifest or bundle exceeds its size limit. |
+| `tooLarge` | `TooLarge` | A bundle, or what it unpacks to, exceeds its size limit. |
 | `incompatible` | `Incompatible` | The version is not a frontend update for this binary. |
 | `rejected` | `Rejected` | The version failed a trial or was rolled back before. |
 | `noPendingUpdate` | `NoPendingUpdate` | `download` for a version `check` did not return. |
 | `notDownloaded` | `NotDownloaded` | `install` for a version that is not stored. |
 | `notNewer` | `NotNewer` | The version is not newer than the frontend being served. |
-| `inUse` | `InUse` | `discard` of the bundle being served or of the confirmed fallback, or `stage` of different contents under the version that is confirmed or on trial. |
+| `inUse` | `InUse` | `discard` of the bundle being served or of the confirmed fallback; `download` or `stage` of other contents than those stored under that version, or of a version that differs from a stored one only in letter case. |
 | `invalidHeader` | `InvalidHeaderName`, `InvalidHeaderValue`, `Http` | |
 | `invalidUrl` | `UrlParse` | |
 | `invalidVersion` | `Semver` | |
-| `io` | `Io` | |
+| `io` | `Io` | A file of the store could not be read or written. From `rollback()`: the rejection was not recorded. While the store's state cannot be read, the built-in frontend is served and bundles are neither accepted nor installed. |
 | `json` | `Json` | |
-| `tauri` | `Tauri` | |
+| `tauri` | `Tauri` | From `install()`, `rollback()` and `reset()`: a window could not be reloaded, after the switch. |
 | `unknown` | none | JavaScript only: the rejection did not come from the plugin (a denied permission, a plugin that is not registered). |
 
 New kinds may be added in minor releases.

@@ -32,18 +32,25 @@ and a local server, start to finish.
 ```toml
 # src-tauri/Cargo.toml
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin" }
+tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", tag = "v1.0.0" }
 ```
 
 ```bash
-npm install github:AJayClauGermany/tauri-ffp-ota-updater-plugin
+npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#v1.0.0"
 ```
 
 > The crate and the npm package (`tauri-plugin-ffp-ota-updater-api`) are not
 > on crates.io / npm yet, so both are installed from git; the JS package is
-> built on your machine while it installs. `tauri add` does not know this
-> plugin. Without a bundler, call the commands through `invoke` as
-> [`examples/tauri-app`](examples/tauri-app/src/main.js) does.
+> built on your machine while it installs. Give both the same release tag:
+> the two halves talk to each other and have to match, and without a tag each
+> follows the branch on its own.
+> `tauri add` does not know this plugin. Without a bundler, call the commands
+> through `invoke` as [`examples/tauri-app`](examples/tauri-app/src/main.js)
+> does.
+>
+> `serde_json` has to be a dependency of your app as well. Tauri's templates
+> add it; with a `plugins` block in `tauri.conf.json`, the code that
+> `generate_context!` produces refers to it.
 
 ### 2. Register
 
@@ -81,8 +88,9 @@ frontend before the first window is created.
 }
 ```
 
-The key pair is the updater's: reuse the `pubkey` you already have, or create
-one with `npm run tauri signer generate -- -w ~/.tauri/myapp.key`.
+The key pair can be the updater's: reuse the `pubkey` you already have, or
+create one with `npm run tauri signer generate -- -w ~/.tauri/myapp.key`.
+[When a pair of its own is worth it](docs/explanation/how-it-works.md#security).
 
 Grant the permission in `src-tauri/capabilities/default.json`:
 

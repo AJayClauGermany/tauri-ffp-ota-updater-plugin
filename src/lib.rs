@@ -80,8 +80,8 @@ impl Builder {
     }
 
     /// Adds a header sent with every manifest request, and with bundle downloads from the
-    /// manifest's origin (see [`RequestOptions::headers`]). A header of the same name given to
-    /// a single check replaces it.
+    /// endpoint's origin; never to another origin (see [`RequestOptions::headers`]). A header
+    /// of the same name given to a single check replaces it.
     pub fn header<K, V>(mut self, key: K, value: V) -> Result<Self>
     where
         HeaderName: TryFrom<K>,
@@ -99,29 +99,6 @@ impl Builder {
     /// Replaces the headers set with [`Self::header`].
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         self.client.headers = headers;
-        self
-    }
-
-    /// Adds a header sent with every bundle download, wherever the manifest says the bundle is
-    /// (see [`RequestOptions::download_headers`]). A header of the same name given to a single
-    /// check replaces it.
-    pub fn download_header<K, V>(mut self, key: K, value: V) -> Result<Self>
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
-        HeaderValue: TryFrom<V>,
-        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
-    {
-        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
-        let value: std::result::Result<HeaderValue, http::Error> =
-            value.try_into().map_err(Into::into);
-        self.client.download_headers.insert(key?, value?);
-        Ok(self)
-    }
-
-    /// Replaces the headers set with [`Self::download_header`].
-    pub fn download_headers(mut self, headers: HeaderMap) -> Self {
-        self.client.download_headers = headers;
         self
     }
 
@@ -146,7 +123,9 @@ impl Builder {
 
     /// Adjusts the HTTP client used for the manifest and the bundle, for example to trust a
     /// private certificate authority. Runs last, so it can override what the plugin and its
-    /// configuration set up, including the `https`-only rule.
+    /// configuration set up, including the `https`-only rule. The exception is how redirects
+    /// are handled: the plugin follows them itself, to keep headers on their origin, so a
+    /// redirect policy or `Referer` setting given here has no effect.
     pub fn configure_client(
         mut self,
         configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,
@@ -208,7 +187,7 @@ impl Builder {
                     },
                     rollback: config.rollback,
                     trial_attempts: config.trial_attempts,
-                    shown: Mutex::new(None),
+                    shown: Default::default(),
                     binary: binary_version.clone(),
                     compatibility: self
                         .compatibility
@@ -259,7 +238,8 @@ impl Builder {
                 // what the first page load gets. When none can be served, the store is left as
                 // it is for a run of the app that can.
                 if updater.cannot_serve.is_none() && !updater.config.pubkey.trim().is_empty() {
-                    updater.serve(updater.store.select(None));
+                    // whether the choice could be recorded only matters for a rollback
+                    updater.serve(updater.store.select(None).0);
                 } else {
                     updater.serve(None);
                 }

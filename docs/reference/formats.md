@@ -48,6 +48,7 @@ A gzip-compressed tar archive of the frontend build output
 | Entry types | Regular files and directories. Links and special files are refused. A leading global pax header (`git archive`) is skipped. |
 | Duplicates | The same file twice is refused. |
 | Size | Archive at most `maxBundleSize`; files in total at most `maxUnpackedSize`; at most 20 000 entries. |
+| End | The gzip stream is read to its end and has to be sound, checksum included. What follows the end of the tar archive in it (padding) is ignored. |
 
 A bundle that breaks a rule is refused as a whole (`invalidBundle` or
 `tooLarge`).
@@ -76,6 +77,11 @@ timestamp:1795239006	file:frontend-1.2.1.tar.gz	version:1.2.1
 The field is written by `tauri signer sign --app-version <version>` (Tauri CLI
 2.12 or newer). The file name in the comment is not checked.
 
+The signature says who signed which bytes for which version, and nothing
+else: not for which app, channel or platform. Every app with that public key
+accepts the bundle wherever it comes from. See
+[Security](../explanation/how-it-works.md#security).
+
 ## Store
 
 Directory `ffp-ota-updater/` in the app's local data directory
@@ -83,9 +89,9 @@ Directory `ffp-ota-updater/` in the app's local data directory
 
 | File | |
 | --- | --- |
-| `<version>.tar.gz` | A bundle exactly as downloaded. |
+| `<version>.tar.gz` | A bundle exactly as downloaded. Never replaced by other contents; see below. |
 | `<version>.tar.gz.sig` | The `signature` it was announced with. |
-| `state.json` | `confirmed` (version or null), `trial` (version or null), `attempts` (number), `rejected` (versions). |
+| `state.json` | `confirmed` (version or null), `trial` (version or null), `attempts` (number), `rejected` (versions). Fields a version of the plugin does not know are ignored. |
 | `*.part` | A write in progress. Removed at the next launch if left behind. |
 | `.lock` | Locked by the process that is changing the store. |
 
@@ -98,12 +104,32 @@ rejected and valid is served. Bundles that are incompatible, rejected, invalid
 or not newer than the one served (except the confirmed fallback) are deleted.
 A bundle that cannot be read for now (an I/O error) is skipped and kept.
 
+A version is stored once. Other contents for a stored version are refused
+(`inUse`) until it is discarded or deleted at a launch, with one exception: a
+stored archive that fails verification is replaced. Versions that differ only
+in letter case (`1.2.1-RC`, `1.2.1-rc`) would be one file on Windows and
+macOS, so the second is refused on every platform.
+
+`state.json` is what the plugin goes by:
+
+| `state.json` | At launch | Afterwards |
+| --- | --- | --- |
+| missing | A new store: nothing confirmed, on trial or rejected. | |
+| cannot be read (permissions, an I/O error) | The built-in frontend is served. Nothing is deleted or written. | Whatever needs the record (accepting, installing or discarding a bundle, a `check()` that finds a release) fails with `io` until it can be read. |
+| not valid JSON | Its content is lost. It is written anew; the stored bundles are kept, verified as always, and the newest goes on trial. | |
+
+A version is recorded as rejected before its bundle is deleted. If that
+cannot be written, nothing is deleted, and `rollback()` fails after having
+switched back.
+
 Newest is by semantic versioning precedence, which ignores build metadata,
 unless `compareBuildMetadata` is set. A version that is rejected rejects every
 version that counts as the same.
 
 Processes of the same app take turns: each locks `.lock` while it changes the
 store. Where the file system cannot lock files, the store is used unlocked.
+The lock is held for one operation, not for a trial: see
+[Limitations](../explanation/how-it-works.md#limitations).
 
 ## Stability
 

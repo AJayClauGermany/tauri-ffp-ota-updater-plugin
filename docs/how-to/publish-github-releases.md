@@ -61,6 +61,10 @@ it is never "latest", and its URL does not depend on what is.
    | `TAURI_SIGNING_PRIVATE_KEY` | the **content** of the private key file, not a path |
    | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password; omit if there is none |
 
+   To keep the key that signs installers out of this workflow, give frontend
+   updates [a key pair of their own](../explanation/how-it-works.md#security)
+   and store it under other secret names.
+
 3. Set the `endpoints` URL above in `tauri.conf.json` and ship that in a full
    release. Only apps that contain the plugin and the endpoint can receive
    frontend updates.
@@ -80,18 +84,20 @@ on:
         description: "Frontend version: a new patch of the released app, e.g. 1.2.1"
         required: true
 
+# One publish at a time, in the order they were started.
+concurrency:
+  group: frontend-update
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
+  # Runs the project's own code and that of its dependencies: no secrets here.
+  build:
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ inputs.version }}
-      BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/ota
-      GH_TOKEN: ${{ github.token }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -99,12 +105,46 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run build
-
-      - name: Package and sign
+      - name: Package
         run: |
           grep -rq notify_ready dist
           tar -czf "frontend-$VERSION.tar.gz" -C dist .
-          npx tauri signer sign --app-version "$VERSION" "frontend-$VERSION.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend
+          path: frontend-*.tar.gz
+          if-no-files-found: error
+
+  # Holds the signing key and may write to the release. Runs nothing from the
+  # repository: it only signs and uploads what the build produced.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/ota
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend
+
+      - name: Refuse a version that is not newer than the published one
+        run: |
+          PUBLISHED=$(curl -fsSL "$BASE_URL/ota.json" | jq -r .version || true)
+          if [ -n "$PUBLISHED" ]; then
+            npx --yes semver@7 --range ">$PUBLISHED" "$VERSION"
+          fi
+
+      - name: Sign
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          npx --yes @tauri-apps/cli@2 signer sign --app-version "$VERSION" "frontend-$VERSION.tar.gz"
           jq -n --arg v "$VERSION" --arg u "$BASE_URL/frontend-$VERSION.tar.gz" \
             --rawfile s "frontend-$VERSION.tar.gz.sig" \
             '{version: $v, url: $u, signature: $s}' > ota.json
@@ -115,8 +155,26 @@ jobs:
           gh release upload ota ota.json --clobber
 ```
 
-The tarball is uploaded without `--clobber` on purpose: publishing a version
-twice fails instead of replacing a file that devices may already have stored.
+Three things in it are deliberate:
+
+- **Two jobs.** `npm ci` and `npm run build` run install and build scripts of
+  every dependency. In a job that also holds the signing key, any of them
+  could read it, or replace the `tauri` binary that is about to be handed it.
+  The `build` job therefore has no secrets and a read-only token; the
+  `publish` job has both and runs no code from the repository. It gets the
+  Tauri CLI from npm instead of from `node_modules`; replace `@2` with the
+  exact version your project uses. For an approval step before signing, put
+  the secrets in a GitHub
+  [environment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)
+  with required reviewers and name it in the `publish` job.
+- **One run at a time, never backwards.** `ota.json` is one file that every
+  publish overwrites. Without the `concurrency` group, two runs could finish
+  in the other order than they were started, and the older release would be
+  the one left published. The version check stops a run for an older version
+  that is started later.
+- **No `--clobber` for the tarball.** Publishing a version twice fails instead
+  of replacing a file that devices may already have stored, which they would
+  [not accept anyway](../explanation/how-it-works.md#a-version-is-one-bundle).
 
 ## Publishing
 

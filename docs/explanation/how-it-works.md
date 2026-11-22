@@ -148,6 +148,18 @@ Details that matter in practice:
   windows one after the other, a window still showing the previous frontend
   cannot vouch for the new one. `notify_ready()` in Rust is not subject to
   this: from Rust it confirms whatever is being served.
+
+  The plugin knows where a page is from by what was being served when its
+  navigation started; Tauri does not say which window an asset is requested
+  by. A switch made with `activate()` at the very moment a window navigates
+  can therefore be attributed to the wrong side of it. `install()` reloads
+  every window right after switching, which settles it.
+- **The trial covers what happens from the first page on.** Before that, the
+  bundle is verified, unpacked and, with a CSP, parsed. A bundle that is
+  validly signed and within the size limits but takes the process down in
+  that step would do so at every launch, uncounted. `maxBundleSize` and
+  `maxUnpackedSize` are the guard against that; set them to what your frontend
+  needs rather than leaving them at the defaults.
 - **A good bundle can be rejected** if the app is closed between showing it
   and its `notifyReady()` call in `trialAttempts` runs in a row. The device
   then stays on the previous frontend until the next version is published.
@@ -162,11 +174,26 @@ the previous build again under a new, higher version.
 
 Everything the plugin records (confirmed, on trial, rejected, stored, pending
 download) goes by version, so a version has to name exactly one archive,
-across every channel and endpoint. Publish a rebuild, even an identical one,
-under a new version. The plugin enforces this where breaking it would do harm:
-different contents under the version that is confirmed or on trial are refused
-with `inUse` rather than inheriting its state. A bundle that is stored but was
-never shown can still be replaced; it has no state yet.
+across every channel, endpoint and platform. Publish a rebuild, even an
+identical one, under a new version.
+
+The plugin holds a device to this from the moment a bundle is stored: other
+contents under that version are refused with `inUse`. That includes a bundle
+no page was loaded from yet. It may already be in memory, about to be shown
+and confirmed, and whatever replaced it on disk would start the next launch
+as confirmed without ever having run. To replace a bundle that was never
+shown, `discard()` it first. The refusal is logged as a warning that says
+what happened, since it means a release was published twice.
+
+The plugin cannot stop a version from being published twice; it can only keep
+each device on the first one it stored. A rebuild that must keep its version
+number can carry a build number instead (`1.2.1+2`), which is a version of
+its own. Devices take it as an update only with `compareBuildMetadata`, see
+[Versions](#versions).
+
+The same goes for what a webview holds after `check()`: the `Update` object
+stands for a version, not for one particular answer of the endpoint. If two
+checks return the same version, the later one decides how it is downloaded.
 
 ## Security
 
@@ -186,10 +213,12 @@ Other measures:
 
 - `https` is required for endpoints, bundle URLs and redirects.
 - Headers given for the manifest request (an `Authorization` token, say) are
-  only sent with the download when it is on the manifest's origin. Otherwise
-  whoever can edit the unsigned manifest could point the download at their own
-  server and collect the token before the signature check fails.
-  `downloadHeaders` are for a download host elsewhere.
+  only ever sent to the origin of the endpoint: with the download when it is
+  there, and not along a redirect that leaves it. Otherwise whoever can edit
+  the unsigned manifest could point the download at their own server and
+  collect the token before the signature check fails. For the same reason
+  there is no option that sends headers wherever the manifest points, and a
+  redirect does not tell the next host which URL it came from.
 - The webview cannot choose endpoints or keys; only Rust can.
 - Archives are held to an unambiguous subset of tar: no links, no paths that
   climb out, no duplicate entries, and limits on size and entry count. What
@@ -197,9 +226,26 @@ Other measures:
 - `rollback()` and `reset()`, which discard a frontend, are not in the default
   permission set.
 
-What this does not cover: whoever holds the private key can ship any frontend
-to every user. Protect it as you protect the updater's key; it is the same
-one.
+What this does not cover:
+
+- Whoever holds the private key can ship any frontend to every user. Protect
+  it as you protect the updater's key.
+- The signature says who signed which bytes for which version. It does not
+  say for which app, channel or platform. Every app that has the public key
+  accepts the bundle, from any endpoint. Use one key pair per app, and do not
+  rely on the endpoint to keep a bundle for one platform or channel away from
+  another: if that would do harm, give them different versions, or build one
+  frontend that runs everywhere.
+- For the same reason, an app that shares its key pair with the updater plugin
+  has two plugins that accept whatever that key signed. Reusing the pair is
+  the simple setup and what the guides here assume. A pair of its own for
+  frontend updates keeps the two apart: the pipeline that publishes frontends
+  then never holds the key that signs installers, and a frontend bundle is of
+  no use to anyone who can tamper with the updater's manifest.
+- The files of the store are not secret and not protected from the user or
+  other programs on the device. Tampering with a bundle is caught by its
+  signature; deleting or damaging `state.json` loses the record of what was
+  confirmed and rejected.
 
 ## Limitations
 
@@ -214,6 +260,19 @@ one.
 - **Rollback timing** and **false rejections**: see
   [Trial and rollback](#trial-and-rollback).
 - **Several instances**: processes of the same app take turns on the store
-  (it is locked while changed), but each counts its own runs for a trial.
+  (it is locked while changed), but each counts its own run as an attempt of a
+  trial. If more instances than `trialAttempts` are started before the first
+  of them has called `notifyReady()`, a working bundle is rejected, and an
+  instance that already runs it keeps doing so until it exits. The device is
+  then on the previous frontend until the next version. Apps whose users start
+  them several times at once should use
+  [`tauri-plugin-single-instance`](https://v2.tauri.app/plugin/single-instance/)
+  or raise `trialAttempts`.
+- **Windows with several webviews** (Tauri's `unstable` feature): `install()`,
+  `rollback()` and `reset()` reload each window's own webview, not webviews
+  added to a window. Reload those from Rust.
+- **Overlapping calls**: `discard()` and `reset()` do not cancel a download
+  that is still running; when it completes, its bundle is stored. Wait for the
+  download before discarding.
 - **Memory**: the active bundle is held unpacked in memory.
 - **Desktop only.**

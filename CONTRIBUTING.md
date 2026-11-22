@@ -40,9 +40,11 @@ npm install
 npm run dev
 ```
 
-`tauri dev` loads the frontend from disk, so a downloaded bundle is never
-shown there. To see an update applied, follow the
-[tutorial](docs/tutorial.md), which uses a release build of the example.
+The example has no `pubkey`, so it starts as it is and `check()` fails with
+`emptyPubkey`; the [tutorial](docs/tutorial.md) adds one. `tauri dev` loads
+the frontend from disk, so a downloaded bundle is never shown there. To see an
+update applied, follow the tutorial, which uses a release build of the
+example.
 
 ## Adding a command
 

@@ -6,7 +6,8 @@ for releases that change the binary, this plugin for releases that only change
 the frontend.
 
 The two plugins are independent. Each has its own configuration block, its own
-manifest and its own permission; they share the signing key.
+manifest and its own permission. They can share the signing key, which is
+what this page assumes, or [each have one](../explanation/how-it-works.md#security).
 
 - [If you know the updater plugin](#if-you-know-the-updater-plugin): what looks
   the same but is not
@@ -84,8 +85,8 @@ resolves to `null`, exactly as if there were no update.
 | | Updater plugin | This plugin |
 | --- | --- | --- |
 | JS `Update` | a resource: `close()` it; `install()` only on the object that downloaded | plain object; `install(version)` also works in a later run, offline |
-| JS `check()` options | `headers`, `timeout`, `proxy`, `target` | `headers`, `downloadHeaders`, `timeout`, `proxy` |
-| Headers on the download | all of them, wherever the manifest points | `headers` only to the manifest's origin; `downloadHeaders` anywhere |
+| JS `check()` options | `headers`, `timeout`, `proxy`, `target` | `headers`, `timeout`, `proxy` |
+| Headers on the download | all of them, wherever the manifest points | only to the endpoint's origin, redirects included |
 | JS errors | strings | `OtaUpdateError` with a `kind` to branch on |
 | Rust entry point | `app.updater()?`, `app.updater_builder()` | `app.ota_updater()`; per-check options with `check_with(RequestOptions)` |
 | Rust download | `download()` returns the bytes, `install(bytes)` | `download()` stores the bundle, `install()` takes no bytes |

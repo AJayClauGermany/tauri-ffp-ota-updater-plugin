@@ -5,7 +5,10 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::ACCEPT};
+use http::{
+    HeaderMap, HeaderName, HeaderValue, StatusCode,
+    header::{ACCEPT, LOCATION},
+};
 use percent_encoding::{AsciiSet, CONTROLS};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -25,6 +28,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Longest wait for a connection, and for more data once connected.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redirects followed for one request before it is given up on.
+const MAX_REDIRECTS: usize = 10;
 
 /// The release manifest an endpoint responds with.
 ///
@@ -67,19 +72,19 @@ pub struct RequestOptions {
     /// Manifest URLs to query instead of the configured ones, in order. This is how an app
     /// switches release channels while it is running.
     pub endpoints: Option<Vec<Url>>,
-    /// Extra headers sent with the manifest request, and with the bundle download if the bundle
-    /// is on the same origin (scheme, host and port) as the manifest.
+    /// Extra headers for the manifest request and the bundle download. They are only ever sent
+    /// to the origin (scheme, host and port) of the endpoint that is being asked: not to a
+    /// bundle on another origin, and not along a redirect that leaves it.
     ///
-    /// They are not sent to another origin because the manifest is not signed: whoever can
-    /// change it could point the download at their own server and collect an `Authorization`
-    /// header before the signature check rejects what they serve.
+    /// The manifest is not signed, so whoever can change it could otherwise point the download
+    /// at their own server and collect an `Authorization` header before the signature check
+    /// rejects what they serve. There is deliberately no way to send headers to wherever the
+    /// manifest points: an app whose bundles need credentials on another origin fetches them
+    /// itself and hands them to [`OtaUpdater::stage`].
     pub headers: HeaderMap,
-    /// Extra headers sent with the bundle download only, wherever the manifest says the bundle
-    /// is. For a download host that needs credentials of its own, or the manifest's, on
-    /// another origin; only add what that host may see.
-    pub download_headers: HeaderMap,
-    /// Timeout applied to each request. Defaults to 30 seconds for the manifest and 30 minutes
-    /// for the bundle; a connection that stalls for 30 seconds is given up on either way.
+    /// Timeout applied to each request, and to each request a redirect leads to. Defaults to
+    /// 30 seconds for the manifest and 30 minutes for the bundle; a connection that stalls for
+    /// 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
     /// Proxy for the manifest request and the bundle download.
     pub proxy: Option<Url>,
@@ -111,21 +116,6 @@ impl RequestOptions {
         Ok(self)
     }
 
-    /// Adds a header to [`Self::download_headers`], replacing one of the same name.
-    pub fn download_header<K, V>(mut self, key: K, value: V) -> Result<Self>
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
-        HeaderValue: TryFrom<V>,
-        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
-    {
-        let key: std::result::Result<HeaderName, http::Error> = key.try_into().map_err(Into::into);
-        let value: std::result::Result<HeaderValue, http::Error> =
-            value.try_into().map_err(Into::into);
-        self.download_headers.insert(key?, value?);
-        Ok(self)
-    }
-
     /// Sets [`Self::timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -143,7 +133,6 @@ impl RequestOptions {
 #[derive(Default)]
 pub(crate) struct ClientOptions {
     pub headers: HeaderMap,
-    pub download_headers: HeaderMap,
     pub timeout: Option<Duration>,
     pub proxy: Option<Url>,
     pub no_proxy: bool,
@@ -199,8 +188,12 @@ pub struct OtaUpdater<R: Runtime> {
 
 /// Whether a page whose recorded origin is `shown` (see [`OtaUpdater::documents`]; `None` when
 /// nothing was recorded) may confirm the bundle `serving`.
+///
+/// A webview no page load was seen for cannot: nothing says its page is the new frontend. Tauri
+/// reports every navigation of every webview to the plugin, so this only leaves out pages
+/// that were loaded before the plugin was there to pick a bundle.
 pub(crate) fn may_confirm(shown: Option<&Option<Version>>, serving: &Version) -> bool {
-    shown.is_none_or(|shown| shown.as_ref() == Some(serving))
+    shown.is_some_and(|shown| shown.as_ref() == Some(serving))
 }
 
 /// Whether `url` is a page of the app's own frontend: `tauri://localhost` or, on Windows,
@@ -273,18 +266,10 @@ impl<R: Runtime> OtaUpdater<R> {
 
         // what the download of the release found here is made with, too
         options.headers = merge_headers(&self.client.headers, std::mem::take(&mut options.headers));
-        options.download_headers = merge_headers(
-            &self.client.download_headers,
-            std::mem::take(&mut options.download_headers),
-        );
         options.timeout = options.timeout.or(self.client.timeout);
         options.proxy = options.proxy.or_else(|| self.client.proxy.clone());
 
         let current_version = self.current_version();
-        let mut headers = options.headers.clone();
-        headers
-            .entry(ACCEPT)
-            .or_insert(HeaderValue::from_static("application/json"));
         let client = self.client(
             options.timeout.unwrap_or(CHECK_TIMEOUT),
             options.proxy.as_ref(),
@@ -298,19 +283,21 @@ impl<R: Runtime> OtaUpdater<R> {
         for endpoint in endpoints {
             let url = self.resolve_endpoint(endpoint, &current_version)?;
             log::debug!("checking for frontend updates at {url}");
-            let response = match client
-                .get(url.clone())
-                .headers(headers.clone())
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    last_error = error.to_string();
-                    unreachable = Some(error);
-                    continue;
-                }
-            };
+            let response =
+                match get(&client, &url, &url, &options.headers, "application/json").await {
+                    Ok(response) => response,
+                    Err(Error::Reqwest(error)) => {
+                        last_error = error.to_string();
+                        unreachable = Some(error);
+                        continue;
+                    }
+                    Err(error) => {
+                        // a redirect that leads nowhere: the endpoint did answer
+                        responded = true;
+                        last_error = error.to_string();
+                        continue;
+                    }
+                };
             responded = true;
             if response.status() == StatusCode::NO_CONTENT {
                 return Ok(None);
@@ -346,7 +333,7 @@ impl<R: Runtime> OtaUpdater<R> {
 
         if !self.store.order.newer(&release.version, &current_version)
             || !self.store.compatible(&release.version)
-            || self.store.is_rejected(&release.version)
+            || self.store.is_rejected(&release.version)?
         {
             return Ok(None);
         }
@@ -377,9 +364,10 @@ impl<R: Runtime> OtaUpdater<R> {
     /// The bundle is then staged like a downloaded one: served from the next launch on, or at
     /// once with [`Self::install`].
     ///
-    /// A version names one bundle: staging different contents under the version that is
-    /// confirmed or on trial fails with [`Error::InUse`]. Staging the same contents again
-    /// does nothing.
+    /// A version names one bundle: staging different contents under a version that is already
+    /// stored fails with [`Error::InUse`], as does a version that differs from a stored one
+    /// only in letter case. Staging the same contents again does nothing. To replace a bundle
+    /// that was never shown, [`Self::discard`] it first.
     pub fn stage(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
         self.ensure_pubkey()?;
         self.ensure_not_older(version)?;
@@ -430,6 +418,10 @@ impl<R: Runtime> OtaUpdater<R> {
     }
 
     /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    ///
+    /// An [`Error::Tauri`] is a webview that could not be reloaded: the switch has happened
+    /// ([`Self::current_version`] is `version`), and that webview shows the previous frontend
+    /// until it is reloaded or recreated. Any other error means nothing was switched.
     pub fn install(&self, version: &Version) -> Result<()> {
         self.activate(version)?;
         self.reload()
@@ -439,7 +431,12 @@ impl<R: Runtime> OtaUpdater<R> {
     /// update the user declined or the app decided to skip. The version is not rejected and
     /// can be downloaded again. Fails with [`Error::InUse`] for the bundle being served and
     /// for the confirmed one kept as the fallback; does nothing if the version is not stored.
+    ///
+    /// A download of that version that is still running is not cancelled, and stores the
+    /// bundle again when it completes: wait for it first. The same goes for [`Self::reset`].
     pub fn discard(&self, version: &Version) -> Result<()> {
+        // what is being served must not change between looking and deleting
+        let _switching = self.switching();
         let serving = assets::active().map(|bundle| bundle.version.clone());
         self.store.discard(version, serving.as_ref())
     }
@@ -481,6 +478,14 @@ impl<R: Runtime> OtaUpdater<R> {
     }
 
     /// Records which frontend a page that starts loading in the webview `label` comes from.
+    ///
+    /// This is the frontend being served when the navigation is reported, which is the one the
+    /// page is loaded from unless a switch falls between that report and the request for the
+    /// page. Tauri does not say which webview an asset is requested by, so the two cannot be
+    /// tied together more closely. The switch would have to be an [`OtaUpdater::activate`]
+    /// landing in the middle of a navigation, and for the wrong page to confirm anything, the
+    /// trial has to have begun in another window as well. `install` reloads every webview
+    /// right after switching, which records them all anew.
     pub(crate) fn record_document(&self, label: &str, url: &Url) {
         let version = is_app_url(url)
             .then(assets::active)
@@ -496,17 +501,23 @@ impl<R: Runtime> OtaUpdater<R> {
     /// frontend: its version is rejected, the app switches to the last confirmed bundle or the
     /// built-in frontend and the webviews are reloaded. A newer bundle that is stored but was
     /// never shown is kept, and is tried at the next launch.
+    ///
+    /// Fails if the rejection could not be recorded, in which case the version would be served
+    /// or offered again after a restart, or if a webview could not be reloaded. This run of the
+    /// app has gone back all the same.
     pub fn rollback(&self) -> Result<()> {
-        let rolled_back = {
+        let recorded = {
             let _switching = self.switching();
-            assets::active()
-                .map(|bundle| self.serve(self.store.select(Some(&bundle.version))))
-                .is_some()
+            assets::active().map(|bundle| {
+                let (fallback, recorded) = self.store.select(Some(&bundle.version));
+                self.serve(fallback);
+                recorded
+            })
         };
-        if rolled_back {
-            self.reload()?;
+        match recorded {
+            Some(recorded) => recorded.and(self.reload()),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Makes `bundle` (or the built-in frontend) what is served from now on. Called with
@@ -516,6 +527,13 @@ impl<R: Runtime> OtaUpdater<R> {
     /// here: an app that is closed before it showed the bundle has learned nothing about it.
     /// With `readyTimeout` set, the bundle is rolled back if it is still unconfirmed that long
     /// after that page load.
+    ///
+    /// What happens before that page load is therefore not covered by the trial: verifying and
+    /// unpacking the bundle, and preparing it for the CSP below. A bundle that is validly
+    /// signed and within `maxBundleSize` and `maxUnpackedSize`, yet takes the process down
+    /// there, would do so at every launch. Those limits are the guard against that. Counting
+    /// an interrupted preparation as an attempt is possible later without changing the store's
+    /// format (`state.json` ignores fields it does not know).
     pub(crate) fn serve(&self, bundle: Option<Bundle>) {
         let bundle = bundle
             .filter(|_| self.cannot_serve.is_none())
@@ -534,20 +552,23 @@ impl<R: Runtime> OtaUpdater<R> {
                 let Some(updater) = app.try_state::<OtaUpdater<R>>() else {
                     return;
                 };
-                {
+                let trial = {
                     let _switching = updater.switching();
                     if assets::active().is_none_or(|active| active.version != version) {
                         // switched away from in the meantime
                         return;
                     }
-                    if let Err(error) = updater.store.begin_trial(&version) {
-                        // a trial that is not on record could not be rolled back
-                        log::warn!("not serving frontend bundle {version}: {error}");
-                        updater.serve(updater.store.fallback());
-                        return;
+                    match updater.store.begin_trial(&version) {
+                        Ok(trial) => trial,
+                        Err(error) => {
+                            // a trial that is not on record could not be rolled back
+                            log::warn!("not serving frontend bundle {version}: {error}");
+                            updater.serve(updater.store.fallback());
+                            return;
+                        }
                     }
-                }
-                let Some(timeout) = timeout else {
+                };
+                let (Some(trial), Some(timeout)) = (trial, timeout) else {
                     return;
                 };
                 std::thread::spawn(move || {
@@ -561,9 +582,17 @@ impl<R: Runtime> OtaUpdater<R> {
                         // means it was switched away from
                         assets::active()
                             .is_some_and(|active| active.version == version)
-                            .then(|| updater.store.fail_trial(&version))
+                            // not a later trial of the same version, after a reset
+                            .then(|| updater.store.fail_trial(&version, trial))
                             .flatten()
-                            .map(|fallback| updater.serve(fallback))
+                            .map(|(fallback, recorded)| {
+                                updater.serve(fallback);
+                                if let Err(error) = recorded {
+                                    log::error!(
+                                        "frontend bundle {version} may be served again after a restart: {error}"
+                                    );
+                                }
+                            })
                             .is_some()
                     };
                     if rolled_back {
@@ -601,14 +630,24 @@ impl<R: Runtime> OtaUpdater<R> {
         cleared
     }
 
-    /// Reloads every webview, which makes them load the frontend that is active now.
+    /// Reloads every webview window, which makes them load the frontend that is active now.
+    /// Each of them is tried; the first error is returned.
+    ///
+    /// Webviews that share a window (Tauri's `unstable` multi-webview windows) are not listed
+    /// by Tauri without that feature, and are not reloaded: an app that has them reloads them
+    /// itself with `Webview::reload` after [`Self::activate`] or [`Self::install`].
     pub fn reload(&self) -> Result<()> {
+        let mut result = Ok(());
         for window in self.app.webview_windows().values() {
-            window.reload()?;
+            if let Err(error) = window.reload() {
+                result = result.and(Err(error.into()));
+            }
         }
-        Ok(())
+        result
     }
 
+    /// The HTTP client for one check or download. It follows no redirects: [`get`] does, to
+    /// decide for each one which headers go along.
     fn client(&self, timeout: Duration, proxy: Option<&Url>) -> Result<reqwest::Client> {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             // can only fail if another thread installed one in the meantime, which is just as
@@ -630,6 +669,12 @@ impl<R: Runtime> OtaUpdater<R> {
         if let Some(configure) = &self.client.configure {
             builder = configure(builder);
         }
+        // After `configure`, which may change everything else: were reqwest to follow redirects,
+        // it would take every header but a few standard ones (`Authorization`, `Cookie`) to
+        // another origin, and name the URL it came from, query included, in a `Referer`.
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false);
         Ok(builder.build()?)
     }
 
@@ -668,6 +713,53 @@ fn merge_headers(base: &HeaderMap, overrides: HeaderMap) -> HeaderMap {
         }
     }
     headers
+}
+
+/// Requests `url` and follows redirects, up to [`MAX_REDIRECTS`] of them.
+///
+/// `headers` are the caller's, and whoever receives them can keep them: they are sent only to
+/// the origin of `trusted`, the endpoint the app was configured to ask. Neither the unsigned
+/// manifest, which names `url` for a download, nor a redirect can take them elsewhere. A request
+/// to another origin carries nothing but `accept` and the client's defaults.
+async fn get(
+    client: &reqwest::Client,
+    url: &Url,
+    trusted: &Url,
+    headers: &HeaderMap,
+    accept: &'static str,
+) -> Result<reqwest::Response> {
+    let mut url = url.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        let mut request = if url.origin() == trusted.origin() {
+            headers.clone()
+        } else {
+            if !headers.is_empty() {
+                log::debug!("not sending the request's headers to {url}, which is another origin");
+            }
+            HeaderMap::new()
+        };
+        request
+            .entry(ACCEPT)
+            .or_insert(HeaderValue::from_static(accept));
+        let response = client.get(url.clone()).headers(request).send().await?;
+        let location = matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        )
+        .then(|| response.headers().get(LOCATION))
+        .flatten()
+        .and_then(|location| location.to_str().ok());
+        match location {
+            // relative to the URL that redirected; `https` is enforced by the client
+            Some(location) => url = url.join(location)?,
+            None => return Ok(response),
+        }
+    }
+    Err(Error::TooManyRedirects(url.to_string()))
 }
 
 /// Reads a response body of at most `limit` bytes.
@@ -731,8 +823,8 @@ pub struct Update<R: Runtime> {
     pub download_url: Url,
     /// The bundle's signature.
     pub signature: String,
-    /// Where the manifest came from, which decides whether [`RequestOptions::headers`] are
-    /// sent with the download.
+    /// The endpoint the manifest was asked from, which is where [`RequestOptions::headers`]
+    /// may go.
     manifest_url: Url,
     options: RequestOptions,
 }
@@ -788,33 +880,23 @@ impl<R: Runtime> Update<R> {
             return Ok(());
         }
 
-        let mut headers = if self.download_url.origin() == self.manifest_url.origin() {
-            self.options.headers.clone()
-        } else {
-            if !self.options.headers.is_empty() {
-                log::debug!(
-                    "not sending the manifest's headers to {}, which is another origin",
-                    self.download_url
-                );
-            }
-            HeaderMap::new()
-        };
-        for (name, value) in &self.options.download_headers {
-            headers.insert(name, value.clone());
+        let client = updater.client(
+            self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT),
+            self.options.proxy.as_ref(),
+        )?;
+        let response = get(
+            &client,
+            &self.download_url,
+            &self.manifest_url,
+            &self.options.headers,
+            "application/octet-stream",
+        )
+        .await?
+        .error_for_status()?;
+        if !response.status().is_success() {
+            // a redirect without a destination, say: its body is not the bundle
+            return Err(Error::TooManyRedirects(response.url().to_string()));
         }
-        headers
-            .entry(ACCEPT)
-            .or_insert(HeaderValue::from_static("application/octet-stream"));
-        let response = updater
-            .client(
-                self.options.timeout.unwrap_or(DOWNLOAD_TIMEOUT),
-                self.options.proxy.as_ref(),
-            )?
-            .get(self.download_url.clone())
-            .headers(headers)
-            .send()
-            .await?
-            .error_for_status()?;
 
         let content_length = response.content_length();
         let limit = updater.config.max_bundle_size;
@@ -858,9 +940,9 @@ mod tests {
     #[test]
     fn only_pages_of_the_bundle_on_trial_confirm_it() {
         let v = |s: &str| Version::parse(s).unwrap();
-        // nothing recorded (no page load seen for that webview): trusted
-        assert!(may_confirm(None, &v("1.2.1")));
         assert!(may_confirm(Some(&Some(v("1.2.1"))), &v("1.2.1")));
+        // nothing recorded (no page load seen for that webview): nothing to go by
+        assert!(!may_confirm(None, &v("1.2.1")));
         // a page still showing the previous bundle or the built-in frontend
         assert!(!may_confirm(Some(&Some(v("1.2.0"))), &v("1.2.1")));
         assert!(!may_confirm(Some(&None), &v("1.2.1")));

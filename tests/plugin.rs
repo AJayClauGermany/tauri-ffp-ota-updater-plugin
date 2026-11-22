@@ -84,7 +84,8 @@ fn sign(key: &minisign::KeyPair, data: &[u8], version: Option<&str>) -> String {
 type Routes = Arc<Mutex<HashMap<&'static str, Vec<u8>>>>;
 
 /// Serves `routes` by the last path segment and records every requested path, followed by
-/// `#` and the value of the `x-channel` header if one was sent.
+/// `#` and the value of the `x-channel` header if one was sent, and by `!referer` if the
+/// request names where it came from. A route whose content is `-> ` and a URL redirects there.
 fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -96,10 +97,13 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
             reader.read_line(&mut request_line).unwrap();
             let mut line = String::new();
             let mut channel = None;
+            let mut referer = false;
             while reader.read_line(&mut line).unwrap() > 2 {
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("x-channel:") {
+                let header = line.to_ascii_lowercase();
+                if let Some(value) = header.strip_prefix("x-channel:") {
                     channel = Some(value.trim().to_string());
                 }
+                referer |= header.starts_with("referer:");
                 line.clear();
             }
             let path = request_line
@@ -110,15 +114,33 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
             let body = routes
                 .lock()
                 .unwrap()
-                .get(path.rsplit('/').next().unwrap())
+                .get(
+                    path.split('?')
+                        .next()
+                        .and_then(|path| path.rsplit('/').next())
+                        .unwrap(),
+                )
                 .cloned();
-            requests.lock().unwrap().push(match channel {
-                Some(channel) => format!("{path}#{channel}"),
-                None => path,
-            });
+            let mut request = path;
+            if let Some(channel) = channel {
+                request.push_str(&format!("#{channel}"));
+            }
+            if referer {
+                request.push_str("!referer");
+            }
+            requests.lock().unwrap().push(request);
             let (status, body) = match body {
-                Some(body) => ("200 OK", body),
-                None => ("404 Not Found", Vec::new()),
+                Some(body) => match body.strip_prefix(b"-> ") {
+                    Some(location) => (
+                        format!(
+                            "302 Found\r\nLocation: {}",
+                            String::from_utf8_lossy(location)
+                        ),
+                        Vec::new(),
+                    ),
+                    None => ("200 OK".into(), body),
+                },
+                None => ("404 Not Found".into(), Vec::new()),
             };
             let _ = write!(
                 stream,
@@ -569,13 +591,17 @@ fn frontend_update_lifecycle() {
     development_mode_does_not_serve_bundles();
     build_metadata_is_ignored_unless_asked_for();
     bundles_get_the_csp_processing_of_built_in_frontends();
-    headers_follow_the_download_only_to_the_manifests_origin();
+    headers_stay_on_the_endpoints_origin();
     a_bundle_reinstalled_after_a_reset_goes_on_trial_again();
     failed_deletions_are_reported();
     archive_metadata_counts_towards_the_unpacked_size();
     remote_frontends_do_not_serve_bundles();
     concurrent_installs_never_go_backwards();
     a_version_names_one_bundle();
+    an_unreadable_state_leaves_the_store_alone();
+    rollbacks_that_are_not_recorded_are_reported();
+    a_lost_fallback_is_forgotten();
+    bundles_are_read_to_their_end();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -1126,6 +1152,30 @@ fn unconfirmed_bundles_time_out() {
     assert!(block_on(updater.check()).unwrap().is_none());
     drop(app);
 
+    // A deadline belongs to one trial: after a reset, a later trial of the same version gets
+    // its own, and is not ended by what is left of the first.
+    let (app, _) = published(
+        &[("./index.html", "again")],
+        "1.2.1",
+        serde_json::json!({ "readyTimeout": 2000 }),
+    );
+    let updater = app.ota_updater();
+    let install = || {
+        let update = block_on(updater.check()).unwrap().expect("no update");
+        block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+        assert_eq!(served_index(&app), "again");
+    };
+    install();
+    wait();
+    updater.reset().unwrap();
+    install();
+    // the first deadline has passed, the second has not
+    wait();
+    assert_eq!(served_index(&app), "again");
+    wait();
+    assert_eq!(served_index(&app), "built-in");
+    drop(app);
+
     // the same goes for a bundle picked up at launch
     let (app, relaunch) = published(&[("./index.html", "broken")], "1.2.2", overrides);
     let update = block_on(app.ota_updater().check())
@@ -1179,32 +1229,35 @@ fn oversized_bundles_are_refused() {
     assert!(stored_files(&data_dir.path().join("ffp-ota-updater")).is_empty());
 }
 
-/// The manifest is not signed, so it must not be able to send the manifest's credentials to a
-/// host of its choosing.
-fn headers_follow_the_download_only_to_the_manifests_origin() {
+/// Headers are for the endpoint the app was configured with. Neither the manifest, which is not
+/// signed, nor a redirect can send them to a host of its choosing.
+fn headers_stay_on_the_endpoints_origin() {
     let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
     let pubkey = b64(key.pk.to_box().unwrap().to_string());
     let bundle = archive("elsewhere");
-    let manifest_routes = Routes::default();
-    let manifest_requests = Arc::new(Mutex::new(Vec::new()));
-    let manifest_port = serve(manifest_routes.clone(), manifest_requests.clone());
-    let bundle_routes = Routes::default();
-    let bundle_requests = Arc::new(Mutex::new(Vec::new()));
+    let signature = sign(&key, &bundle, Some("1.2.1"));
+    let own_routes = Routes::default();
+    let own_requests = Arc::new(Mutex::new(Vec::new()));
+    let own_port = serve(own_routes.clone(), own_requests.clone());
+    let other_routes = Routes::default();
+    let other_requests = Arc::new(Mutex::new(Vec::new()));
     // another port is another origin
-    let bundle_port = serve(bundle_routes.clone(), bundle_requests.clone());
-    bundle_routes
+    let other_port = serve(other_routes.clone(), other_requests.clone());
+    other_routes
         .lock()
         .unwrap()
         .insert("bundle.tar.gz", bundle.clone());
-    let manifest = serde_json::json!({
-        "version": "1.2.1",
-        "url": format!("http://127.0.0.1:{bundle_port}/bundle.tar.gz"),
-        "signature": sign(&key, &bundle, Some("1.2.1")),
-    });
-    manifest_routes
-        .lock()
-        .unwrap()
-        .insert("ota.json", manifest.to_string().into_bytes());
+    let manifest = |bundle_port: u16| {
+        serde_json::json!({
+            "version": "1.2.1",
+            "url": format!("http://127.0.0.1:{bundle_port}/bundle.tar.gz?token=1"),
+            "signature": signature,
+        })
+        .to_string()
+        .into_bytes()
+    };
+    let requests =
+        |requests: &Arc<Mutex<Vec<String>>>| std::mem::take(&mut *requests.lock().unwrap());
 
     let data_dir = tempfile::tempdir().unwrap();
     let builder = Builder::new().header("x-channel", "secret").unwrap();
@@ -1212,29 +1265,83 @@ fn headers_follow_the_download_only_to_the_manifests_origin() {
         data_dir.path(),
         "1.2.0",
         &pubkey,
-        manifest_port,
+        own_port,
         serde_json::json!({}),
         builder,
     );
     let updater = app.ota_updater();
-    let update = block_on(updater.check()).unwrap().expect("no update");
-    block_on(update.download(|_, _| {}, || {})).unwrap();
-    assert!(manifest_requests.lock().unwrap()[0].ends_with("#secret"));
-    assert_eq!(*bundle_requests.lock().unwrap(), ["/bundle.tar.gz"]);
-    updater.reset().unwrap();
+    let download = || {
+        let update = block_on(updater.check()).unwrap().expect("no update");
+        block_on(update.download(|_, _| {}, || {})).unwrap();
+        assert_eq!(served_index(&app), "built-in");
+        updater.reset().unwrap();
+    };
 
-    // download headers go wherever the bundle is, and replace the builder's of that name
-    let options = RequestOptions::new()
-        .download_header("x-channel", "for the cdn")
-        .unwrap();
-    let update = block_on(updater.check_with(options))
+    // a manifest that names a bundle elsewhere
+    own_routes
+        .lock()
         .unwrap()
-        .expect("no update");
-    block_on(update.download(|_, _| {}, || {})).unwrap();
-    assert_eq!(
-        bundle_requests.lock().unwrap().last().unwrap(),
-        "/bundle.tar.gz#for the cdn"
-    );
+        .insert("ota.json", manifest(other_port));
+    download();
+    assert!(requests(&own_requests)[0].ends_with("/ota.json#secret"));
+    assert_eq!(requests(&other_requests), ["/bundle.tar.gz?token=1"]);
+
+    // a bundle on the endpoint's origin gets the headers, but a redirect does not take them
+    // along, nor does it tell the other host which URL, token included, it came from
+    own_routes.lock().unwrap().extend([
+        ("ota.json", manifest(own_port)),
+        (
+            "bundle.tar.gz",
+            format!("-> http://127.0.0.1:{other_port}/bundle.tar.gz").into_bytes(),
+        ),
+    ]);
+    download();
+    let own = requests(&own_requests);
+    assert!(own[0].ends_with("/ota.json#secret"), "{own:?}");
+    assert_eq!(own[1], "/bundle.tar.gz?token=1#secret");
+    assert_eq!(requests(&other_requests), ["/bundle.tar.gz"]);
+
+    // the same goes for an endpoint that redirects to a manifest elsewhere, and for the bundle
+    // that manifest names on the endpoint's origin, which gets them again
+    other_routes
+        .lock()
+        .unwrap()
+        .insert("moved.json", manifest(own_port));
+    own_routes.lock().unwrap().extend([
+        (
+            "ota.json",
+            // relative to the URL that redirects
+            b"-> moved.json".to_vec(),
+        ),
+        (
+            "moved.json",
+            format!("-> http://127.0.0.1:{other_port}/moved.json").into_bytes(),
+        ),
+        ("bundle.tar.gz", bundle.clone()),
+    ]);
+    download();
+    let own = requests(&own_requests);
+    assert!(own[0].ends_with("/ota.json#secret"), "{own:?}");
+    assert!(own[1].ends_with("/moved.json#secret"), "{own:?}");
+    assert_eq!(own[2], "/bundle.tar.gz?token=1#secret");
+    assert_eq!(requests(&other_requests), ["/moved.json"]);
+
+    // a redirect that never ends is given up on
+    own_routes
+        .lock()
+        .unwrap()
+        .insert("ota.json", b"-> ota.json".to_vec());
+    let lost = block_on(updater.check()).err().unwrap();
+    assert!(matches!(lost, Error::ReleaseNotFound(_)), "{lost}");
+    assert_eq!(requests(&own_requests).len(), 11);
+    own_routes.lock().unwrap().extend([
+        ("ota.json", manifest(own_port)),
+        ("bundle.tar.gz", b"-> bundle.tar.gz".to_vec()),
+    ]);
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    let lost = block_on(update.download(|_, _| {}, || {})).err().unwrap();
+    assert!(matches!(lost, Error::TooManyRedirects(_)), "{lost}");
+    assert_eq!(serde_json::to_value(&lost).unwrap()["kind"], "network");
     updater.reset().unwrap();
 }
 
@@ -1422,24 +1529,217 @@ fn a_version_names_one_bundle() {
     let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
     let updater = app.ota_updater();
 
-    // never shown: can still be replaced
-    stage(&app, "1.2.1", "first 1.2.1").unwrap();
-    stage(&app, "1.2.1", "own 1.2.1").unwrap();
-    updater.install(&v("1.2.1")).unwrap();
-    assert_eq!(served_index(&app), "own 1.2.1");
-    // on trial, then confirmed: the same contents again are fine, others are not
-    for confirm in [false, true] {
-        if confirm {
-            updater.notify_ready().unwrap();
-        }
-        stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let other = |app: &App<MockRuntime>| {
+        // the same contents again are fine, others are not
+        stage(app, "1.2.1", "own 1.2.1").unwrap();
         assert!(matches!(
-            stage(&app, "1.2.1", "other 1.2.1"),
+            stage(app, "1.2.1", "other 1.2.1"),
             Err(Error::InUse(_))
         ));
-    }
+    };
+
+    // To replace a bundle that was never shown, it has to be discarded first: left in place
+    // it could be in memory already, and be confirmed in the place of its replacement.
+    stage(&app, "1.2.1", "first 1.2.1").unwrap();
+    assert!(matches!(
+        stage(&app, "1.2.1", "own 1.2.1"),
+        Err(Error::InUse(_))
+    ));
+    updater.discard(&v("1.2.1")).unwrap();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    other(&app);
+    // activated, but no page was loaded from it yet
+    updater.activate(&v("1.2.1")).unwrap();
+    other(&app);
+    // on trial, then confirmed
+    assert_eq!(served_index(&app), "own 1.2.1");
+    other(&app);
+    updater.notify_ready().unwrap();
+    other(&app);
     drop(app);
     let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
     assert_eq!(served_index(&app), "own 1.2.1");
+    assert!(app.ota_updater().status().confirmed);
+
+    // two versions that would be one file where the file system ignores case
+    stage(&app, "1.2.2-RC", "own 1.2.2-RC").unwrap();
+    assert!(matches!(
+        stage(&app, "1.2.2-rc", "own 1.2.2-rc"),
+        Err(Error::InUse(_))
+    ));
+    // an archive that is no bundle does not hold on to its version
+    std::fs::write(store.join("1.2.3.tar.gz"), "damaged").unwrap();
+    stage(&app, "1.2.3", "own 1.2.3").unwrap();
+    app.ota_updater().install(&v("1.2.3")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.3");
+    app.ota_updater().reset().unwrap();
+}
+
+/// A state that cannot be read is not an empty one: nothing is served, deleted or offered on
+/// the strength of a guess, and all is as it was once it can be read again.
+fn an_unreadable_state_leaves_the_store_alone() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.notify_ready().unwrap();
+    // a newer one that fails its only attempt, and one staged after it
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    updater.install(&v("1.2.2")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.2");
+    updater.rollback().unwrap();
+    stage(&app, "1.2.3", "own 1.2.3").unwrap();
+    drop(app);
+    let files = stored_files(&store);
+    assert_eq!(
+        files,
+        [
+            "1.2.1.tar.gz",
+            "1.2.1.tar.gz.sig",
+            "1.2.3.tar.gz",
+            "1.2.3.tar.gz.sig",
+            "state.json"
+        ]
+    );
+
+    // reading a directory fails like a file another program has locked does
+    std::fs::rename(store.join("state.json"), store.join("state.kept")).unwrap();
+    std::fs::create_dir(store.join("state.json")).unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "built-in");
+    // with an empty state 1.2.3 would have been served and the fallback 1.2.1 deleted
+    assert!(store.join("1.2.1.tar.gz").exists() && store.join("1.2.3.tar.gz").exists());
+    // and the rejected 1.2.2 accepted again
+    assert!(matches!(
+        stage(&app, "1.2.2", "own 1.2.2"),
+        Err(Error::Io(_))
+    ));
+    assert!(matches!(updater.install(&v("1.2.3")), Err(Error::Io(_))));
+    assert_eq!(served_index(&app), "built-in");
+    drop(app);
+
+    std::fs::remove_dir(store.join("state.json")).unwrap();
+    std::fs::rename(store.join("state.kept"), store.join("state.json")).unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.3");
+    assert_eq!(app.ota_updater().status().rejected, [v("1.2.2")]);
+    assert!(store.join("1.2.1.tar.gz").exists());
+    drop(app);
+
+    // A state that is read but makes no sense is lost for good. The bundles are still verified
+    // and the newest goes on trial; the file is written anew.
+    std::fs::write(store.join("state.json"), "{ not json").unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.3");
+    assert!(!app.ota_updater().status().confirmed);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["trial"], "1.2.3");
+    app.ota_updater().reset().unwrap();
+}
+
+/// A rejection that could not be recorded is reported, and nothing is deleted for it.
+fn rollbacks_that_are_not_recorded_are_reported() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+
+    // the state is written to this file first
+    std::fs::create_dir(store.join("state.json.part")).unwrap();
+    assert!(matches!(updater.rollback(), Err(Error::Io(_))));
+    // this run has gone back all the same
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    assert!(store.join("1.2.1.tar.gz").exists());
+    assert!(updater.status().rejected.is_empty());
+
+    // the record is the old one, and what the next launch goes by
+    std::fs::remove_dir(store.join("state.json.part")).unwrap();
+    drop(app);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.rollback().unwrap();
+    assert_eq!(updater.status().rejected, [v("1.2.1")]);
+    assert!(!store.join("1.2.1.tar.gz").exists());
+
+    // A bundle whose trial cannot be put on record is not served, to any of the pages that are
+    // requested at once.
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    updater.activate(&v("1.2.2")).unwrap();
+    std::fs::create_dir(store.join("state.json.part")).unwrap();
+    let handle = app.handle();
+    std::thread::scope(|scope| {
+        let pages: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| handle.asset_resolver().get("index.html".into())))
+            .collect();
+        for page in pages {
+            assert_eq!(page.join().unwrap().unwrap().bytes(), b"built-in");
+        }
+    });
+    assert_eq!(updater.current_version(), v("1.2.0"));
+    std::fs::remove_dir(store.join("state.json.part")).unwrap();
+    updater.reset().unwrap();
+}
+
+/// A confirmed bundle whose archive is gone is no fallback, and does not keep its version from
+/// being stored again.
+fn a_lost_fallback_is_forgotten() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    app.ota_updater().install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    app.ota_updater().notify_ready().unwrap();
+    drop(app);
+
+    std::fs::write(store.join("1.2.1.tar.gz"), "damaged").unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.2.1.tar.gz").exists());
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    app.ota_updater().install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    // on trial like any bundle that was not confirmed
+    assert!(!app.ota_updater().status().confirmed);
+    app.ota_updater().reset().unwrap();
+}
+
+/// A bundle is a whole gzip stream: one that is cut short or damaged after the last file is
+/// refused, although every file could be unpacked.
+fn bundles_are_read_to_their_end() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let stage = |archive: &[u8]| {
+        app.ota_updater()
+            .stage(archive, &sign(&key, archive, Some("1.2.1")), &v("1.2.1"))
+    };
+
+    let whole = archive("own 1.2.1");
+    // the checksum the stream ends with
+    let mut damaged = whole.clone();
+    let checksum = damaged.len() - 8;
+    damaged[checksum] ^= 0xff;
+    assert!(matches!(stage(&damaged), Err(Error::InvalidBundle(_))));
+    assert!(matches!(
+        stage(&whole[..whole.len() - 4]),
+        Err(Error::InvalidBundle(_))
+    ));
+    stage(&whole).unwrap();
     app.ota_updater().reset().unwrap();
 }
