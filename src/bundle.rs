@@ -44,6 +44,9 @@ const STATE_FILE: &str = "state.json";
 const LOCK_FILE: &str = ".lock";
 /// Entries (files and directories) a bundle may contain.
 const MAX_ENTRIES: usize = 20_000;
+/// What the tar stream of a bundle may hold besides file contents, per entry: its header and
+/// padding, plus those of a metadata entry (a PAX header or GNU long name) and a long name.
+const MAX_OVERHEAD_PER_ENTRY: u64 = 2048;
 
 /// Size limits applied to a bundle, in bytes.
 #[derive(Debug, Clone, Copy)]
@@ -123,39 +126,20 @@ impl Bundle {
         }
         verify_signature(archive, signature, pubkey, version, require_signed_version)?;
 
-        let mut files = HashMap::new();
-        let mut unpacked = 0u64;
-        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-        for (index, entry) in tar.entries().map_err(invalid)?.enumerate() {
-            if index >= MAX_ENTRIES {
-                return Err(Error::InvalidBundle(format!(
-                    "more than {MAX_ENTRIES} entries"
-                )));
-            }
-            let mut entry = entry.map_err(invalid)?;
-            let kind = entry.header().entry_type();
-            // `git archive` leads with a global pax header; it carries no file
-            if kind.is_dir() || kind.is_pax_global_extensions() {
-                continue;
-            }
-            let key = asset_key(&entry.path_bytes())?;
-            if !kind.is_file() {
-                return Err(Error::InvalidBundle(format!(
-                    "`{key}` is a link or special file"
-                )));
-            }
-            unpacked = unpacked.saturating_add(entry.size());
-            if unpacked > limits.unpacked {
-                return Err(Error::TooLarge("unpacked bundle", limits.unpacked));
-            }
-            let mut contents = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut contents).map_err(invalid)?;
-            if files.insert(key.clone(), contents).is_some() {
-                return Err(Error::InvalidBundle(format!(
-                    "`{key}` is in the archive twice"
-                )));
-            }
+        // `tar` reads metadata entries into memory before handing out the entry they describe,
+        // and `limits.unpacked` only counts file contents: what is decompressed is capped, too.
+        let mut stream = Capped {
+            inner: flate2::read::GzDecoder::new(archive),
+            left: limits
+                .unpacked
+                .saturating_add(MAX_ENTRIES as u64 * MAX_OVERHEAD_PER_ENTRY),
+            exceeded: false,
+        };
+        let files = unpack(&mut stream, limits.unpacked);
+        if stream.exceeded {
+            return Err(Error::TooLarge("unpacked bundle", limits.unpacked));
         }
+        let files = files?;
 
         if !files.contains_key("/index.html") {
             return Err(Error::InvalidBundle(
@@ -169,6 +153,75 @@ impl Bundle {
             csp: Default::default(),
         })
     }
+}
+
+/// A reader that fails once it has passed on `left` bytes.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+    exceeded: bool,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            // more data, rather than its end, is what exceeds the cap
+            let read = self.inner.read(&mut [0])?;
+            self.exceeded = read > 0;
+            return if self.exceeded {
+                Err(std::io::Error::other(
+                    "the archive decompresses to too much data",
+                ))
+            } else {
+                Ok(0)
+            };
+        }
+        let len = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..len])?;
+        self.left -= read as u64;
+        Ok(read)
+    }
+}
+
+/// Unpacks a tar stream into memory, see [`Bundle::from_archive`]. `limit` is the sum of the
+/// file sizes allowed.
+fn unpack(stream: impl Read, limit: u64) -> Result<HashMap<String, Vec<u8>>> {
+    let mut files = HashMap::new();
+    let mut unpacked = 0u64;
+    let mut tar = tar::Archive::new(stream);
+    for (index, entry) in tar.entries().map_err(invalid)?.enumerate() {
+        if index >= MAX_ENTRIES {
+            return Err(Error::InvalidBundle(format!(
+                "more than {MAX_ENTRIES} entries"
+            )));
+        }
+        let mut entry = entry.map_err(invalid)?;
+        let kind = entry.header().entry_type();
+        // `git archive` leads with a global pax header; it carries no file
+        if kind.is_dir() || kind.is_pax_global_extensions() {
+            continue;
+        }
+        let key = asset_key(&entry.path_bytes())?;
+        if !kind.is_file() {
+            return Err(Error::InvalidBundle(format!(
+                "`{key}` is a link or special file"
+            )));
+        }
+        unpacked = unpacked.saturating_add(entry.size());
+        if unpacked > limit {
+            return Err(Error::TooLarge("unpacked bundle", limit));
+        }
+        let mut contents = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut contents).map_err(invalid)?;
+        if files.insert(key.clone(), contents).is_some() {
+            return Err(Error::InvalidBundle(format!(
+                "`{key}` is in the archive twice"
+            )));
+        }
+    }
+    Ok(files)
 }
 
 /// Turns an archive path into the key Tauri looks assets up by: `./assets/app.js` (what
@@ -386,7 +439,10 @@ impl Store {
         let _guard = self.guard();
         let mut shown = self.shown.lock().unwrap();
         let mut state = self.read_state();
-        if shown.as_ref() == Some(version) || state.confirmed.as_ref() == Some(version) {
+        // `shown` alone is not enough: a reset or discard in the meantime ended that trial, and
+        // a bundle of the same version installed since starts a new one
+        let counted = shown.as_ref() == Some(version) && state.trial.as_ref() == Some(version);
+        if counted || state.confirmed.as_ref() == Some(version) {
             return Ok(());
         }
         if state.trial.as_ref() == Some(version) {
@@ -449,12 +505,24 @@ impl Store {
     }
 
     /// Verifies a downloaded archive and, only if it is valid, persists it.
+    ///
+    /// A version names one bundle. Different contents under the version that is confirmed or on
+    /// trial are refused with [`Error::InUse`]: they would inherit what is on record for the
+    /// bundle that was actually shown. A stored bundle no page was loaded from yet can be
+    /// replaced.
     pub fn save(&self, archive: &[u8], signature: &str, version: &Version) -> Result<()> {
         let _guard = self.guard();
-        if self.is_rejected(version) {
+        let state = self.read_state();
+        if self.rejected_in(&state, version) {
             return Err(Error::Rejected(version.to_string()));
         }
         self.verify(archive, signature, version)?;
+        if [&state.confirmed, &state.trial].contains(&&Some(version.clone())) {
+            return match fs::read(self.archive_path(version)) {
+                Ok(stored) if stored == archive => Ok(()),
+                _ => Err(Error::InUse(version.to_string())),
+            };
+        }
         fs::create_dir_all(&self.dir)?;
         // Each file appears complete or not at all, and the archive, which `versions` goes by,
         // comes last. Even a half-saved bundle would only fail verification in `load`.
@@ -501,9 +569,26 @@ impl Store {
         versions
     }
 
-    fn remove(&self, version: &Version) {
-        let _ = fs::remove_file(self.archive_path(version));
-        let _ = fs::remove_file(self.signature_path(version));
+    /// Deletes the stored bundle `version`. One that is not stored is not an error. The archive
+    /// goes first: without it the version is no longer stored, see [`Self::versions`].
+    fn remove(&self, version: &Version) -> Result<()> {
+        for path in [self.archive_path(version), self.signature_path(version)] {
+            match fs::remove_file(path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::remove`] where a failure is not the caller's concern: what is left is removed
+    /// again by a later cleanup, or found invalid when loaded.
+    fn remove_quietly(&self, version: &Version) {
+        if let Err(error) = self.remove(version) {
+            log::warn!("could not delete frontend bundle {version}: {error}");
+        }
     }
 
     /// Removes what `serving` supersedes: everything that is not newer, except the confirmed
@@ -514,16 +599,24 @@ impl Store {
                 && !self.order.newer(&version, serving)
                 && state.confirmed.as_ref() != Some(&version)
             {
-                self.remove(&version);
+                self.remove_quietly(&version);
             }
         }
     }
 
     /// Removes every stored bundle. The rejected versions stay on record.
+    ///
+    /// Fails if a bundle could not be deleted (on Windows, another program may hold it open), as
+    /// that bundle would be served again at the next launch. The others are deleted and the
+    /// state is reset all the same.
     pub fn clear(&self) -> Result<()> {
         let _guard = self.guard();
+        *self.shown.lock().unwrap() = None;
+        let mut result = Ok(());
         for version in self.versions() {
-            self.remove(&version);
+            if let Err(error) = self.remove(&version) {
+                result = result.and(Err(error));
+            }
         }
         let state = self.read_state();
         if state.confirmed.is_some() || state.trial.is_some() {
@@ -532,7 +625,7 @@ impl Store {
                 ..State::default()
             })?;
         }
-        Ok(())
+        result
     }
 
     /// Deletes the stored bundle `version`, unless it is `serving` or the confirmed fallback.
@@ -543,7 +636,7 @@ impl Store {
         if serving == Some(version) || state.confirmed.as_ref() == Some(version) {
             return Err(Error::InUse(version.to_string()));
         }
-        self.remove(version);
+        self.remove(version)?;
         if state.trial.as_ref() == Some(version) {
             state.trial = None;
             state.attempts = 0;
@@ -650,7 +743,7 @@ impl Store {
         let mut chosen = None;
         for version in self.versions() {
             if self.rejected_in(&state, &version) {
-                self.remove(&version);
+                self.remove_quietly(&version);
                 continue;
             }
             if only
@@ -666,7 +759,7 @@ impl Store {
                 }
                 Err(error) if error.is_permanent() => {
                     log::warn!("discarding frontend bundle {version}: {error}");
-                    self.remove(&version);
+                    self.remove_quietly(&version);
                 }
                 Err(error) => log::warn!("skipping frontend bundle {version} for now: {error}"),
             }

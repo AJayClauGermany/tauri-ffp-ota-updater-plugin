@@ -34,7 +34,8 @@ pub enum Error {
     #[error("no OTA public key is configured")]
     EmptyPubkey,
     /// A downloaded frontend cannot be shown in this run of the app: the assets were not wrapped
-    /// with [`wrap_assets`](crate::wrap_assets), or the app runs in development mode from `devUrl`.
+    /// with [`wrap_assets`](crate::wrap_assets), the app runs in development mode from `devUrl`,
+    /// or its `frontendDist` is a URL.
     /// Checking for, downloading and staging bundles still works.
     #[error("downloaded frontends cannot be served: {0}")]
     CannotServe(&'static str),
@@ -80,7 +81,8 @@ pub enum Error {
     #[error("frontend version `{0}` is older than the one being served")]
     NotNewer(String),
     /// The bundle is being served, or is the confirmed one kept to fall back on, and cannot be
-    /// discarded.
+    /// discarded; or different contents were staged under the version that is confirmed or on
+    /// trial, which a version cannot have.
     #[error("the frontend bundle for version `{0}` is in use")]
     InUse(String),
     /// `install` was called before the bundle was downloaded.

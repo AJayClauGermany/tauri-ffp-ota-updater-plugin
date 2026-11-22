@@ -158,6 +158,16 @@ false` turns the mechanism off; bundles are then served without a trial.
 To take back a frontend that was confirmed but turned out to be wrong, publish
 the previous build again under a new, higher version.
 
+### A version is one bundle
+
+Everything the plugin records (confirmed, on trial, rejected, stored, pending
+download) goes by version, so a version has to name exactly one archive,
+across every channel and endpoint. Publish a rebuild, even an identical one,
+under a new version. The plugin enforces this where breaking it would do harm:
+different contents under the version that is confirmed or on trial are refused
+with `inUse` rather than inheriting its state. A bundle that is stored but was
+never shown can still be replaced; it has no state yet.
+
 ## Security
 
 The trust anchor is the public key compiled into the app. A bundle is served
@@ -175,9 +185,15 @@ what the manifest announces.
 Other measures:
 
 - `https` is required for endpoints, bundle URLs and redirects.
+- Headers given for the manifest request (an `Authorization` token, say) are
+  only sent with the download when it is on the manifest's origin. Otherwise
+  whoever can edit the unsigned manifest could point the download at their own
+  server and collect the token before the signature check fails.
+  `downloadHeaders` are for a download host elsewhere.
 - The webview cannot choose endpoints or keys; only Rust can.
 - Archives are held to an unambiguous subset of tar: no links, no paths that
-  climb out, no duplicate entries, and limits on size and entry count.
+  climb out, no duplicate entries, and limits on size and entry count. What
+  they decompress to is capped too, metadata entries included.
 - `rollback()` and `reset()`, which discard a frontend, are not in the default
   permission set.
 
@@ -189,7 +205,8 @@ one.
 
 - **Dev mode**: a downloaded bundle is never displayed under `tauri dev`, so
   the plugin does not switch to one there: `install()` fails with
-  `cannotServe`, and `currentVersion()` is the app's version.
+  `cannotServe`, and `currentVersion()` is the app's version. The same goes
+  for an app whose `frontendDist` is a remote URL.
 - **CSP**: with a CSP, `tauri build` adds nonces and hashes for the embedded
   HTML. The plugin does the same for a bundle when it is served, so inline
   scripts and styles work as they do in the built-in frontend. Anything else

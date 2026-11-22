@@ -102,7 +102,7 @@ jobs:
 
       - name: Package and sign
         run: |
-          grep -rqE 'ffp-ota-updater|notify_ready' dist
+          grep -rq notify_ready dist
           tar -czf "frontend-$VERSION.tar.gz" -C dist .
           npx tauri signer sign --app-version "$VERSION" "frontend-$VERSION.tar.gz"
           jq -n --arg v "$VERSION" --arg u "$BASE_URL/frontend-$VERSION.tar.gz" \

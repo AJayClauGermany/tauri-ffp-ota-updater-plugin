@@ -18,7 +18,7 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 | `notifyReady()` | `Promise<void>` | Confirms the frontend being served. Does nothing when there is no trial, or when the calling page was not loaded from the bundle on trial (a window that still shows the previous frontend). |
 | `status()` | `Promise<Status>` | State of the updater. Makes no request. |
 | `currentVersion()` | `Promise<string>` | Version of the frontend being served: the active bundle's, or else the app's. |
-| `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview. Makes no request. Rejects with `cannotServe` under `tauri dev` or without `wrap_assets`. |
+| `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview. Makes no request. Rejects with `cannotServe` under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. |
 | `discard(version)` | `Promise<void>` | Deletes the stored bundle `version`. Does nothing if it is not stored; the version stays available to `check()`. Rejects with `inUse` for the bundle being served and for the confirmed fallback. |
 | `rollback()` | `Promise<void>` | Rejects the bundle being served and reloads into the last confirmed bundle or the built-in frontend. A newer stored bundle that was never shown is kept for the next launch. Does nothing when the built-in frontend is served. Needs `allow-rollback`. |
 | `reset()` | `Promise<void>` | Deletes every stored bundle and returns to the built-in frontend, reloading if a bundle was served. Rejected versions stay rejected. Needs `allow-reset`. |
@@ -27,7 +27,8 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 
 | Field | Type | |
 | --- | --- | --- |
-| `headers` | `HeadersInit` | Sent with the manifest request and the bundle download. Replace builder headers of the same name. |
+| `headers` | `HeadersInit` | Sent with the manifest request, and with the bundle download if it is on the manifest's origin. Replace builder headers of the same name. |
+| `downloadHeaders` | `HeadersInit` | Sent with the bundle download only, wherever it is. Replace builder download headers of the same name. |
 | `timeout` | `number` (ms) | Deadline for each request. |
 | `proxy` | `string` | Proxy URL for both requests. |
 
@@ -73,7 +74,7 @@ For `invoke("plugin:ffp-ota-updater|<command>", args)`. Errors are
 
 | Command | Arguments | Result |
 | --- | --- | --- |
-| `check` | `headers?: [string, string][]`, `timeout?: number`, `proxy?: string` | update metadata (`currentVersion`, `version`, `downloaded`, `date`, `body`, `rawJson`) or `null` |
+| `check` | `headers?: [string, string][]`, `downloadHeaders?: [string, string][]`, `timeout?: number`, `proxy?: string` | update metadata (`currentVersion`, `version`, `downloaded`, `date`, `body`, `rawJson`) or `null` |
 | `download` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `download_and_install` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `install` | `version: string` | |
@@ -158,7 +159,7 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 | `releaseNotFound` | `ReleaseNotFound` | An endpoint answered, but none with a usable manifest. |
 | `emptyEndpoints` | `EmptyEndpoints` | No endpoints are configured. |
 | `emptyPubkey` | `EmptyPubkey` | No public key is configured. |
-| `cannotServe` | `CannotServe` | `install`/`activate` while bundles cannot be served: under `tauri dev`, or without `wrap_assets`. |
+| `cannotServe` | `CannotServe` | `install`/`activate` while bundles cannot be served: under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. |
 | `insecureTransportProtocol` | `InsecureTransportProtocol` | An endpoint or bundle URL is not `https`. |
 | `signature` | `InvalidSignature` | The public key or signature is unreadable, or the signature is not this key's for this bundle. |
 | `missingSignedVersion` | `MissingSignedVersion` | `requireSignedVersion` is on and the signature records no version. |
@@ -170,7 +171,7 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 | `noPendingUpdate` | `NoPendingUpdate` | `download` for a version `check` did not return. |
 | `notDownloaded` | `NotDownloaded` | `install` for a version that is not stored. |
 | `notNewer` | `NotNewer` | The version is not newer than the frontend being served. |
-| `inUse` | `InUse` | `discard` of the bundle being served or of the confirmed fallback. |
+| `inUse` | `InUse` | `discard` of the bundle being served or of the confirmed fallback, or `stage` of different contents under the version that is confirmed or on trial. |
 | `invalidHeader` | `InvalidHeaderName`, `InvalidHeaderValue`, `Http` | |
 | `invalidUrl` | `UrlParse` | |
 | `invalidVersion` | `Semver` | |

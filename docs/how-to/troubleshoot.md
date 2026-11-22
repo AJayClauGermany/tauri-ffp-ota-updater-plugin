@@ -55,7 +55,7 @@ version is now in `status().rejected`.
 
 - The frontend does not call `notifyReady()`, or fails before reaching it.
   Minifiers do not remove it, but a refactoring can: check the build output
-  with `grep -rqE 'ffp-ota-updater|notify_ready' dist`.
+  with `grep -rq notify_ready dist`.
 - `notifyReady()` waits for something that does not always happen (a login, a
   network request).
 - `readyTimeout` is shorter than a slow start.
