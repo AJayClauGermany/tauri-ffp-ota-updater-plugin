@@ -1,5 +1,5 @@
 [default]
-description = "Allows checking for, downloading and installing frontend (OTA) updates, confirming them, discarding a staged one and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately."
+description = "Allows checking for, downloading and installing frontend (OTA) updates, confirming them, approving a staged one for the next launch or discarding it, and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately."
 permissions = [
   "allow-check",
   "allow-download",
@@ -9,4 +9,6 @@ permissions = [
   "allow-notify-ready",
   "allow-status",
   "allow-discard",
+  "allow-approve",
+  "allow-unapprove",
 ]

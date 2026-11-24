@@ -40,6 +40,18 @@ pub struct Config {
     /// versioning prescribes, so a release that only changes it is not an update.
     #[serde(alias = "compare-build-metadata")]
     pub compare_build_metadata: bool,
+    /// Serve a downloaded bundle only once the app has approved it: with `approve` for the next
+    /// launch, or with `install` / `activate` at once. Until then it stays stored, across
+    /// restarts. Off by default, where the next launch switches to the newest stored bundle by
+    /// itself.
+    #[serde(alias = "require-approval")]
+    pub require_approval: bool,
+    /// Files every bundle has to contain besides `index.html`, as paths from the root of the
+    /// frontend build (`settings.html`, `editor/index.html`): the page of each window, say. A
+    /// bundle that lacks one is refused. Tauri answers a request for a page that is missing
+    /// with `index.html`, so without this a window would silently show the wrong page.
+    #[serde(alias = "required-files")]
+    pub required_files: Vec<String>,
     /// Largest bundle (the `.tar.gz`) accepted, in bytes. Defaults to 64 MiB.
     #[serde(alias = "max-bundle-size")]
     pub max_bundle_size: u64,
@@ -60,6 +72,8 @@ impl Default for Config {
             trial_attempts: 2,
             ready_timeout: None,
             compare_build_metadata: false,
+            require_approval: false,
+            required_files: Vec::new(),
             max_bundle_size: 64 << 20,
             max_unpacked_size: 256 << 20,
         }
@@ -77,6 +91,21 @@ impl Config {
             // a key that cannot be read would make every bundle fail verification
             crate::bundle::parse_pubkey(&self.pubkey)?;
         }
+        self.required_keys()?;
         Ok(())
+    }
+
+    /// [`Self::required_files`] as the keys a bundle's files go by (`/settings.html`).
+    pub(crate) fn required_keys(&self) -> crate::Result<Vec<String>> {
+        self.required_files
+            .iter()
+            .map(|path| {
+                crate::bundle::asset_key(path.trim_start_matches('/').as_bytes()).map_err(|_| {
+                    crate::Error::InvalidConfig(format!(
+                        "`requiredFiles` has `{path}`, which is not a path inside a bundle"
+                    ))
+                })
+            })
+            .collect()
     }
 }
