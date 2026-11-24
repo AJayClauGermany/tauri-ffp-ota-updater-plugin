@@ -34,6 +34,18 @@ const KEY_PASSWORD = "e2e";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** What `promise` resolves to, or `undefined` if it takes longer than `ms`. */
+async function within(ms, promise) {
+  let timer;
+  const timeout = new Promise((resolve) => (timer = setTimeout(resolve, ms)));
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    // a timer that is left running keeps Node alive after the last step
+    clearTimeout(timer);
+  }
+}
+
 /** Deletes `dir` if it can. On Windows a webview process that is still closing may hold a file. */
 function remove(dir) {
   try {
@@ -140,11 +152,9 @@ class App {
     app.process.once("exit", () => (app.exited = true));
     running = app;
 
-    const timeout = sleep(120_000).then(() => {
-      throw new Error("the app did not start");
-    });
-    app.socket = await Promise.race([connected, timeout]);
+    app.socket = await within(120_000, connected);
     control.close();
+    if (!app.socket) throw new Error("the app did not start");
 
     app.pending = new Map();
     app.next = 0;
@@ -166,7 +176,7 @@ class App {
     const id = ++this.next;
     const reply = new Promise((resolve) => this.pending.set(id, resolve));
     this.socket.write(`${JSON.stringify({ id, window, js: expression })}\n`);
-    const result = await Promise.race([reply, sleep(timeout)]);
+    const result = await within(timeout, reply);
     this.pending.delete(id);
     // a page that is loading or reloading does not answer
     if (!result) throw new Error(`no answer from the ${window} window`);
@@ -320,8 +330,9 @@ async function main() {
   publish("0.1.2", "Broken build", (dist) => {
     const file = path.join(dist, "main.js");
     const script = fs.readFileSync(file, "utf8");
-    const confirmation = 'await plugin("notify_ready");\n';
-    assert(script.includes(confirmation), "main.js no longer confirms the frontend");
+    // the checkout has CRLF line endings on Windows
+    const confirmation = /^await plugin\("notify_ready"\);\r?\n/m;
+    assert(confirmation.test(script), "main.js no longer confirms the frontend");
     fs.writeFileSync(file, script.replace(confirmation, ""));
   });
   app = await App.start();
