@@ -15,7 +15,7 @@ keys and `tauri signer` tooling, same manifest fields, same
 | --- | --- | --- |
 | Replaces | the application | the frontend assets |
 | Artifact | installer / app bundle per platform, signed by `tauri build` | one `frontend.tar.gz` for all platforms, signed by you |
-| Applies | after restart | on webview reload, or on next launch |
+| Applies | after restart | on webview reload, or on next launch; optionally only once the user agreed |
 | Default scope | any newer version | newer **patch** versions of the installed binary |
 | Safety net | none | a frontend that does not call `notifyReady()` is rolled back |
 
@@ -32,18 +32,23 @@ and a local server, start to finish.
 ```toml
 # src-tauri/Cargo.toml
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", tag = "v1.0.0" }
+tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", tag = "v1.1.0" }
 ```
 
 ```bash
-npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#v1.0.0"
+npm install https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin/releases/download/v1.1.0/tauri-plugin-ffp-ota-updater-api-1.1.0.tgz
 ```
 
 > The crate and the npm package (`tauri-plugin-ffp-ota-updater-api`) are not
-> on crates.io / npm yet, so both are installed from git; the JS package is
-> built on your machine while it installs. Give both the same release tag:
-> the two halves talk to each other and have to match, and without a tag each
-> follows the branch on its own.
+> on crates.io / npm yet. The crate is installed from the release's git tag,
+> the JS package from the file attached to the
+> [release](https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin/releases),
+> which is built already. Give both the same version: the two halves talk to
+> each other and have to match.
+> To install the JS package from git instead, use
+> `npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#v1.1.0"`;
+> it is then built on your machine while it installs, which needs a package
+> manager that runs the `prepare` script of a git dependency.
 > `tauri add` does not know this plugin. Without a bundler, call the commands
 > through `invoke` as [`examples/tauri-app`](examples/tauri-app/src/main.js)
 > does.
@@ -154,7 +159,8 @@ release build (`tauri build`).
 | **learn** it by shipping one update locally | [Tutorial: your first frontend update](docs/tutorial.md) |
 | **publish** updates | [Anywhere](docs/how-to/publish.md) · [GitHub Releases](docs/how-to/publish-github-releases.md) · [CrabNebula Cloud](docs/how-to/publish-crabnebula.md) |
 | **use it next to `tauri-plugin-updater`** | [Use with the updater plugin](docs/how-to/use-with-updater-plugin.md), including what differs if you know that plugin |
-| **build the update experience** (prompts, staging, channels, multi-page apps, no-reload switching) | [Integrate updates into your app](docs/how-to/integrate.md) |
+| **build the update experience** (asking the user first, staging, channels, several pages or windows, no-reload switching, tying a frontend to a native build) | [Integrate updates into your app](docs/how-to/integrate.md) |
+| **see it** in an app that asks first and has two windows | [`examples/consent-app`](examples/consent-app), which CI runs in a real webview on Linux, macOS and Windows |
 | **fix** something | [Troubleshooting](docs/how-to/troubleshoot.md) |
 | **look up** a key, function, error or format | [Configuration](docs/reference/configuration.md) · [API](docs/reference/api.md) · [Manifest, bundle and store](docs/reference/formats.md) |
 | **understand** the design | [How it works](docs/explanation/how-it-works.md) · [What a frontend update can change](docs/explanation/frontend-only-updates.md) |
