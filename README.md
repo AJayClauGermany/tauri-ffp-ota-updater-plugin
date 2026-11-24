@@ -32,11 +32,11 @@ and a local server, start to finish.
 ```toml
 # src-tauri/Cargo.toml
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", tag = "v1.1.0" }
+tauri-plugin-ffp-ota-updater = { git = "https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin", tag = "v1.0.0" }
 ```
 
 ```bash
-npm install https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin/releases/download/v1.1.0/tauri-plugin-ffp-ota-updater-api-1.1.0.tgz
+npm install https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin/releases/download/v1.0.0/tauri-plugin-ffp-ota-updater-api-1.0.0.tgz
 ```
 
 > The crate and the npm package (`tauri-plugin-ffp-ota-updater-api`) are not
@@ -46,7 +46,7 @@ npm install https://github.com/AJayClauGermany/tauri-ffp-ota-updater-plugin/rele
 > which is built already. Give both the same version: the two halves talk to
 > each other and have to match.
 > To install the JS package from git instead, use
-> `npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#v1.1.0"`;
+> `npm install "github:AJayClauGermany/tauri-ffp-ota-updater-plugin#v1.0.0"`;
 > it is then built on your machine while it installs, which needs a package
 > manager that runs the `prepare` script of a git dependency.
 > `tauri add` does not know this plugin. Without a bundler, call the commands

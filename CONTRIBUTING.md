@@ -92,17 +92,23 @@ feature `e2e`).
 3. Tag the merge commit `v<version>` and push the tag:
 
    ```bash
-   git tag v1.1.0
+   git tag v1.0.0
    ```
 
    ```bash
-   git push origin v1.1.0
+   git push origin v1.0.0
    ```
 
 `.github/workflows/release.yml` then creates the GitHub release and attaches
 the built JavaScript package (`npm pack`). The install commands of the README
 point at that tag and that file, so they work once the workflow has finished,
 and not before.
+
+The tag can be pushed at any time after the merge, but it has to be on a
+commit that contains the release workflow and has the tag's version in both
+`Cargo.toml` and `package.json`: the workflow runs from the tagged commit and
+fails if the versions differ. Do not move or reuse a tag once it is pushed;
+apps pin it. A later release needs a new version first.
 
 ## Documentation
 
