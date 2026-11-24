@@ -22,8 +22,12 @@ async function run(action) {
 
 // What the updater has on record. It is read from disk, so it also knows of a
 // download from an earlier run, and none of the buttons needs a connection.
+let shown = 0;
 async function show() {
+  const turn = ++shown;
   const status = await plugin("status");
+  // a later call is under way: it has the newer answer, and draws it
+  if (turn !== shown) return status;
   const { staged, approved } = status;
   $("version").textContent = status.currentVersion;
   $("state").textContent = !staged

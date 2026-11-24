@@ -206,7 +206,23 @@ class App {
 
   page = (window = "main") => this.js(window, PAGE);
   status = (window = "main") => this.js(window, STATUS);
-  click = (id) => this.js("main", `document.getElementById(${JSON.stringify(id)}).click()`);
+
+  /**
+   * Clicks a button of the main page as a user could: once the page has enabled it. The
+   * updater's status changes before the page has drawn it, so a click that follows a change
+   * of status at once would land on a button that is still disabled, and do nothing.
+   */
+  async click(id) {
+    const button = `document.getElementById(${JSON.stringify(id)})`;
+    await this.until("main", `!${button}.disabled`, (enabled) => enabled, `the ${id} button`);
+    try {
+      await this.js("main", `${button}.click()`);
+    } catch (error) {
+      // "Reload into it now" replaces the page, which may not get to answer first. What the
+      // click was for is checked by the step that follows.
+      if (!(error instanceof Error && error.message.startsWith("no answer"))) throw error;
+    }
+  }
 
   /** Waits for the main page to show what `accept` looks for. */
   shows = (accept, what) => this.until("main", PAGE, accept, what);
