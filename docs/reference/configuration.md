@@ -42,11 +42,15 @@ and can be given on the [Builder](#builder) instead.
 | `trialAttempts` | integer | `2` | Runs of the app in which a new bundle may be shown without confirming itself before it is rejected. Values below 1 count as 1. |
 | `readyTimeout` | integer (ms) | off | Time a bundle on trial gets, from the first page loaded from it, to call `notifyReady()` before it is rejected and replaced while the app is running. `0` is off. |
 | `compareBuildMetadata` | boolean | `false` | Order versions that differ only in build metadata by it (`1.2.1+2` after `1.2.1+1`, `1.2.0+1` after the binary `1.2.0`). By default build metadata is ignored when deciding what is newer. See [Versions](../explanation/how-it-works.md#versions). |
+| `requireApproval` | boolean | `false` | Serve a stored bundle only once the app has chosen it: with `approve()` for the next launch, or with `install()` / `activate()` at once. Until then it stays stored, across restarts, and is reported as `staged`. With `false`, the next launch switches to the newest stored bundle by itself. See [Approval](../explanation/how-it-works.md#approval). |
+| `requiredFiles` | string[] | `[]` | Files every bundle has to contain besides `index.html`, as paths from the root of the frontend build (`settings.html`, `editor/index.html`). A bundle that lacks one is refused with `invalidBundle`, when it is downloaded or staged and whenever it is loaded. An entry that cannot be a path in a bundle (`..`, a backslash) is a setup error. |
 | `maxBundleSize` | integer (bytes) | `67108864` (64 MiB) | Largest `.tar.gz` accepted. |
 | `maxUnpackedSize` | integer (bytes) | `268435456` (256 MiB) | Largest total size of the files in a bundle. They are held in memory. |
 
 A non-`https` entry in `endpoints` without
 `dangerousInsecureTransportProtocol` is a setup error: the app does not start.
+The same goes for a `pubkey` that cannot be read and an entry of
+`requiredFiles` that cannot be a path.
 
 ```json
 {
@@ -120,7 +124,7 @@ Per-check settings: [`RequestOptions`](api.md#requestoptions).
 
 | Permission | Allows |
 | --- | --- |
-| `ffp-ota-updater:default` | `check`, `download`, `install`, `download-and-install`, `current-version`, `notify-ready`, `status`, `discard` |
+| `ffp-ota-updater:default` | `check`, `download`, `install`, `download-and-install`, `current-version`, `notify-ready`, `status`, `discard`, `approve`, `unapprove` |
 | `ffp-ota-updater:allow-rollback` | `rollback()`. Not in `default`. |
 | `ffp-ota-updater:allow-reset` | `reset()`. Not in `default`. |
 
@@ -149,7 +153,15 @@ not apply them gets the commands by name instead of `default`:
 ```
 
 What it downloads is still applied at the next launch; only `discard` or a
-decision in Rust prevents that.
+decision in Rust prevents that. With `requireApproval` it is not: nothing is
+applied until `approve`, `install` or `download-and-install` is called, so a
+webview without those three cannot switch frontends, and the decision can be
+left to Rust.
+
+Capabilities are per window. In an app with several windows, a window that
+should not be able to confirm a bundle (a splash screen, say) gets a
+capability without `allow-notify-ready`: see
+[Apps with several windows](../how-to/integrate.md#apps-with-several-windows).
 
 The options a webview passes to `check` (`headers`, `timeout`, `proxy`)
 replace the builder's for that check. To keep them out of the webview's hands,

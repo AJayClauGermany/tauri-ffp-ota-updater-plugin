@@ -28,6 +28,8 @@ produce yourself:
 - **It only uses what the installed binary has**: no new Rust commands,
   plugins, permissions or CSP entries
   ([details](../explanation/frontend-only-updates.md)).
+- **It contains every page the app requires**, if the app sets
+  `requiredFiles`.
 - **Tauri CLI 2.12 or newer** (`npm run tauri -- --version`), for
   `--app-version`.
 
@@ -172,6 +174,10 @@ tell if an endpoint hands it another platform's: it accepts any bundle signed
 for that version. This layout is for builds that differ in detail, not for
 ones that break on the wrong platform. A device also keeps the first bundle
 it stored under a version.
+
+For builds that do break on the wrong platform, put the platform into the
+version (`1.2.1+windows`), which is signed, and let the app refuse the others:
+[Bind a frontend to a native build or IPC contract](integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract).
 
 ## Taking a release back
 

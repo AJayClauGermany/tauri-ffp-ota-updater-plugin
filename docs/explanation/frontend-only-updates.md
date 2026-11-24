@@ -16,6 +16,11 @@ If you keep patch releases frontend-only (see
 every binary of a line is identical in this respect and the question
 disappears. If you do not, the oldest binary sets the limit.
 
+If binaries of one version can differ in what they offer, the version is not
+enough to go by. A frontend can then name the native build or IPC contract it
+was made for, and the binary holds bundles to it:
+[Bind a frontend to a native build or IPC contract](../how-to/integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract).
+
 ## Fixed in the binary
 
 These are compiled in or read from `tauri.conf.json` at build time. A frontend
@@ -27,7 +32,7 @@ runtime, typically with a rejected `invoke`.
 | **Rust commands** | A new or changed command needs a full release. |
 | **Plugins** | Keep the `@tauri-apps/plugin-*` npm packages at the versions the binary was built with. The JavaScript half of a plugin talks to the Rust half; a newer JS package may call commands the installed plugin does not have. |
 | **Capabilities and permissions** | Calling a command that was not permitted at build time is refused, however new the frontend is. |
-| **Windows** | Window labels and the page each window opens. |
+| **Windows** | Window labels and the page each window opens. Name those pages in `requiredFiles`, so that a bundle without one is refused. |
 | **Content Security Policy** | A new API host, font or image origin has to be in the CSP of the binary. |
 | **Asset and filesystem scopes** | |
 | **The app version** | `getVersion()` from `@tauri-apps/api/app` keeps returning the binary's version. Use this plugin's `currentVersion()` for what the user is actually running. |

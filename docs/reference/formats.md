@@ -43,7 +43,8 @@ A gzip-compressed tar archive of the frontend build output
 
 | Rule | |
 | --- | --- |
-| `index.html` at the root | Required. No other file is checked for. |
+| `index.html` at the root | Required. |
+| Files named in [`requiredFiles`](configuration.md#tauriconfjson) | Required. No other file is checked for. |
 | Paths | Relative. `./assets/app.js`, `assets/app.js` and `assets//app.js` all become `/assets/app.js`. Absolute paths, `..`, backslashes, control characters and non-UTF-8 names are refused. |
 | Entry types | Regular files and directories. Links and special files are refused. A leading global pax header (`git archive`) is skipped. |
 | Duplicates | The same file twice is refused. |
@@ -91,7 +92,7 @@ Directory `ffp-ota-updater/` in the app's local data directory
 | --- | --- |
 | `<version>.tar.gz` | A bundle exactly as downloaded. Never replaced by other contents; see below. |
 | `<version>.tar.gz.sig` | The `signature` it was announced with. |
-| `state.json` | `confirmed` (version or null), `trial` (version or null), `attempts` (number), `rejected` (versions). Fields a version of the plugin does not know are ignored. |
+| `state.json` | `confirmed` (version or null), `trial` (version or null), `attempts` (number), `rejected` (versions), `approved` (version or null). Fields a version of the plugin does not know are ignored. |
 | `*.part` | A write in progress. Removed at the next launch if left behind. |
 | `.lock` | Locked by the process that is changing the store. |
 
@@ -103,6 +104,11 @@ At launch the newest stored bundle that is compatible with the binary, not
 rejected and valid is served. Bundles that are incompatible, rejected, invalid
 or not newer than the one served (except the confirmed fallback) are deleted.
 A bundle that cannot be read for now (an I/O error) is skipped and kept.
+
+With `requireApproval`, a launch chooses only among the bundles on record as
+`approved`, `trial` or `confirmed`. The other stored bundles wait and are not
+verified at launch. Of those, the newest is kept; older ones and ones the
+binary cannot run are deleted.
 
 A version is stored once. Other contents for a stored version are refused
 (`inUse`) until it is discarded or deleted at a launch, with one exception: a
@@ -116,7 +122,7 @@ macOS, so the second is refused on every platform.
 | --- | --- | --- |
 | missing | A new store: nothing confirmed, on trial or rejected. | |
 | cannot be read (permissions, an I/O error) | The built-in frontend is served. Nothing is deleted or written. | Whatever needs the record (accepting, installing or discarding a bundle, a `check()` that finds a release) fails with `io` until it can be read. |
-| not valid JSON | Its content is lost. It is written anew; the stored bundles are kept, verified as always, and the newest goes on trial. | |
+| not valid JSON | Its content is lost. It is written anew; the stored bundles are kept, verified as always, and the newest goes on trial. With `requireApproval` the built-in frontend is served instead and the newest stored bundle waits for approval again. | |
 
 A version is recorded as rejected before its bundle is deleted. If that
 cannot be written, nothing is deleted, and `rollback()` fails after having

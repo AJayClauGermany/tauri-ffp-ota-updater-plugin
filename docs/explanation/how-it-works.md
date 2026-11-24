@@ -7,6 +7,7 @@ seeing it, and why the plugin behaves the way it does. For steps, see the
 
 - [Serving a different frontend](#serving-a-different-frontend)
 - [The life of a bundle](#the-life-of-a-bundle)
+- [Approval](#approval)
 - [Versions](#versions)
 - [Trial and rollback](#trial-and-rollback)
 - [Security](#security)
@@ -59,7 +60,8 @@ price is memory: the unpacked frontend is held in RAM, which is what
 - **`download()`** fetches the tarball, verifies it and stores it. Nothing
   else happens: the app keeps showing what it showed.
 - **`install()`** makes the stored bundle the active one and reloads the
-  webviews. Without it, the next launch does the same thing.
+  webviews. Without it, the next launch does the same thing, unless the app
+  asked for [approval](#approval) first.
 - **At every launch** the plugin picks the newest stored bundle that is still
   compatible with the binary, verifies it again and serves it. If none is
   usable, the built-in frontend is served. Selection never fails.
@@ -67,6 +69,60 @@ price is memory: the unpacked frontend is held in RAM, which is what
 Downloading and applying are separate on purpose. A bundle that is stored
 needs no network to be applied, so "download now, switch when convenient" and
 "switch at the next start" are the same mechanism.
+
+## Approval
+
+By default a stored bundle is a decision already made: the next launch
+switches to it. That is right for an app that updates silently, and wrong for
+one that has to ask first. Such an app could only decline by deleting the
+download (`discard()`), and would have to keep it somewhere else to tell
+"downloaded and verified" from "agreed to".
+
+`requireApproval` separates the two. A bundle that was downloaded stays
+stored, across any number of restarts, and a launch serves only what the app
+chose:
+
+```text
+              download()                 approve()               next launch
+ manifest ───────────────▶ stored ─────────────────▶ approved ───────────────▶ on trial
+                         (`staged`)                (`approved`)
+                             │                          │ unapprove()               ▲
+                             │◀─────────────────────────┘                           │
+                             └──────────────── install() / activate() ──────────────┘
+```
+
+- **`approve()`** records the choice and changes nothing in the run that makes
+  it. The next launch switches. Until then it can be taken back with
+  `unapprove()`.
+- **`install()` and `activate()`** switch at once, and count as approval.
+- **A bundle that was served before** needs no second approval: one on trial
+  gets its remaining attempts, the confirmed one stays the fallback.
+- **Nothing else moves a device forward.** Not a launch, not a newer download,
+  not a rollback: a bundle that was downloaded while another was on trial
+  still waits after that trial failed.
+
+Approval is a record in the store, next to what is confirmed and rejected, so
+it survives restarts and needs no network. One version is approved at a time,
+which is the one the user was asked about: if `1.2.1` is approved and `1.2.2`
+arrives before the restart, the next launch serves `1.2.1`, and `1.2.2` is
+reported as `staged` for the app to ask again.
+
+Two things follow from a bundle being able to wait indefinitely:
+
+- A bundle that waits is not verified at launch, which would mean unpacking
+  something that is not going to be shown. It was verified when it was stored
+  and is verified again when it is approved and when it is loaded.
+- Of the bundles that wait, a launch keeps only the newest. Versions only move
+  forward, so nothing would ever offer the older ones, and they would pile up
+  on a device whose user never agrees.
+
+The approval does not replace the trial. An approved bundle still has to
+confirm itself with `notifyReady()`, and is rolled back if it does not.
+
+Whether the frontend may give that approval is a question of permissions:
+`approve`, `install` and `download-and-install` are the three commands that
+move a device forward. An app that asks in a native dialog leaves them out of
+its capabilities and calls `approve` from Rust.
 
 ## Versions
 
@@ -92,6 +148,11 @@ broken in ways no rollback can detect in time. Those releases are left to a
 full update. The plugin cannot inspect your Rust code, so the version number
 is the contract: publishing a patch is your statement that the binary did not
 need to change.
+
+Where the version number cannot say that, because two binaries with different
+native code carry the same one (a rebuild, a platform with commands of its
+own), the rule can go by more than major and minor:
+[Bind a frontend to a native build](../how-to/integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract).
 
 `Builder::compatibility` replaces the rule in 2 for projects with another
 convention. It is deliberately not a "version comparator" like the updater
@@ -129,7 +190,8 @@ that call is a failed attempt.
   deleted, never served and never offered by `check()` again. The app serves
   the last confirmed bundle, or else the built-in frontend. The fix has to be
   published as a new version. A newer bundle that was downloaded but never
-  shown is kept, and is tried at the next launch.
+  shown is kept, and is tried at the next launch (with `requireApproval`, at
+  the next launch after it was approved).
 - The confirmed bundle is kept as the fallback until its successor is
   confirmed.
 
@@ -143,8 +205,10 @@ Details that matter in practice:
   stays on screen until the user restarts the app, twice with the default
   settings. `readyTimeout` adds a deadline that reverts it while the app is
   running; `rollback()` lets the frontend or the Rust side give up at once.
-- **Only a page of the bundle can confirm it.** Any window can, as long as its
-  page was loaded from the bundle on trial. While `install()` reloads the
+- **Only a page of the bundle can confirm it.** Any window that is permitted
+  to can, as long as its page was loaded from the bundle on trial. Which
+  windows are permitted is up to the app's capabilities: see
+  [Apps with several windows](../how-to/integrate.md#apps-with-several-windows). While `install()` reloads the
   windows one after the other, a window still showing the previous frontend
   cannot vouch for the new one. `notify_ready()` in Rust is not subject to
   this: from Rust it confirms whatever is being served.
@@ -235,7 +299,10 @@ What this does not cover:
   accepts the bundle, from any endpoint. Use one key pair per app, and do not
   rely on the endpoint to keep a bundle for one platform or channel away from
   another: if that would do harm, give them different versions, or build one
-  frontend that runs everywhere.
+  frontend that runs everywhere. The version is the one thing the signature
+  does carry, so it is also where a bundle can say which native build it was
+  made for:
+  [Bind a frontend to a native build](../how-to/integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract).
 - For the same reason, an app that shares its key pair with the updater plugin
   has two plugins that accept whatever that key signed. Reusing the pair is
   the simple setup and what the guides here assume. A pair of its own for

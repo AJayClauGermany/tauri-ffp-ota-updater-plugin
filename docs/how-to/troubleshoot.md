@@ -8,7 +8,7 @@ Find the symptom, apply the fix. Error names are the `kind` of an
 ```js
 import { status } from "tauri-plugin-ffp-ota-updater-api";
 console.log(await status());
-// { binaryVersion, currentVersion, confirmed, staged, rejected }
+// { binaryVersion, currentVersion, confirmed, staged, approved, rejected }
 ```
 
 The plugin logs through the `log` crate. Add
@@ -35,6 +35,7 @@ built-in frontend.
 | No `pubkey` is configured. `check()` fails with `emptyPubkey`. | Add it; see [Configuration](../reference/configuration.md#tauriconfjson). |
 | The plugin is registered inside `.setup()`. | Register it with `.plugin(…)` on `tauri::Builder`. |
 | Only `download()` was called. | That is how it works: the bundle is used from the next launch. Call `install()` or `downloadAndInstall()` to switch now. |
+| `requireApproval` is set and the bundle was not approved. `status()` has it as `staged`, at every start. | That is what the setting is for: call `approve(version)` to use it from the next launch, or `install(version)` to switch now. |
 
 ## `check()` resolves to `null`, but I published an update
 
@@ -59,7 +60,10 @@ version is now in `status().rejected`.
 - `notifyReady()` waits for something that does not always happen (a login, a
   network request).
 - `readyTimeout` is shorter than a slow start.
-- The permission for it is missing; see ["not allowed"](#unknown--command-not-allowed).
+- The permission for it is missing in the window that calls it; see
+  ["not allowed"](#unknown--command-not-allowed).
+- Only a window that was not meant to confirm loaded (a splash screen), and
+  the main page failed.
 - More instances of the app than `trialAttempts` were started before the
   first one confirmed; see
   [Limitations](../explanation/how-it-works.md#limitations).
@@ -147,6 +151,9 @@ The message says what is wrong with the archive.
 
 - `no index.html at the root of the archive`: the folder itself was packed.
   Use `tar -czf frontend.tar.gz -C dist .`, not `tar -czf frontend.tar.gz dist`.
+- `no … in the archive, which requiredFiles asks for`: the build lacks a page
+  the app was configured to require. The list is part of the binary: fix the
+  build, not the list.
 - A link or special file, a path with `..`, or the same file twice.
 - Not a gzipped tarball (a `.zip`, or an HTML error page saved as the file),
   or one that is cut short.
@@ -171,11 +178,11 @@ use `install(version)`.
 
 | Kind | Meaning |
 | --- | --- |
-| `notDownloaded` | `install()` for a version that is not stored. Download it first. |
+| `notDownloaded` | `install()` or `approve()` for a version that is not stored. Download it first. |
 | `notNewer` | The version is not newer than the frontend being served. Versions only move forward. |
 | `inUse` | `discard()` of the bundle being served, or of the confirmed one kept as the fallback. From `download()`: this device already stores other contents under that version. A version was published twice with different files; publish the new build under a new version. |
 | `rejected` | The version was rolled back on this device before. |
-| `incompatible` | The version is not a frontend update for this binary (see the first row of the `null` table above). |
+| `incompatible` | The version is not a frontend update for this binary (see the first row of the `null` table above). With a [rule of your own](integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract): the bundle was made for another native build. |
 
 ### `unknown` / "command not allowed"
 
@@ -204,6 +211,14 @@ nothing, and goes back to normal at the first launch that can read it.
 
 The frontend calls something the installed binary does not have or permit.
 See [What a frontend update can change](../explanation/frontend-only-updates.md).
+If binaries with the same version differ in what they offer, see
+[Bind a frontend to a native build or IPC contract](integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract).
+
+## After the update, a window shows the main page instead of its own
+
+The bundle lacks that window's page, and Tauri answers with `index.html`.
+Name the pages in [`requiredFiles`](../reference/configuration.md#tauriconfjson)
+so that such a bundle is refused.
 
 ## Signing fails
 
