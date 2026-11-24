@@ -34,6 +34,15 @@ const KEY_PASSWORD = "e2e";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Deletes `dir` if it can. On Windows a webview process that is still closing may hold a file. */
+function remove(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  } catch (error) {
+    console.warn(`could not delete ${dir}: ${error.message}`);
+  }
+}
+
 function run(command, args, options = {}) {
   // stdout is where the signer prints keys and signatures, at length
   const result = spawnSync(command, args, { stdio: ["ignore", "ignore", "inherit"], ...options });
@@ -252,7 +261,7 @@ async function main() {
     darwin: path.join(os.homedir(), "Library", "Application Support", identifier),
     win32: path.join(process.env.LOCALAPPDATA ?? "", identifier),
   }[process.platform];
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  remove(dataDir);
 
   step("1. online: an update is downloaded, and nothing changes");
   publish("0.1.1", "Updated over the air");
@@ -359,7 +368,7 @@ async function main() {
   await app.exit();
   await offline();
 
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  remove(dataDir);
   console.log("\nAll steps passed.");
 }
 
@@ -371,5 +380,5 @@ main()
   .finally(() => {
     running?.process.kill();
     server?.close();
-    fs.rmSync(work, { recursive: true, force: true });
+    remove(work);
   });
