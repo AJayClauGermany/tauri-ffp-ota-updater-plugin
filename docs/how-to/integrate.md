@@ -14,6 +14,8 @@ Recipes for the update experience, once the plugin is
 - [Send headers, use a proxy or a private CA](#send-headers-use-a-proxy-or-a-private-ca)
 - [Switch without reloading at a bad moment](#switch-without-reloading-at-a-bad-moment)
 - [Multi-page apps](#multi-page-apps)
+- [Apps with several windows](#apps-with-several-windows)
+- [Bind a frontend to a native build or IPC contract](#bind-a-frontend-to-a-native-build-or-ipc-contract)
 - [Bring your own bundles](#bring-your-own-bundles)
 - [Apps that also build for mobile](#apps-that-also-build-for-mobile)
 - [Use it without a bundler](#use-it-without-a-bundler)
@@ -65,9 +67,66 @@ this on every start is cheap.
 
 ## Ask the user before updating
 
-`status()` makes no request, so it also tells you about a bundle downloaded in
-an earlier run. Ask it whether or not the check worked, so that the bundle can
-be applied while offline:
+Set `requireApproval`. A bundle that was downloaded then changes nothing until
+the user has agreed: not in this run, and not at the next launch either.
+
+```json
+{ "plugins": { "ffp-ota-updater": { "requireApproval": true } } }
+```
+
+Download whenever it suits the app, for instance
+[from Rust](#check-from-rust) at startup. `status()` makes no request, so it
+also knows about a bundle that was downloaded in an earlier run, and the
+user's answer can be acted on while offline:
+
+```js
+import { status, approve, install, discard } from "tauri-plugin-ffp-ota-updater-api";
+
+const { staged, approved } = await status();
+if (staged && staged !== approved) {
+  // `ask` is yours: a dialog with these four answers
+  const answer = await ask(`Version ${staged} is ready.`, [
+    "Reload now",
+    "At the next start",
+    "Later",
+    "Skip",
+  ]);
+  if (answer === "Reload now") {
+    await install(staged);   // reloads every window
+  } else if (answer === "At the next start") {
+    await approve(staged);   // nothing changes until the app is started again
+  } else if (answer === "Skip") {
+    await discard(staged);   // deletes the download
+  }
+  // "Later" needs no call: the bundle stays stored, and `staged` reports it
+  // at every start until the user decides
+}
+```
+
+- `approve()` can be taken back with `unapprove(version)` until the app is
+  restarted. Show `approved` as "will be used at the next start".
+- One version is approved at a time. If a newer bundle arrives before the
+  restart, the next launch still switches to the approved one, and the newer
+  one is reported as `staged` afterwards.
+- Of several bundles that wait, a launch keeps the newest.
+- To ask in a native dialog, call `app.ota_updater().approve(&version)` or
+  `install(&version)` from Rust, and leave `allow-approve`, `allow-install`
+  and `allow-download-and-install` out of the capabilities: the frontend can
+  then fetch updates but not switch to one
+  ([Permissions](../reference/configuration.md#permissions)).
+- Discarding is not a rejection: `check()` offers the version again, so
+  remember the user's answer if it should not be asked again. Discard only
+  once `download()` has settled: a download that is still running stores the
+  bundle again.
+
+[`examples/consent-app`](../../examples/consent-app) is a small app built this
+way, with two windows.
+
+### Without `requireApproval`
+
+A downloaded bundle is then used at the next launch whatever the user
+answered, unless it is discarded. "Later" and "at the next start" are the
+same thing, and declining means deleting the download:
 
 ```js
 import { check, status, install, discard } from "tauri-plugin-ffp-ota-updater-api";
@@ -81,7 +140,6 @@ try {
 
 const { staged } = await status();
 if (staged) {
-  // `ask` is yours: a dialog with these three answers
   const answer = await ask(`Version ${staged} is ready.`, ["Reload now", "Later", "Skip"]);
   if (answer === "Reload now") {
     await install(staged);   // reloads every window
@@ -90,12 +148,6 @@ if (staged) {
   }
 }
 ```
-
-Without `discard()` a downloaded bundle is used at the next launch whatever
-the user answered. Discarding is not a rejection: `check()` offers the version
-again, so remember the user's answer if it should not be asked again.
-Discard only once `download()` has settled: a download that is still running
-stores the bundle again.
 
 ## Show download progress
 
@@ -152,7 +204,8 @@ use tauri_plugin_ffp_ota_updater::OtaUpdaterExt;
 .setup(|app| {
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(async move {
-        // staged for the next launch; errors (offline) are not fatal
+        // staged for the next launch, or with `requireApproval` until the
+        // user agrees; errors (offline) are not fatal
         if let Ok(Some(update)) = handle.ota_updater().check().await {
             let _ = update.download(|_, _| {}, || {}).await;
         }
@@ -286,8 +339,149 @@ Every page is a fresh document, which has three consequences:
   contains, and requests for files of the previous build, are answered with
   `index.html` (Tauri's fallback), not with an error: keep page paths stable.
 
-Only the presence of `index.html` is checked when a bundle is accepted. A
-bundle that lacks another page is accepted and that page is then missing.
+Only the presence of `index.html` is checked when a bundle is accepted, unless
+you name the other pages in `requiredFiles`: a bundle that lacks one of them
+is then refused instead of answering for it with the index page.
+
+```json
+{ "plugins": { "ffp-ota-updater": { "requiredFiles": ["about.html", "settings/index.html"] } } }
+```
+
+## Apps with several windows
+
+**Require the page of every window.** Which page a window opens is fixed in
+the binary. A bundle that lacks it would not fail: Tauri answers with
+`index.html`, and the window shows the wrong page. List the pages in
+`requiredFiles` and such a bundle is refused when it is downloaded:
+
+```json
+{ "plugins": { "ffp-ota-updater": { "requiredFiles": ["editor.html", "splash.html"] } } }
+```
+
+**Let only a real page confirm.** A bundle is confirmed by the first page of
+it that calls `notifyReady()`, in any window. A splash screen, a tray popup or
+a hidden bootstrap window loads fine from a bundle whose main page is broken,
+so it must not be the one that vouches for it. Do not call `notifyReady()`
+there, and take the permission away so that a later change cannot add it
+back. Capabilities are per window; instead of `ffp-ota-updater:default` for
+all of them, give every window what it needs by name:
+
+```json
+{
+  "identifier": "every-window",
+  "windows": ["*"],
+  "permissions": ["core:default", "ffp-ota-updater:allow-status"]
+}
+```
+
+```json
+{
+  "identifier": "main-window",
+  "windows": ["main"],
+  "permissions": [
+    "ffp-ota-updater:allow-notify-ready",
+    "ffp-ota-updater:allow-approve",
+    "ffp-ota-updater:allow-unapprove",
+    "ffp-ota-updater:allow-install",
+    "ffp-ota-updater:allow-discard"
+  ]
+}
+```
+
+A window whose page was loaded puts the bundle on trial all the same: with
+`readyTimeout`, the clock starts when the splash screen is served.
+
+**Check once, in Rust.** Each window is a document of its own and would run
+its own check. [Check from Rust](#check-from-rust) and let the windows read
+`status()`.
+
+**Switch all windows together.** `install()` reloads every window, from
+whichever one it is called. For windows that hold unsaved work, see
+[Switch without reloading at a bad moment](#switch-without-reloading-at-a-bad-moment),
+or let the user [approve](#ask-the-user-before-updating) the bundle for the
+next start, when no document is open.
+
+## Bind a frontend to a native build or IPC contract
+
+By default the version says which binaries a frontend runs on: the later
+patches of their line. That is not enough when two binaries with the same
+version differ in what the frontend can call: a rebuild that changed a
+command, an installer feed that counts builds separately from the version
+users see, a platform with commands of its own.
+
+Give the binary a name for what it offers, and let each frontend say in its
+version which one it was built for. Build metadata, the part after `+`, is
+the place: it is part of the version, so the signature covers it, and it
+plays no role in deciding which version is newer.
+
+```rust
+/// Changes whenever a frontend built for the previous value could not run on
+/// this binary: a command or its arguments changed, a permission is gone.
+const IPC_CONTRACT: &str = "ipc3";
+
+tauri_plugin_ffp_ota_updater::Builder::new()
+    .compatibility(|binary, bundle| {
+        tauri_plugin_ffp_ota_updater::default_compatibility(binary, bundle)
+            && bundle.build.as_str() == IPC_CONTRACT
+    })
+    .build()
+```
+
+Publish the frontend under that version, wherever a version is given:
+
+```bash
+npm run tauri signer sign -- --app-version 1.2.1+ipc3 frontend-1.2.1-ipc3.tar.gz
+```
+
+```json
+{
+  "version": "1.2.1+ipc3",
+  "url": "https://releases.example.com/frontend-1.2.1-ipc3.tar.gz",
+  "signature": "CONTENT OF frontend-1.2.1-ipc3.tar.gz.sig"
+}
+```
+
+Keep the `+` out of the file name: some hosts read it as a space in a URL.
+
+What this gives you:
+
+- A frontend with another tag, or with none, is not offered by `check()`
+  (`null`) and is refused by `download()` and `stage()` with `incompatible`.
+  The tag is inside the signature, so a changed manifest cannot relabel a
+  bundle.
+- The rule is applied again at every launch. When the binary is replaced by
+  one with another contract, **even one with the same version**, the bundles
+  stored for the old one are deleted at its first launch, the confirmed one
+  included, and the built-in frontend is served.
+- `1.2.1+ipc3` and `1.2.1+ipc4` are one release built twice: they have the
+  same place in the order of versions, and a device accepts only the one made
+  for it.
+
+Things to decide:
+
+- **What the tag stands for.** A contract number that you raise by hand when
+  the IPC changes incompatibly lets several native builds share a frontend. A
+  build id from CI (`env!("APP_BUILD_ID")`, a commit hash) binds each
+  frontend to exactly one native build, at the price of publishing one for
+  every build that is in use. A binary that still serves the previous
+  contract can accept both:
+  `["ipc3", "ipc4"].contains(&bundle.build.as_str())`.
+- **Which manifest a device asks.** One URL describes one release, so each
+  contract needs its own. Put the tag into the endpoint from Rust,
+  `.endpoints(vec![format!("https://releases.example.com/ota/{IPC_CONTRACT}/ota.json").parse()?])`,
+  or send it as a header (`.header("X-Ipc-Contract", IPC_CONTRACT)?`) to a
+  server that decides. A device that is handed another contract's manifest
+  loses nothing: its `check()` resolves to `null`.
+- **Leave `compareBuildMetadata` off.** With it, build metadata also orders
+  versions, and a tag is not a counter.
+
+The same works for frontends that differ by platform: `1.2.1+windows`, and
+`cfg!(windows)` in the rule.
+
+As a second line of defence, the frontend can ask the binary what it offers,
+through a command of your own, before it calls `notifyReady()`, and call
+[`rollback()`](#recover-from-a-broken-frontend-sooner) when that is not what
+it was built for.
 
 ## Bring your own bundles
 
@@ -300,11 +494,13 @@ shipped next to the installer, a patch applied to the previous archive.
 let updater = app.ota_updater();
 updater.stage(&archive, &signature, &version)?;  // verified, then stored
 updater.install(&version)?;                      // or leave it for the next launch
+                                                 // (`approve` it, with `requireApproval`)
 ```
 
 `stage` applies every check a download gets (signature, signed version,
-compatibility, size limits, archive contents). `activate(&version)`,
-`install(&version)` and `discard(&version)` work on any stored bundle.
+compatibility, size limits, archive contents, required files).
+`activate(&version)`, `install(&version)`, `approve(&version)` and
+`discard(&version)` work on any stored bundle.
 
 A version is stored once: staging other contents under a version that is
 already stored fails with `InUse`. Staging the same archive again does

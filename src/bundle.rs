@@ -9,7 +9,8 @@
 //! on trial, and which versions were rejected. A bundle goes through these stages:
 //!
 //! - *stored*: downloaded, and no page has been loaded from it yet. Launching the app any
-//!   number of times without showing it changes nothing.
+//!   number of times without showing it changes nothing. With `requireApproval` it is not even
+//!   picked at a launch until the app has *approved* it ([`Store::approve`]).
 //! - *on trial*: a page was loaded from it ([`Store::begin_trial`]). Every run of the app that
 //!   does so without a confirmation following counts as a failed attempt.
 //! - *confirmed* by the frontend ([`Store::confirm`]), which makes it the fallback, or
@@ -125,6 +126,7 @@ impl Bundle {
         version: &Version,
         require_signed_version: bool,
         limits: Limits,
+        required: &[String],
     ) -> Result<Self> {
         if archive.len() as u64 > limits.archive {
             return Err(Error::TooLarge("bundle", limits.archive));
@@ -159,6 +161,14 @@ impl Bundle {
             return Err(Error::InvalidBundle(
                 "no index.html at the root of the archive".into(),
             ));
+        }
+        // Tauri answers a request for a page that is not there with `index.html`: a window
+        // whose page is missing would show the wrong one instead of failing.
+        if let Some(missing) = required.iter().find(|key| !files.contains_key(*key)) {
+            return Err(Error::InvalidBundle(format!(
+                "no {} in the archive, which `requiredFiles` asks for",
+                missing.trim_start_matches('/')
+            )));
         }
 
         Ok(Self {
@@ -240,7 +250,7 @@ fn unpack(stream: impl Read, limit: u64) -> Result<HashMap<String, Vec<u8>>> {
 
 /// Turns an archive path into the key Tauri looks assets up by: `./assets/app.js` (what
 /// `tar -C dist .` writes) becomes `/assets/app.js`.
-fn asset_key(path: &[u8]) -> Result<String> {
+pub(crate) fn asset_key(path: &[u8]) -> Result<String> {
     let bad = || Error::InvalidBundle(format!("bad path `{}`", String::from_utf8_lossy(path)));
     let path = std::str::from_utf8(path).map_err(|_| bad())?;
     if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
@@ -330,6 +340,10 @@ struct State {
     /// Versions that failed a trial or were rolled back. They are never served or offered
     /// again; a fixed frontend needs a new version.
     rejected: BTreeSet<Version>,
+    /// The stored bundle the app chose to move to: approved for the next launch, or, with
+    /// `requireApproval`, switched to while running. With `requireApproval` a launch serves no
+    /// bundle that is neither this one nor on record above.
+    approved: Option<Version>,
 }
 
 /// The directory downloaded bundles live in: `<version>.tar.gz` plus `<version>.tar.gz.sig`,
@@ -339,8 +353,12 @@ pub(crate) struct Store {
     pub pubkey: String,
     pub require_signed_version: bool,
     pub limits: Limits,
+    /// Files a bundle has to contain besides `index.html`, as asset keys.
+    pub required_files: Vec<String>,
     /// With rollback off every bundle counts as confirmed as soon as it is served.
     pub rollback: bool,
+    /// A launch only serves a bundle the app chose, see [`State::approved`].
+    pub require_approval: bool,
     /// Failed attempts after which a bundle on trial is rejected.
     pub trial_attempts: u32,
     /// The trial this run of the app already counts as an attempt of.
@@ -452,7 +470,8 @@ impl Store {
     }
 
     /// The newest stored bundle that is newer than `current` and may be served, i.e. the one
-    /// the next launch would pick. Goes by the files present; nothing is verified.
+    /// the next launch would pick, if it does not have to be approved first. Goes by the files
+    /// present; nothing is verified.
     ///
     /// Takes no lock: it only reads, and `status` should not wait for a download that is being
     /// verified.
@@ -463,6 +482,47 @@ impl Store {
                 && self.compatible(version)
                 && !self.rejected_in(&state, version)
         })
+    }
+
+    /// The bundle approved for the next launch, while it is stored, ahead of `current` and may
+    /// be served. Like [`Self::staged`] it takes no lock and verifies nothing.
+    pub fn approved(&self, current: &Version) -> Option<Version> {
+        let state = self.read_state().ok()?;
+        state.approved.clone().filter(|version| {
+            self.order.newer(version, current)
+                && self.compatible(version)
+                && !self.rejected_in(&state, version)
+                && self.archive_path(version).is_file()
+        })
+    }
+
+    /// Records that the app chose the stored bundle `version`: the next launch serves it,
+    /// which with `requireApproval` it would not do otherwise. The bundle is verified first, so
+    /// that what is approved is something that can be served.
+    pub fn approve(&self, version: &Version) -> Result<()> {
+        let _guard = self.guard();
+        let mut state = self.read_state()?;
+        if self.rejected_in(&state, version) {
+            return Err(Error::Rejected(version.to_string()));
+        }
+        self.load(version)?;
+        if state.approved.as_ref() != Some(version) {
+            state.approved = Some(version.clone());
+            self.write_state(&state)?;
+        }
+        Ok(())
+    }
+
+    /// Takes back the approval of `version`, which stays stored. Another version's approval is
+    /// left alone, as is a bundle that was served before: that one is abandoned by a rollback.
+    pub fn unapprove(&self, version: &Version) -> Result<()> {
+        let _guard = self.guard();
+        let mut state = self.read_state()?;
+        if state.approved.as_ref() == Some(version) {
+            state.approved = None;
+            self.write_state(&state)?;
+        }
+        Ok(())
     }
 
     /// Whether serving `version` is a trial, i.e. it still has to be confirmed. It is unless
@@ -574,6 +634,7 @@ impl Store {
             version,
             self.require_signed_version,
             self.limits,
+            &self.required_files,
         )
     }
 
@@ -732,10 +793,9 @@ impl Store {
             }
         }
         let state = self.load_state()?;
-        if state
-            .as_ref()
-            .is_none_or(|state| state.confirmed.is_some() || state.trial.is_some())
-        {
+        if state.as_ref().is_none_or(|state| {
+            state.confirmed.is_some() || state.trial.is_some() || state.approved.is_some()
+        }) {
             self.write_state(&State {
                 rejected: state.map(|state| state.rejected).unwrap_or_default(),
                 ..State::default()
@@ -753,9 +813,15 @@ impl Store {
             return Err(Error::InUse(version.to_string()));
         }
         self.remove(version)?;
+        let old_state = state.clone();
         if state.trial.as_ref() == Some(version) {
             state.trial = None;
             state.attempts = 0;
+        }
+        if state.approved.as_ref() == Some(version) {
+            state.approved = None;
+        }
+        if state != old_state {
             self.write_state(&state)?;
         }
         Ok(())
@@ -779,6 +845,12 @@ impl Store {
             state.trial = None;
             state.attempts = 0;
         }
+        if self.require_approval && state.confirmed.as_ref() != Some(version) {
+            // Switching to it is the app's choice as well. Without this, an app that is closed
+            // before a page was loaded from the bundle would find it waiting for approval
+            // again: its trial, which is what a launch goes by otherwise, has not begun.
+            state.approved = Some(version.clone());
+        }
         if state != old_state {
             self.write_state(&state)?;
         }
@@ -795,6 +867,13 @@ impl Store {
         if state.trial.as_ref() == Some(serving) {
             state.confirmed = state.trial.take();
             state.attempts = 0;
+            if state
+                .approved
+                .as_ref()
+                .is_some_and(|approved| !self.order.newer(approved, serving))
+            {
+                state.approved = None;
+            }
             self.write_state(&state)?;
             self.prune(&state, serving);
         }
@@ -802,7 +881,10 @@ impl Store {
     }
 
     /// Picks the bundle to serve: the newest stored one that is compatible with the binary, was
-    /// not rejected and passes verification.
+    /// not rejected and passes verification. With `requireApproval`, only among those the app
+    /// chose: the approved bundle, and the ones that were served before (on trial or
+    /// confirmed). The others wait where they are, unverified; of those only the newest is
+    /// kept, as it is the one an approval would be asked for.
     ///
     /// Called at startup, where a trial that earlier runs left unconfirmed is rejected once its
     /// attempts are used up, and to roll back, where `reject` is the version to abandon. A
@@ -881,13 +963,31 @@ impl Store {
         {
             state.confirmed = None;
         }
+        if state
+            .approved
+            .as_ref()
+            .is_some_and(|v| !self.compatible(v) || self.rejected_in(&state, v))
+        {
+            state.approved = None;
+        }
 
         // a rollback goes back to what is known to work: the confirmed bundle or the built-in
         // assets
         let only = reject.map(|_| state.confirmed.clone());
+        // with `requireApproval`, what a launch may serve
+        let chosen_by_app: Option<Vec<Version>> = self.require_approval.then(|| {
+            [&state.approved, &state.trial, &state.confirmed]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect()
+        });
         let mut chosen = None;
         // deleted once the rejection is on record, not before
         let mut rejected = Vec::new();
+        // bundles waiting for approval that are of no use: deleted with the rejected ones
+        let mut superseded = Vec::new();
+        let mut waiting = false;
         for version in self.versions() {
             if self.rejected_in(&state, &version) {
                 rejected.push(version);
@@ -897,6 +997,22 @@ impl Store {
                 .as_ref()
                 .is_some_and(|only| only.as_ref() != Some(&version))
             {
+                continue;
+            }
+            if chosen_by_app
+                .as_ref()
+                .is_some_and(|chosen_by_app| !chosen_by_app.contains(&version))
+            {
+                // Waits for the app's approval, and is verified when it gets it: doing so here
+                // would unpack a bundle that is not going to be served. Older ones than the
+                // newest that waits are never offered, and neither is one that this binary
+                // cannot run; without this they would pile up on a device whose user never
+                // approves.
+                if waiting || !self.compatible(&version) {
+                    superseded.push(version);
+                } else {
+                    waiting = true;
+                }
                 continue;
             }
             match self.load(&version) {
@@ -926,6 +1042,18 @@ impl Store {
             state.trial = None;
             state.attempts = 0;
         }
+        // An approval is for a stored bundle that is ahead of the confirmed one. It stays on
+        // record while that bundle is served without having been confirmed: until a page is
+        // loaded from it, the approval is all that makes the next launch pick it again.
+        if state.approved.as_ref().is_some_and(|approved| {
+            self.is_gone(approved)
+                || state
+                    .confirmed
+                    .as_ref()
+                    .is_some_and(|confirmed| !self.order.newer(approved, confirmed))
+        }) {
+            state.approved = None;
+        }
         let recorded = if state != old_state || rewrite {
             self.write_state(&state)
         } else {
@@ -933,7 +1061,7 @@ impl Store {
         };
         match &recorded {
             Ok(()) => {
-                for version in &rejected {
+                for version in rejected.iter().chain(&superseded) {
                     self.remove_quietly(version);
                 }
                 if let Some(bundle) = &chosen {

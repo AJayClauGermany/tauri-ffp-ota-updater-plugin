@@ -78,7 +78,8 @@ resolves to `null`, exactly as if there were no update.
 | Takes effect | after the app restarts (`relaunch()` from the process plugin; Windows exits by itself during install) | `install()` reloads the webviews; without it, at the next launch. No restart, no process plugin. |
 | State | lost with the process | in-memory page state is lost with the reload; `localStorage`, IndexedDB and the Rust side keep running |
 | A bad update | stays installed | reverted if it never calls `notifyReady()` |
-| Downloaded but not installed | gone when the app quits | kept on disk and applied at the next launch, unless you `discard()` it |
+| Downloaded but not installed | gone when the app quits | kept on disk and applied at the next launch, unless you `discard()` it. With `requireApproval` it is kept and **not** applied until you `approve()` or `install()` it. |
+| Asking the user first | your code decides before `downloadAndInstall()` | the same, or `requireApproval`: download ahead of time, [ask whenever it suits](integrate.md#ask-the-user-before-updating) |
 
 ### API
 
@@ -161,6 +162,13 @@ What counts as "only the frontend" is listed in
 
 After a full update the app drops the bundles of the previous line by itself:
 on `1.3.0`, a stored `1.2.4` is deleted at the first launch.
+
+This scheme relies on the version changing whenever the binary does. If your
+installer feed can replace the binary without that, for instance because it
+goes by a build number of its own, a bundle made for the old binary would stay
+in use on the new one. Tie frontends to the native build instead of to the
+version alone:
+[Bind a frontend to a native build or IPC contract](integrate.md#bind-a-frontend-to-a-native-build-or-ipc-contract).
 
 ### Every release is also a full release
 

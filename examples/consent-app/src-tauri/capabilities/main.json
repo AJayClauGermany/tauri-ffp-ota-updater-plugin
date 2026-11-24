@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Only the main window confirms a frontend and acts on the user's answer. Checking and downloading are left to Rust.",
+  "windows": ["main"],
+  "permissions": [
+    "ffp-ota-updater:allow-notify-ready",
+    "ffp-ota-updater:allow-approve",
+    "ffp-ota-updater:allow-unapprove",
+    "ffp-ota-updater:allow-install",
+    "ffp-ota-updater:allow-discard"
+  ]
+}

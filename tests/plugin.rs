@@ -602,6 +602,10 @@ fn frontend_update_lifecycle() {
     rollbacks_that_are_not_recorded_are_reported();
     a_lost_fallback_is_forgotten();
     bundles_are_read_to_their_end();
+    bundles_wait_for_approval();
+    approval_is_optional();
+    required_files_are_checked();
+    frontends_are_bound_to_a_native_contract();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -1741,5 +1745,311 @@ fn bundles_are_read_to_their_end() {
         Err(Error::InvalidBundle(_))
     ));
     stage(&whole).unwrap();
+    app.ota_updater().reset().unwrap();
+}
+
+/// With `requireApproval` a bundle that was downloaded is not served, however often the app is
+/// started, until the app says so.
+fn bundles_wait_for_approval() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let overrides = serde_json::json!({ "requireApproval": true });
+    let launch = |binary: &str| launch_with(data_dir.path(), binary, &pubkey, 1, overrides.clone());
+    let state = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(store.join("state.json")).unwrap()).unwrap()
+    };
+
+    let app = launch("1.2.0");
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    let status = app.ota_updater().status();
+    assert_eq!(status.staged, Some(v("1.2.1")));
+    assert_eq!(status.approved, None);
+    // what is absent is left out, as the JavaScript types declare it
+    assert!(
+        serde_json::to_value(&status)
+            .unwrap()
+            .get("approved")
+            .is_none()
+    );
+    drop(app);
+
+    // it stays where it is across restarts
+    for _ in 0..2 {
+        let app = launch("1.2.0");
+        assert_eq!(served_index(&app), "built-in");
+        assert_eq!(app.ota_updater().current_version(), v("1.2.0"));
+        assert_eq!(app.ota_updater().status().staged, Some(v("1.2.1")));
+        assert_eq!(stored_files(&store), ["1.2.1.tar.gz", "1.2.1.tar.gz.sig"]);
+    }
+
+    // approving it changes nothing in this run, and can be taken back
+    let app = launch("1.2.0");
+    let updater = app.ota_updater();
+    assert!(matches!(
+        updater.approve(&v("1.2.2")),
+        Err(Error::NotDownloaded(_))
+    ));
+    updater.approve(&v("1.2.1")).unwrap();
+    assert_eq!(updater.status().approved, Some(v("1.2.1")));
+    assert_eq!(
+        serde_json::to_value(updater.status()).unwrap()["approved"],
+        "1.2.1"
+    );
+    assert_eq!(served_index(&app), "built-in");
+    updater.unapprove(&v("1.2.1")).unwrap();
+    assert_eq!(updater.status().approved, None);
+    drop(app);
+    let app = launch("1.2.0");
+    assert_eq!(served_index(&app), "built-in");
+    // another version's approval is not this one's to take back
+    app.ota_updater().approve(&v("1.2.1")).unwrap();
+    app.ota_updater().unapprove(&v("1.2.2")).unwrap();
+    assert_eq!(app.ota_updater().status().approved, Some(v("1.2.1")));
+    drop(app);
+
+    // the next launch serves it, on trial like any bundle
+    let app = launch("1.2.0");
+    let updater = app.ota_updater();
+    assert_eq!(updater.current_version(), v("1.2.1"));
+    assert_eq!(served_index(&app), "own 1.2.1");
+    assert!(!updater.status().confirmed);
+    updater.notify_ready().unwrap();
+    assert!(updater.status().confirmed);
+    assert!(state()["approved"].is_null());
+
+    // of the bundles that wait, a launch keeps the newest, which is the one `staged` names
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    stage(&app, "1.2.3", "own 1.2.3").unwrap();
+    // only what is ahead of the frontend being served can be approved
+    assert!(matches!(
+        updater.approve(&v("1.2.0")),
+        Err(Error::NotNewer(_))
+    ));
+    drop(app);
+    let app = launch("1.2.0");
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    assert_eq!(updater.status().staged, Some(v("1.2.3")));
+    assert_eq!(
+        stored_files(&store),
+        [
+            "1.2.1.tar.gz",
+            "1.2.1.tar.gz.sig",
+            "1.2.3.tar.gz",
+            "1.2.3.tar.gz.sig",
+            "state.json"
+        ]
+    );
+
+    // Switching while the app runs is the app's choice too. It is remembered even if the app
+    // is closed before a page was loaded from the bundle, when its trial has not begun.
+    updater.activate(&v("1.2.3")).unwrap();
+    assert_eq!(state()["approved"], "1.2.3");
+    assert!(state()["trial"].is_null());
+    drop(app);
+    let app = launch("1.2.0");
+    assert_eq!(app.ota_updater().current_version(), v("1.2.3"));
+    // ...and the trial is what it always is: two runs that show it without a confirmation
+    assert_eq!(served_index(&app), "own 1.2.3");
+    drop(app);
+    assert_eq!(served_index(&launch("1.2.0")), "own 1.2.3");
+    let app = launch("1.2.0");
+    let updater = app.ota_updater();
+    assert_eq!(served_index(&app), "own 1.2.1");
+    assert_eq!(updater.status().rejected, [v("1.2.3")]);
+    assert!(state()["approved"].is_null());
+    assert!(matches!(
+        updater.approve(&v("1.2.3")),
+        Err(Error::Rejected(_))
+    ));
+
+    // a rollback leaves a bundle that waits where it is, and discarding one withdraws its
+    // approval
+    stage(&app, "1.2.4", "own 1.2.4").unwrap();
+    updater.approve(&v("1.2.4")).unwrap();
+    updater.rollback().unwrap();
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(updater.status().approved, Some(v("1.2.4")));
+    updater.discard(&v("1.2.4")).unwrap();
+    assert_eq!(updater.status().approved, None);
+    assert!(state()["approved"].is_null());
+
+    // A record that is lost takes the approvals with it: the bundles wait again, instead of
+    // the newest going on trial as it does without `requireApproval`.
+    stage(&app, "1.2.5", "own 1.2.5").unwrap();
+    updater.approve(&v("1.2.5")).unwrap();
+    drop(app);
+    std::fs::write(store.join("state.json"), "{ not json").unwrap();
+    let app = launch("1.2.0");
+    assert_eq!(served_index(&app), "built-in");
+    let status = app.ota_updater().status();
+    assert_eq!(status.staged, Some(v("1.2.5")));
+    assert_eq!(status.approved, None);
+    drop(app);
+
+    // a bundle that waits does not outlive the binary it was made for
+    let app = launch("1.3.0");
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(stored_files(&store), ["state.json"]);
+    drop(app);
+
+    // a download is held back like a staged bundle, and `install` needs no approval
+    let (app, relaunch) = published(&[("./index.html", "held")], "1.2.1", overrides.clone());
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    drop(app);
+    let app = relaunch();
+    assert_eq!(served_index(&app), "built-in");
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    assert!(update.downloaded);
+    update.install().unwrap();
+    assert_eq!(served_index(&app), "held");
+    app.ota_updater().reset().unwrap();
+}
+
+/// Without `requireApproval` the next launch takes the newest stored bundle, approved or not.
+fn approval_is_optional() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    app.ota_updater().approve(&v("1.2.1")).unwrap();
+    assert_eq!(app.ota_updater().status().approved, Some(v("1.2.1")));
+    stage(&app, "1.2.2", "own 1.2.2").unwrap();
+    drop(app);
+
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    assert_eq!(served_index(&app), "own 1.2.2");
+    assert_eq!(app.ota_updater().status().approved, None);
+    app.ota_updater().reset().unwrap();
+}
+
+/// `requiredFiles` names what a bundle must contain besides `index.html`: Tauri would answer a
+/// request for a page that is missing with the index page.
+fn required_files_are_checked() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let stage = |app: &App<MockRuntime>, version: &str, entries: &[(&str, &str)]| {
+        let archive = archive_of(entries);
+        app.ota_updater()
+            .stage(&archive, &sign(&key, &archive, Some(version)), &v(version))
+    };
+    // with and without a leading slash
+    let required = serde_json::json!({ "requiredFiles": ["settings.html", "/editor/index.html"] });
+
+    let app = launch_with(data_dir.path(), "1.2.0", &pubkey, 1, required);
+    let error = stage(
+        &app,
+        "1.2.1",
+        &[("./index.html", "home"), ("./settings.html", "settings")],
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidBundle(_)), "{error}");
+    assert!(error.to_string().contains("editor/index.html"), "{error}");
+    assert!(stored_files(&store).is_empty());
+    let pages = [
+        ("./index.html", "home"),
+        ("./settings.html", "settings"),
+        ("./editor/index.html", "editor"),
+    ];
+    stage(&app, "1.2.1", &pages).unwrap();
+    app.ota_updater().install(&v("1.2.1")).unwrap();
+    assert_eq!(served(&app, "editor"), "editor");
+    app.ota_updater().notify_ready().unwrap();
+    drop(app);
+
+    // a binary that needs another page does not serve a bundle from before that
+    let more = serde_json::json!({ "requiredFiles": ["settings.html", "about.html"] });
+    let app = launch_with(data_dir.path(), "1.2.0", &pubkey, 1, more);
+    assert_eq!(served_index(&app), "built-in");
+    assert!(!store.join("1.2.1.tar.gz").exists());
+    drop(app);
+
+    // a path that cannot be in a bundle is a mistake in the configuration
+    let launched = try_launch(
+        data_dir.path(),
+        "1.2.0",
+        &pubkey,
+        1,
+        serde_json::json!({ "requiredFiles": ["../settings.html"] }),
+        Builder::new(),
+        |_| {},
+    );
+    assert!(launched.is_err());
+}
+
+/// The recipe of the integration guide: a tag in the version's build metadata says which native
+/// build or IPC contract a frontend was made for, and `Builder::compatibility` holds bundles to
+/// the one compiled into the binary. Two binaries of the same version are then told apart.
+fn frontends_are_bound_to_a_native_contract() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let routes = Routes::default();
+    let port = serve(routes.clone(), Default::default());
+    let publish = |version: &str| {
+        let bundle = archive(&format!("ota {version}"));
+        let manifest = serde_json::json!({
+            "version": version,
+            "url": format!("http://127.0.0.1:{port}/bundle.tar.gz"),
+            "signature": sign(&key, &bundle, Some(version)),
+        });
+        routes.lock().unwrap().extend([
+            ("ota.json", manifest.to_string().into_bytes()),
+            ("bundle.tar.gz", bundle),
+        ]);
+    };
+    let stage = |app: &App<MockRuntime>, version: &str| {
+        let archive = archive(&format!("own {version}"));
+        app.ota_updater()
+            .stage(&archive, &sign(&key, &archive, Some(version)), &v(version))
+    };
+    let launch = |contract: &'static str| {
+        let builder = Builder::new().compatibility(move |binary, bundle| {
+            default_compatibility(binary, bundle) && bundle.build.as_str() == contract
+        });
+        let none = serde_json::json!({});
+        launch_built(data_dir.path(), "1.2.0", &pubkey, port, none, builder)
+    };
+
+    let app = launch("ipc3");
+    let updater = app.ota_updater();
+    // a frontend made for another contract, or for none, is neither offered nor accepted
+    publish("1.2.1+ipc4");
+    assert!(block_on(updater.check()).unwrap().is_none());
+    for other in ["1.2.1+ipc4", "1.2.1"] {
+        assert!(matches!(stage(&app, other), Err(Error::Incompatible(_))));
+    }
+    // the one made for this binary is, with the tag covered by the signature
+    publish("1.2.1+ipc3");
+    let update = block_on(updater.check()).unwrap().expect("no update");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    assert_eq!(served_index(&app), "ota 1.2.1+ipc3");
+    updater.notify_ready().unwrap();
+    assert_eq!(
+        stored_files(&store),
+        ["1.2.1+ipc3.tar.gz", "1.2.1+ipc3.tar.gz.sig", "state.json"]
+    );
+    drop(app);
+
+    // A binary of the same version with another contract drops it, although it was confirmed,
+    // and takes the frontend made for itself, which is the same version as far as order goes.
+    let app = launch("ipc4");
+    assert_eq!(served_index(&app), "built-in");
+    assert_eq!(stored_files(&store), ["state.json"]);
+    publish("1.2.1+ipc4");
+    let update = block_on(app.ota_updater().check())
+        .unwrap()
+        .expect("no update");
+    block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
+    assert_eq!(served_index(&app), "ota 1.2.1+ipc4");
     app.ota_updater().reset().unwrap();
 }

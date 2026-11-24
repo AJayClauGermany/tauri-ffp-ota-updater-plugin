@@ -165,6 +165,8 @@ impl Builder {
                 commands::status,
                 commands::rollback,
                 commands::discard,
+                commands::approve,
+                commands::unapprove,
             ])
             .setup(move |app, api| {
                 let mut config = api.config().clone().unwrap_or_default();
@@ -185,7 +187,9 @@ impl Builder {
                         archive: config.max_bundle_size,
                         unpacked: config.max_unpacked_size,
                     },
+                    required_files: config.required_keys()?,
                     rollback: config.rollback,
+                    require_approval: config.require_approval,
                     trial_attempts: config.trial_attempts,
                     shown: Default::default(),
                     binary: binary_version.clone(),

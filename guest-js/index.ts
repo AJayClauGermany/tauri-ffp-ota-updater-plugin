@@ -36,6 +36,7 @@ export type OtaUpdateErrorKind =
   | 'inUse'
   | 'emptyEndpoints'
   | 'emptyPubkey'
+  | 'invalidConfig'
   | 'cannotServe'
   | 'insecureTransportProtocol'
   | 'invalidHeader'
@@ -69,11 +70,19 @@ export interface Status {
    */
   confirmed: boolean
   /**
-   * A downloaded bundle that is newer than the one being served. The next
-   * launch switches to it; {@link install} does so now and {@link discard}
-   * deletes it.
+   * A downloaded bundle that is newer than the one being served.
+   * {@link install} switches to it now and {@link discard} deletes it. The
+   * next launch switches to it by itself, unless the app is configured with
+   * `requireApproval`: then it waits, across restarts, for {@link approve}.
    */
   staged?: string
+  /**
+   * The downloaded bundle that was approved with {@link approve} and is newer
+   * than the one being served: with `requireApproval`, what the next launch
+   * switches to. It can be older than `staged`, when a newer bundle was
+   * downloaded since.
+   */
+  approved?: string
   /**
    * Versions that failed their trial or were rolled back, oldest first. They
    * are not offered again.
@@ -132,8 +141,8 @@ export class Update {
   version: string
   /**
    * Whether the bundle is already stored on this device, waiting for
-   * {@link install} or the next launch. {@link download} then returns without
-   * fetching it again.
+   * {@link install}, the next launch or, with `requireApproval`,
+   * {@link approve}. {@link download} then returns without fetching it again.
    */
   downloaded: boolean
   date?: string
@@ -153,7 +162,8 @@ export class Update {
 
   /**
    * Downloads, verifies and stores the frontend bundle. Without a following
-   * {@link install} it takes effect the next time the app starts.
+   * {@link install} it takes effect the next time the app starts, or with
+   * `requireApproval` at the first start after {@link approve}.
    *
    * Safe to call again for a bundle that is already stored: nothing is
    * fetched and only the `Finished` event is sent.
@@ -234,9 +244,9 @@ export async function currentVersion(): Promise<string> {
 }
 
 /**
- * What is being served and whether it is confirmed, what is staged for the
- * next launch and which versions were rolled back. Makes no request, so it
- * works offline.
+ * What is being served and whether it is confirmed, what is staged and what is
+ * approved for the next launch, and which versions were rolled back. Makes no
+ * request, so it works offline.
  */
 export async function status(): Promise<Status> {
   return await call('status')
@@ -253,6 +263,36 @@ export async function status(): Promise<Status> {
  */
 export async function install(version: string): Promise<void> {
   await call('install', { version })
+}
+
+/**
+ * Approves the stored bundle `version` for the next launch. Nothing changes in
+ * this run of the app: use {@link install} to switch now.
+ *
+ * This is the consent an app configured with `requireApproval` waits for. There
+ * a downloaded bundle stays stored, across restarts, until it is approved or
+ * installed. Without `requireApproval` the next launch takes the newest stored
+ * bundle anyway and this only records the choice.
+ *
+ * One version is approved at a time; approving another replaces it. Makes no
+ * request, so it works offline.
+ *
+ * Rejects with kind `notDownloaded` for a version that is not stored,
+ * `notNewer` for one older than the frontend being served and `rejected` for
+ * one that was rolled back.
+ */
+export async function approve(version: string): Promise<void> {
+  await call('approve', { version })
+}
+
+/**
+ * Takes back the approval of `version`, for a user who changed their mind.
+ * The bundle stays stored and can be approved again. Does nothing if that
+ * version is not the approved one, and nothing about a bundle that was shown
+ * before: that one is abandoned with {@link rollback}.
+ */
+export async function unapprove(version: string): Promise<void> {
+  await call('unapprove', { version })
 }
 
 /**

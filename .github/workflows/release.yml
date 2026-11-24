@@ -1,0 +1,37 @@
+name: Release
+
+# Pushing a tag `v<version>` creates the GitHub release for it and attaches the JavaScript
+# package, built. Apps install that file, so they need neither TypeScript nor a build step.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: check that the tag is the version of the crate and of the package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          package="$(node -p 'require("./package.json").version')"
+          echo "tag $version, crate $crate, package $package"
+          test "$crate" = "$version"
+          test "$package" = "$version"
+      - run: npm install
+      - run: npm run check
+      # `prepare` builds dist-js, which is what the package consists of
+      - run: npm pack
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" tauri-plugin-ffp-ota-updater-api-*.tgz --verify-tag --generate-notes

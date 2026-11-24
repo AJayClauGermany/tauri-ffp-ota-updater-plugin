@@ -154,11 +154,17 @@ pub struct Status {
     /// `false` while the frontend being served is a downloaded bundle that still has to be
     /// confirmed with `notify_ready`, and would be rolled back otherwise.
     pub confirmed: bool,
-    /// A stored bundle newer than the one being served, which the next launch (or
-    /// [`OtaUpdater::install`]) switches to and [`OtaUpdater::discard`] removes. It is verified
-    /// only when it is loaded.
+    /// A stored bundle newer than the one being served, which [`OtaUpdater::install`] switches
+    /// to and [`OtaUpdater::discard`] removes. The next launch switches to it by itself, unless
+    /// `requireApproval` is set: then it waits for [`OtaUpdater::approve`]. It is verified only
+    /// when it is loaded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staged: Option<Version>,
+    /// The stored bundle that was approved with [`OtaUpdater::approve`] and is newer than the
+    /// one being served: with `requireApproval`, what the next launch switches to. It can be
+    /// older than [`Self::staged`], when a newer bundle was downloaded since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved: Option<Version>,
     /// Versions that failed their trial or were rolled back, oldest first. They are not
     /// offered or served again. The record is dropped once a full update makes them
     /// irrelevant.
@@ -228,13 +234,14 @@ impl<R: Runtime> OtaUpdater<R> {
     }
 
     /// Where the updater stands: what is being served and whether it is confirmed, what is
-    /// staged for the next launch and which versions were rolled back.
+    /// staged and what is approved for the next launch, and which versions were rolled back.
     pub fn status(&self) -> Status {
         let current_version = self.current_version();
         Status {
             binary_version: self.binary_version.clone(),
             confirmed: assets::active().is_none() || !self.store.unproven(&current_version),
             staged: self.store.staged(&current_version),
+            approved: self.store.approved(&current_version),
             rejected: self.store.rejected(),
             current_version,
         }
@@ -361,8 +368,9 @@ impl<R: Runtime> OtaUpdater<R> {
     /// `.sig` file) has to be this app's key signing exactly `archive`, for `version`, and the
     /// version has to be compatible with the binary and not rejected.
     ///
-    /// The bundle is then staged like a downloaded one: served from the next launch on, or at
-    /// once with [`Self::install`].
+    /// The bundle is then staged like a downloaded one: served from the next launch on (with
+    /// `requireApproval`, once it is [approved](Self::approve)), or at once with
+    /// [`Self::install`].
     ///
     /// A version names one bundle: staging different contents under a version that is already
     /// stored fails with [`Error::InUse`], as does a version that differs from a stored one
@@ -401,7 +409,8 @@ impl<R: Runtime> OtaUpdater<R> {
     /// [`Self::reload`]) before the old documents load more of their assets.
     ///
     /// The bundle is verified again as it is loaded from disk, and is on trial from the first
-    /// page loaded from it until [`Self::notify_ready`].
+    /// page loaded from it until [`Self::notify_ready`]. With `requireApproval`, switching to a
+    /// bundle approves it as well.
     ///
     /// Fails with [`Error::CannotServe`] when the assets were not wrapped with
     /// [`wrap_assets`](crate::wrap_assets), the app runs from `devUrl` in development mode, or
@@ -425,6 +434,35 @@ impl<R: Runtime> OtaUpdater<R> {
     pub fn install(&self, version: &Version) -> Result<()> {
         self.activate(version)?;
         self.reload()
+    }
+
+    /// Approves the stored bundle `version` for the next launch, and changes nothing in this
+    /// run of the app. This is the consent that `requireApproval` makes a launch wait for:
+    /// with it, a bundle that was downloaded stays stored, across restarts, until it is approved
+    /// here or switched to with [`Self::activate`] or [`Self::install`]. Without
+    /// `requireApproval` the next launch takes the newest stored bundle either way, and this
+    /// only records the choice.
+    ///
+    /// The bundle is verified as it is when loaded, so that what is approved can be served.
+    /// One version is approved at a time: approving another replaces it. No request is made.
+    ///
+    /// Fails with [`Error::NotDownloaded`] for a version that is not stored, [`Error::NotNewer`]
+    /// for one older than the frontend being served and [`Error::Rejected`] for one that was
+    /// rolled back.
+    pub fn approve(&self, version: &Version) -> Result<()> {
+        self.ensure_pubkey()?;
+        // what is being served must not change between looking and recording
+        let _switching = self.switching();
+        self.ensure_not_older(version)?;
+        self.store.approve(version)
+    }
+
+    /// Takes back the approval of `version`, for a user who changed their mind. The bundle
+    /// stays stored and can be approved again. Does nothing if that version is not the approved
+    /// one, and nothing about a bundle that was served before: that one is abandoned with
+    /// [`Self::rollback`].
+    pub fn unapprove(&self, version: &Version) -> Result<()> {
+        self.store.unapprove(version)
     }
 
     /// Deletes the stored bundle `version` so that it is not served at the next launch, for an
@@ -811,7 +849,8 @@ pub struct Update<R: Runtime> {
     /// Version of the update.
     pub version: Version,
     /// Whether this bundle was already downloaded when the check was made, and is waiting for
-    /// [`Self::install`] or the next launch. [`Self::download`] then does not fetch it again.
+    /// [`Self::install`], the next launch or, with `requireApproval`, [`OtaUpdater::approve`].
+    /// [`Self::download`] then does not fetch it again.
     pub downloaded: bool,
     /// Release date from the manifest.
     pub date: Option<String>,
@@ -850,9 +889,9 @@ impl<R: Runtime> Clone for Update<R> {
 impl<R: Runtime> Update<R> {
     /// Downloads the bundle, verifies it and stores it.
     ///
-    /// A stored bundle is picked up automatically on the next launch; call [`Self::install`] to
-    /// switch to it right away. `on_chunk` receives the chunk length and the total content
-    /// length, if known.
+    /// A stored bundle is picked up automatically on the next launch, or with `requireApproval`
+    /// once it is [approved](OtaUpdater::approve); call [`Self::install`] to switch to it right
+    /// away. `on_chunk` receives the chunk length and the total content length, if known.
     ///
     /// A bundle that is already stored, with the signature this release announces, is not
     /// fetched again: only `on_download_finish` is called. Calling this on every start, or on

@@ -1,6 +1,6 @@
 ## Default Permission
 
-Allows checking for, downloading and installing frontend (OTA) updates, confirming them, discarding a staged one and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.
+Allows checking for, downloading and installing frontend (OTA) updates, confirming them, approving a staged one for the next launch or discarding it, and reading the updater's status. `allow-rollback` and `allow-reset` have to be granted separately.
 
 #### This default permission set includes the following:
 
@@ -12,6 +12,8 @@ Allows checking for, downloading and installing frontend (OTA) updates, confirmi
 - `allow-notify-ready`
 - `allow-status`
 - `allow-discard`
+- `allow-approve`
+- `allow-unapprove`
 
 ## Permission Table
 
@@ -21,6 +23,32 @@ Allows checking for, downloading and installing frontend (OTA) updates, confirmi
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-approve`
+
+</td>
+<td>
+
+Enables the approve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-approve`
+
+</td>
+<td>
+
+Denies the approve command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>
@@ -278,6 +306,32 @@ Enables the status command without any pre-configured scope.
 <td>
 
 Denies the status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:allow-unapprove`
+
+</td>
+<td>
+
+Enables the unapprove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ffp-ota-updater:deny-unapprove`
+
+</td>
+<td>
+
+Denies the unapprove command without any pre-configured scope.
 
 </td>
 </tr>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en" data-build="built-in">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ffp-ota-updater consent example</title>
+    <link rel="stylesheet" href="style.css" />
+    <!-- Inline on purpose. The app has a Content Security Policy, and a
+         downloaded frontend has to pass it like the built-in one does. -->
+    <script>
+      document.documentElement.dataset.inline = "built-in";
+    </script>
+    <script type="module" src="main.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Consent example</h1>
+      <p>Frontend version: <strong id="version">…</strong></p>
+      <p id="state">…</p>
+      <p>
+        <button id="install" disabled>Reload into it now</button>
+        <button id="approve" disabled>Use it at the next start</button>
+        <button id="unapprove" disabled>Do not use it after all</button>
+        <button id="discard" disabled>Skip this version</button>
+        <button id="fetch">Look for an update</button>
+      </p>
+      <pre id="output"></pre>
+    </main>
+  </body>
+</html>

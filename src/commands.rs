@@ -153,6 +153,16 @@ pub(crate) async fn discard<R: Runtime>(app: AppHandle<R>, version: String) -> R
 }
 
 #[command]
+pub(crate) async fn approve<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
+    app.ota_updater().approve(&parse(&version)?)
+}
+
+#[command]
+pub(crate) async fn unapprove<R: Runtime>(app: AppHandle<R>, version: String) -> Result<()> {
+    app.ota_updater().unapprove(&parse(&version)?)
+}
+
+#[command]
 pub(crate) async fn download_and_install<R: Runtime>(
     app: AppHandle<R>,
     version: String,

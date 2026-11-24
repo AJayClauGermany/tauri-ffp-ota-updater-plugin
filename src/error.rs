@@ -26,6 +26,10 @@ pub enum Error {
     Http(#[from] http::Error),
     #[error(transparent)]
     UrlParse(#[from] url::ParseError),
+    /// A value in the plugin's configuration cannot be used. Raised while the plugin is set
+    /// up, so the app does not start with it.
+    #[error("invalid OTA configuration: {0}")]
+    InvalidConfig(String),
     /// No endpoints are configured under `plugins.ffp-ota-updater.endpoints`.
     #[error("no OTA update endpoints are configured")]
     EmptyEndpoints,
@@ -92,7 +96,7 @@ pub enum Error {
     /// case, which would be the same file on Windows and macOS.
     #[error("the frontend bundle for version `{0}` is in use")]
     InUse(String),
-    /// `install` was called before the bundle was downloaded.
+    /// `install`, `activate` or `approve` was called for a version that is not stored.
     #[error("the frontend bundle for version `{0}` has not been downloaded")]
     NotDownloaded(String),
 }
@@ -113,6 +117,7 @@ impl Error {
                 "invalidHeader"
             }
             Self::UrlParse(_) => "invalidUrl",
+            Self::InvalidConfig(_) => "invalidConfig",
             Self::EmptyEndpoints => "emptyEndpoints",
             Self::EmptyPubkey => "emptyPubkey",
             Self::CannotServe(_) => "cannotServe",

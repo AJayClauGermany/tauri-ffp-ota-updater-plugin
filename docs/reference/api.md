@@ -19,7 +19,9 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 | `status()` | `Promise<Status>` | State of the updater. Makes no request. |
 | `currentVersion()` | `Promise<string>` | Version of the frontend being served: the active bundle's, or else the app's. |
 | `install(version)` | `Promise<void>` | Switches to the stored bundle `version` and reloads every webview window. Makes no request. Rejects with `cannotServe` under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. A rejection of kind `tauri` means the switch happened but a window could not be reloaded; with any other kind nothing was switched. |
-| `discard(version)` | `Promise<void>` | Deletes the stored bundle `version`. Does nothing if it is not stored; the version stays available to `check()`. Rejects with `inUse` for the bundle being served and for the confirmed fallback. Does not cancel a `download()` of that version that is still running, which stores it again. |
+| `approve(version)` | `Promise<void>` | Approves the stored bundle `version` for the next launch, which with `requireApproval` is what makes a launch switch to it. Changes nothing in this run and makes no request. The bundle is verified first. One version is approved at a time. Rejects with `notDownloaded`, `notNewer` (older than the frontend being served) or `rejected`. Without `requireApproval` it only records the choice. |
+| `unapprove(version)` | `Promise<void>` | Takes back the approval of `version`. The bundle stays stored. Does nothing if another version, or none, is approved, and nothing about a bundle that was shown before. |
+| `discard(version)` | `Promise<void>` | Deletes the stored bundle `version`, and its approval with it. Does nothing if it is not stored; the version stays available to `check()`. Rejects with `inUse` for the bundle being served and for the confirmed fallback. Does not cancel a `download()` of that version that is still running, which stores it again. |
 | `rollback()` | `Promise<void>` | Rejects the bundle being served and reloads into the last confirmed bundle or the built-in frontend. A newer stored bundle that was never shown is kept for the next launch. Does nothing when the built-in frontend is served. Rejects with `io` if the rejection could not be recorded: the app has gone back for this run, but the version is served or offered again after a restart. Needs `allow-rollback`. |
 | `reset()` | `Promise<void>` | Deletes every stored bundle and returns to the built-in frontend, reloading if a bundle was served. Rejected versions stay rejected. Needs `allow-reset`. |
 
@@ -45,7 +47,7 @@ from the webview.
 | `date` | `string?` | `pub_date` of the manifest, as sent. |
 | `body` | `string?` | `notes` of the manifest. |
 | `rawJson` | `Record<string, unknown>` | The manifest as received, including fields of your own. |
-| `download(onEvent?)` | `Promise<void>` | Downloads, verifies and stores the bundle. Used from the next launch. For a bundle that is already stored nothing is fetched and only `Finished` is sent. |
+| `download(onEvent?)` | `Promise<void>` | Downloads, verifies and stores the bundle. Used from the next launch, or with `requireApproval` once it is approved. For a bundle that is already stored nothing is fetched and only `Finished` is sent. |
 | `install()` | `Promise<void>` | `install(this.version)`. |
 | `downloadAndInstall(onEvent?)` | `Promise<void>` | Both. |
 
@@ -68,7 +70,8 @@ refused when it rejects.
 | `binaryVersion` | `string` | Version of the app, i.e. of the built-in frontend. |
 | `currentVersion` | `string` | Version of the frontend being served. |
 | `confirmed` | `boolean` | `false` while the frontend being served is a bundle on trial. |
-| `staged` | `string?` | Newest stored bundle that is newer than the one being served: what the next launch switches to. Not yet verified. |
+| `staged` | `string?` | Newest stored bundle that is newer than the one being served: what the next launch switches to, unless `requireApproval` is set. Not yet verified. |
+| `approved` | `string?` | The stored bundle that was approved and is newer than the one being served: with `requireApproval`, what the next launch switches to. Can be older than `staged`. |
 | `rejected` | `string[]` | Versions that failed their trial or were rolled back, oldest first. Cleared of versions a full update made irrelevant. |
 
 ## Commands
@@ -83,6 +86,8 @@ For `invoke("plugin:ffp-ota-updater|<command>", args)`. Errors are
 | `download_and_install` | `version: string`, `onEvent: Channel<DownloadEvent>` | |
 | `install` | `version: string` | |
 | `discard` | `version: string` | |
+| `approve` | `version: string` | |
+| `unapprove` | `version: string` | |
 | `current_version` | | `string` |
 | `status` | | `Status` |
 | `notify_ready` | | |
@@ -120,8 +125,10 @@ see [Permissions](configuration.md#permissions).
 | `current_version()` | `Version` | |
 | `status()` | `Status` | Fields as in JavaScript, in snake case, as `Version`. |
 | `stage(archive: &[u8], signature: &str, version: &Version)` | `Result<()>` | Verifies and stores a bundle obtained by other means. Same checks as a download. `NotNewer` for a version that is not newer than the one being served (other than that very version). `InUse` for other contents than those stored under that version. |
-| `activate(&Version)` | `Result<()>` | Serves the stored bundle from now on, without touching the webviews. `CannotServe` under `tauri dev` or without `wrap_assets`. |
+| `activate(&Version)` | `Result<()>` | Serves the stored bundle from now on, without touching the webviews. `CannotServe` under `tauri dev` or without `wrap_assets`. With `requireApproval` this approves the bundle as well. |
 | `install(&Version)` | `Result<()>` | `activate`, then `reload`. `Error::Tauri` is a failed reload after the switch. |
+| `approve(&Version)` | `Result<()>` | As the JavaScript `approve()`. |
+| `unapprove(&Version)` | `Result<()>` | As the JavaScript `unapprove()`. |
 | `discard(&Version)` | `Result<()>` | |
 | `notify_ready()` | `Result<()>` | Confirms whatever is being served, unlike the JavaScript `notifyReady()`, which only counts from a page of the bundle on trial. |
 | `rollback()` | `Result<()>` | As the JavaScript `rollback()`. |
@@ -171,17 +178,18 @@ non-exhaustive enum and `Error::kind()` returns the same string.
 | `releaseNotFound` | `ReleaseNotFound` | An endpoint answered, but none with a usable manifest. That includes a manifest over 1 MiB; the message has the reason. |
 | `emptyEndpoints` | `EmptyEndpoints` | No endpoints are configured. |
 | `emptyPubkey` | `EmptyPubkey` | No public key is configured. |
+| `invalidConfig` | `InvalidConfig` | A value of the configuration cannot be used (an entry of `requiredFiles`). Raised at setup, where it keeps the app from starting; the webview does not see it. |
 | `cannotServe` | `CannotServe` | `install`/`activate` while bundles cannot be served: under `tauri dev`, without `wrap_assets`, or with a URL as `frontendDist`. |
 | `insecureTransportProtocol` | `InsecureTransportProtocol` | An endpoint or bundle URL is not `https`. |
 | `signature` | `InvalidSignature` | The public key or signature is unreadable, or the signature is not this key's for this bundle. |
 | `missingSignedVersion` | `MissingSignedVersion` | `requireSignedVersion` is on and the signature records no version. |
 | `signedVersionMismatch` | `SignedVersionMismatch` | Signed for another version than the one announced. |
-| `invalidBundle` | `InvalidBundle` | The archive is not a usable frontend bundle. |
+| `invalidBundle` | `InvalidBundle` | The archive is not a usable frontend bundle, or lacks a file named in `requiredFiles`. |
 | `tooLarge` | `TooLarge` | A bundle, or what it unpacks to, exceeds its size limit. |
 | `incompatible` | `Incompatible` | The version is not a frontend update for this binary. |
 | `rejected` | `Rejected` | The version failed a trial or was rolled back before. |
 | `noPendingUpdate` | `NoPendingUpdate` | `download` for a version `check` did not return. |
-| `notDownloaded` | `NotDownloaded` | `install` for a version that is not stored. |
+| `notDownloaded` | `NotDownloaded` | `install` or `approve` for a version that is not stored. |
 | `notNewer` | `NotNewer` | The version is not newer than the frontend being served. |
 | `inUse` | `InUse` | `discard` of the bundle being served or of the confirmed fallback; `download` or `stage` of other contents than those stored under that version, or of a version that differs from a stored one only in letter case. |
 | `invalidHeader` | `InvalidHeaderName`, `InvalidHeaderValue`, `Http` | |

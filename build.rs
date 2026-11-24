@@ -9,6 +9,8 @@ const COMMANDS: &[&str] = &[
     "status",
     "rollback",
     "discard",
+    "approve",
+    "unapprove",
 ];
 
 /// The application manifest `tauri-build` embeds in apps, declaring Common Controls 6.
