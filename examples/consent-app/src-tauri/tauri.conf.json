@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ffp-ota-consent-example",
+  "version": "0.1.0",
+  "identifier": "com.example.ffp-ota-consent",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "ffp-ota-updater consent example",
+        "url": "index.html",
+        "width": 800,
+        "height": 600
+      },
+      {
+        "label": "bootstrap",
+        "title": "Starting",
+        "url": "bootstrap.html",
+        "width": 360,
+        "height": 140,
+        "resizable": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "ffp-ota-updater": {
+      "endpoints": [
+        "http://localhost:8000/ota.json"
+      ],
+      "pubkey": "",
+      "dangerousInsecureTransportProtocol": true,
+      "requireApproval": true,
+      "requiredFiles": [
+        "bootstrap.html"
+      ],
+      "readyTimeout": 20000
+    }
+  }
+}
