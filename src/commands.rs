@@ -55,6 +55,30 @@ fn pending<R: Runtime>(app: &AppHandle<R>, version: &str) -> Result<Update<R>> {
         .ok_or_else(|| Error::NoPendingUpdate(version.to_string()))
 }
 
+/// Headers a webview passed, as pairs.
+fn header_map(headers: Vec<(String, String)>) -> Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        // `append` panics once a map is full
+        map.try_append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?)
+            .map_err(http::Error::from)?;
+    }
+    Ok(map)
+}
+
+/// The update for `version` that a `check` returned, with the options a webview gave its
+/// download (the updater plugin's `DownloadOptions`). Only this download uses them: the offer
+/// that is kept stays as the check made it.
+fn pending_download<R: Runtime>(
+    app: &AppHandle<R>,
+    version: &str,
+    headers: Option<Vec<(String, String)>>,
+    timeout: Option<u64>,
+) -> Result<Update<R>> {
+    let headers = headers.map(header_map).transpose()?;
+    Ok(pending(app, version)?.with_download_options(headers, timeout.map(Duration::from_millis)))
+}
+
 async fn download_with_events<R: Runtime>(
     update: &Update<R>,
     on_event: &Channel<DownloadEvent>,
@@ -87,19 +111,12 @@ pub(crate) async fn check<R: Runtime>(
     // No endpoints: where updates come from is not the webview's to decide. What it can set are
     // the builder's defaults for one check. Neither lets it read a header set in Rust, nor see
     // inside an `https` request by naming a proxy.
-    let mut options = RequestOptions {
-        headers: HeaderMap::new(),
+    let options = RequestOptions {
+        headers: header_map(headers.unwrap_or_default())?,
         timeout: timeout.map(Duration::from_millis),
         proxy: proxy.as_deref().map(Url::parse).transpose()?,
         ..Default::default()
     };
-    for (name, value) in headers.unwrap_or_default() {
-        // `append` panics once a map is full
-        options
-            .headers
-            .try_append(HeaderName::from_str(&name)?, HeaderValue::from_str(&value)?)
-            .map_err(http::Error::from)?;
-    }
 
     let updater = app.ota_updater();
     let update = updater.check_with(options).await?;
@@ -137,8 +154,11 @@ pub(crate) async fn download<R: Runtime>(
     app: AppHandle<R>,
     version: String,
     on_event: Channel<DownloadEvent>,
+    headers: Option<Vec<(String, String)>>,
+    timeout: Option<u64>,
 ) -> Result<()> {
-    download_with_events(&pending(&app, &version)?, &on_event).await
+    let update = pending_download(&app, &version, headers, timeout)?;
+    download_with_events(&update, &on_event).await
 }
 
 #[command]
@@ -167,8 +187,10 @@ pub(crate) async fn download_and_install<R: Runtime>(
     app: AppHandle<R>,
     version: String,
     on_event: Channel<DownloadEvent>,
+    headers: Option<Vec<(String, String)>>,
+    timeout: Option<u64>,
 ) -> Result<()> {
-    let update = pending(&app, &version)?;
+    let update = pending_download(&app, &version, headers, timeout)?;
     download_with_events(&update, &on_event).await?;
     update.install()
 }

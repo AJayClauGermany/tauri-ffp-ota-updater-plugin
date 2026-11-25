@@ -113,17 +113,40 @@ endpoint's carries none of the configured headers, and no `Referer`.
 | `no_proxy()` | Ignore the system's proxy settings. |
 | `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. Not the handling of redirects: the plugin follows them itself. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
 | `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. Independently of the rule, a bundle has to be newer than the binary, and is only offered if it is newer than the frontend being served. |
-
 | `build()` | The plugin. |
 
 Per-check settings: [`RequestOptions`](api.md#requestoptions).
 
 ### TLS
 
-Requests use [rustls](https://docs.rs/rustls). If no process-wide rustls
-crypto provider is installed when the first request is made, the plugin
-installs *ring*'s, as `tauri-plugin-updater` does. An app that wants another
-provider installs it before then, for example at the start of `main`.
+The crate has the same Cargo features as `tauri-plugin-updater`, with the
+same defaults:
+
+| Feature | |
+| --- | --- |
+| `rustls-tls` (default) | Requests use [rustls](https://docs.rs/rustls). If no process-wide rustls crypto provider is installed when the first request is made, the plugin installs *ring*'s, as the updater does. An app that wants another provider installs it before then, for example at the start of `main`. |
+| `native-tls`, `native-tls-vendored` | Requests use the platform's TLS. |
+| `system-proxy` (default) | Requests follow the system's proxy settings unless `proxy()` or `no_proxy()` says otherwise. |
+
+Cargo features are shared by every crate of an app: if anything turns on
+reqwest's native TLS (the updater's `native-tls` feature, say), this plugin
+uses it too.
+
+The updater's `dangerousAcceptInvalidCerts` and
+`dangerousAcceptInvalidHostnames` keys are not configuration keys here, and
+stop the app at setup. For a staging server with a certificate of its own,
+trust that certificate with `configure_client(|client|
+client.add_root_certificate(…))`, as in
+[Send headers, use a proxy or a private CA](../how-to/integrate.md#send-headers-use-a-proxy-or-a-private-ca).
+To turn certificate checks off, only in a debug build:
+
+```rust
+let builder = tauri_plugin_ffp_ota_updater::Builder::new();
+#[cfg(debug_assertions)]
+let builder = builder.configure_client(|client| client.tls_danger_accept_invalid_certs(true));
+```
+
+Bundles are still checked against their signature either way.
 
 ## Permissions
 

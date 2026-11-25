@@ -3,7 +3,9 @@ use url::Url;
 
 /// Plugin configuration, read from `plugins.ffp-ota-updater` in `tauri.conf.json`.
 ///
-/// The keys deliberately match `tauri-plugin-updater`. A key the plugin does not know is a
+/// The keys both plugins have deliberately match `tauri-plugin-updater`; the updater's
+/// guide in `docs/how-to/use-with-updater-plugin.md` lists the ones this one does not take.
+/// A key the plugin does not know is a
 /// setup error rather than ignored: a misspelled `requireApproval` or `pubkey` would otherwise
 /// leave the app running with the default, which may be the less safe setting.
 #[derive(Debug, Clone, Deserialize)]

@@ -122,7 +122,7 @@ frontend: under `tauri dev`, or without `wrap_assets(&mut context)`. The
 bundle stays stored. See [the update downloads, but the app looks the
 same](#the-update-downloads-but-the-app-looks-the-same).
 
-### `signature`
+### `invalidSignature`
 
 The bundle is not signed by the key in `pubkey`.
 

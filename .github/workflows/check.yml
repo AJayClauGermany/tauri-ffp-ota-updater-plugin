@@ -51,3 +51,6 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The library alone, as apps get it: without the dev-dependencies, tauri's default
+      # features are off, so this fails if the plugin starts to rely on one of them.
+      - run: cargo check --lib

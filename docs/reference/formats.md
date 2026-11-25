@@ -149,6 +149,8 @@ and JavaScript APIs:
 - the `kind` strings of errors. New kinds may appear in minor releases;
 - the store: a newer plugin version reads what an older one wrote.
 
-`reqwest` and `http` types are part of the Rust API (`configure_client`,
-headers, `Error`), so a new major version of either is a new major version of
-this crate.
+Types from `tauri`, `reqwest`, `http`, `url`, `semver` and `serde_json`
+appear in the Rust API (`configure_client`, headers, endpoint and proxy URLs,
+versions, `Update::raw_json`, the variants of `Error`), so a new major version
+of any of them is a new major version of this crate. Rust code that passes
+versions to the plugin uses `semver = "1"`.

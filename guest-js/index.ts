@@ -9,10 +9,31 @@ export interface CheckOptions {
    * redirect to another host.
    */
   headers?: HeadersInit
-  /** Timeout in milliseconds, applied to each request. */
+  /**
+   * Timeout in milliseconds, applied to each request: the manifest request,
+   * and the bundle download unless {@link Update.download} sets its own.
+   */
   timeout?: number
   /** Proxy URL for the manifest request and the bundle download. */
   proxy?: string
+}
+
+/**
+ * Options for one {@link Update.download}, as in the updater plugin. What is
+ * left out is what {@link check} used.
+ */
+export interface DownloadOptions {
+  /**
+   * Headers for the bundle download, instead of those given to {@link check}.
+   * Like those, they are only sent when the bundle is on the endpoint's
+   * origin.
+   */
+  headers?: HeadersInit
+  /**
+   * Timeout in milliseconds for the download, instead of the one given to
+   * {@link check}, or else 30 minutes.
+   */
+  timeout?: number
 }
 
 /**
@@ -23,7 +44,7 @@ export interface CheckOptions {
 export type OtaUpdateErrorKind =
   | 'network'
   | 'releaseNotFound'
-  | 'signature'
+  | 'invalidSignature'
   | 'missingSignedVersion'
   | 'signedVersionMismatch'
   | 'invalidBundle'
@@ -174,10 +195,14 @@ export class Update {
    * Rejects with kind `inUse` if this device already stores other contents
    * under this version: a version names one bundle.
    */
-  async download(onEvent?: (progress: DownloadEvent) => void): Promise<void> {
+  async download(
+    onEvent?: (progress: DownloadEvent) => void,
+    options?: DownloadOptions
+  ): Promise<void> {
     await call('download', {
       version: this.version,
       onEvent: channel(onEvent),
+      ...downloadArgs(options),
     })
     this.downloaded = true
   }
@@ -186,6 +211,9 @@ export class Update {
    * Switches to the downloaded bundle now by reloading the app's webviews.
    * In-memory page state is lost, as with any reload. The new frontend has to
    * call {@link notifyReady} or it is reverted.
+   *
+   * Does nothing when this version is already being served, so two windows
+   * that install the same update reload the app once.
    *
    * A rejection of kind `tauri` means the switch happened but a window could
    * not be reloaded. With any other kind nothing was switched.
@@ -196,12 +224,38 @@ export class Update {
 
   /** {@link download} followed by {@link install}. */
   async downloadAndInstall(
-    onEvent?: (progress: DownloadEvent) => void
+    onEvent?: (progress: DownloadEvent) => void,
+    options?: DownloadOptions
   ): Promise<void> {
     await call('download_and_install', {
       version: this.version,
       onEvent: channel(onEvent),
+      ...downloadArgs(options),
     })
+    this.downloaded = true
+  }
+
+  /**
+   * Does nothing: unlike the updater plugin's `Update`, this one holds no
+   * resource. It is here so that code written for both can call it.
+   */
+  async close(): Promise<void> {}
+}
+
+/** `HeadersInit` as the name and value pairs the commands take. */
+function headerPairs(headers?: HeadersInit): [string, string][] | undefined {
+  try {
+    return headers ? Array.from(new Headers(headers).entries()) : undefined
+  } catch (error) {
+    // `Headers` throws a `TypeError` for a name or value it cannot send
+    throw new OtaUpdateError('invalidHeader', String(error))
+  }
+}
+
+function downloadArgs(options?: DownloadOptions) {
+  return {
+    headers: headerPairs(options?.headers),
+    timeout: options?.timeout,
   }
 }
 
@@ -218,17 +272,8 @@ function channel(onEvent?: (progress: DownloadEvent) => void) {
  * the published release needs a full application update instead.
  */
 export async function check(options?: CheckOptions): Promise<Update | null> {
-  let headers: [string, string][] | undefined
-  try {
-    headers = options?.headers
-      ? Array.from(new Headers(options.headers).entries())
-      : undefined
-  } catch (error) {
-    // `Headers` throws a `TypeError` for a name or value it cannot send
-    throw new OtaUpdateError('invalidHeader', String(error))
-  }
   const metadata = await call<UpdateMetadata | null>('check', {
-    headers,
+    headers: headerPairs(options?.headers),
     timeout: options?.timeout,
     proxy: options?.proxy,
   })
@@ -255,7 +300,8 @@ export async function status(): Promise<Status> {
 /**
  * Switches to the stored bundle `version` now by reloading the app's
  * webviews, like {@link Update.install}, but without a {@link check}: a bundle
- * that {@link status} reports as `staged` can be applied offline.
+ * that {@link status} reports as `staged` can be applied offline. Does nothing
+ * when `version` is already being served.
  *
  * Rejects with kind `cannotServe` where no downloaded frontend can be shown:
  * under `tauri dev`, when the app did not call `wrap_assets`, or when its

@@ -67,9 +67,11 @@ jq -n --arg v "$VERSION" --arg u "$BASE_URL/frontend-$VERSION.tar.gz?channel=ota
   '{version: $v, url: $u, signature: $s}' > ota.json
 ```
 
-The signing key is the one CrabNebula's Tauri guide has you create for the
-updater. `tauri signer sign` wants its content in `TAURI_SIGNING_PRIVATE_KEY`
-or its path in `TAURI_SIGNING_PRIVATE_KEY_PATH`.
+The signing key is the one whose public half is in `pubkey`: the updater's,
+if the app uses it, or one from `tauri signer generate`. `tauri signer sign`
+wants its content in `TAURI_SIGNING_PRIVATE_KEY` or its path in
+`TAURI_SIGNING_PRIVATE_KEY_PATH`, and its password in
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
 ## 2. Create the release in the `ota` channel
 

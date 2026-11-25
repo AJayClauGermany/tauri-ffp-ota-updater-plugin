@@ -607,6 +607,7 @@ fn frontend_update_lifecycle() {
     required_files_are_checked();
     frontends_are_bound_to_a_native_contract();
     unknown_configuration_keys_are_refused();
+    installing_the_served_version_again_does_nothing();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -2082,4 +2083,24 @@ fn frontends_are_bound_to_a_native_contract() {
     block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
     assert_eq!(served_index(&app), "ota 1.2.1+ipc4");
     app.ota_updater().reset().unwrap();
+}
+
+/// Two windows, or a button pressed twice, that install the same update switch and reload once:
+/// the second install finds that version served already, and does not even read its archive.
+fn installing_the_served_version_again_does_nothing() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+
+    std::fs::write(store.join("1.2.1.tar.gz"), "damaged").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    updater.activate(&v("1.2.1")).unwrap();
+    assert_eq!(updater.current_version(), v("1.2.1"));
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.reset().unwrap();
 }
