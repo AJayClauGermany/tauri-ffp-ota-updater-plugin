@@ -31,7 +31,7 @@ export interface DownloadOptions {
   headers?: HeadersInit
   /**
    * Timeout in milliseconds for the download, instead of the one given to
-   * {@link check}, or else 30 minutes.
+   * {@link check}. Without either, the one set in Rust, or else 30 minutes.
    */
   timeout?: number
 }

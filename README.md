@@ -144,9 +144,10 @@ TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/myapp.key TAURI_SIGNING_PRIVATE_KEY_PASS
 ```
 
 Put the key's password in `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, or leave it
-empty for a key without one. Already signing updater artifacts? The
-`TAURI_SIGNING_PRIVATE_KEY` of that setup works too, if it holds the key
-itself rather than a path ([details](docs/how-to/publish.md#3-sign-it)).
+empty for a key without one. Already signing updater artifacts with
+`TAURI_SIGNING_PRIVATE_KEY`? Leave out `TAURI_SIGNING_PRIVATE_KEY_PATH`, since
+the signer takes one or the other, not both; that key works if it holds the
+key itself rather than a path ([details](docs/how-to/publish.md#3-sign-it)).
 
 ```json
 {

@@ -44,7 +44,7 @@ The updater plugin's `DownloadOptions`, for one `download()` or
 | Field | Type | |
 | --- | --- | --- |
 | `headers` | `HeadersInit` | Instead of the check's headers (builder headers of other names still apply). Like those, only sent if the bundle is on the endpoint's origin. |
-| `timeout` | `number` (ms) | Deadline for the download, instead of the check's `timeout`, or else 30 minutes. |
+| `timeout` | `number` (ms) | Deadline for the download, instead of the check's `timeout`. Without either, the builder's `timeout()`, or else 30 minutes. |
 
 ### `Update`
 

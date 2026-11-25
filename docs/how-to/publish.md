@@ -63,7 +63,7 @@ in environment variables:
 | Variable | Value |
 | --- | --- |
 | `TAURI_SIGNING_PRIVATE_KEY` | the private key itself (the content of the key file) |
-| `TAURI_SIGNING_PRIVATE_KEY_PATH` | *or* the path of the key file |
+| `TAURI_SIGNING_PRIVATE_KEY_PATH` | *or* the path of the key file; set only one of the two |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password; set it to an empty string if there is none |
 
 > `tauri build` accepts a path in `TAURI_SIGNING_PRIVATE_KEY`; `tauri signer

@@ -78,6 +78,12 @@ Publish the corrected frontend under a **new** version.
 `endpoints` is `http://`. Use `https`, or for local testing only set
 `"dangerousInsecureTransportProtocol": true`.
 
+``unknown field `…` ``: a key under `plugins.ffp-ota-updater` that the plugin
+does not take, either misspelled or copied from the updater's block
+(`allowDowngrades`, `windows`, `dangerousAcceptInvalidCerts`,
+`dangerousAcceptInvalidHostnames`). See the
+[configuration table](../reference/configuration.md#tauriconfjson).
+
 ## Errors from `check()`
 
 ### `releaseNotFound`

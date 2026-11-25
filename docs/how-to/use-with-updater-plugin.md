@@ -57,6 +57,7 @@ with `cannotServe`. The log has a warning saying that
 | `{{bundle_type}}` | yes | no |
 | `http://` endpoints | allowed in debug builds | only with `dangerousInsecureTransportProtocol`, in any build |
 | Invalid TLS certificates and host names | `dangerousAcceptInvalidCerts`, `dangerousAcceptInvalidHostnames` | not configuration keys (they stop the app at setup); see [TLS](../reference/configuration.md#tls) |
+| Other updater keys | `allowDowngrades`, `windows` | not taken: this plugin never downgrades, and installs nothing. Like any key it does not know, they stop the app at setup. |
 | Download URL and redirects | `https` not enforced | `https` enforced |
 | Timeouts | none unless set | 30 s for the manifest, 30 min for the bundle, 30 s without progress. As in the updater, a `check()` timeout applies to the download too, unless `download()` is given its own. |
 
@@ -229,6 +230,7 @@ and `close()`:
 
 ```ts
 import type { Update as AppUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import type { Update as FrontendUpdate } from "tauri-plugin-ffp-ota-updater-api";
 
 async function apply(update: AppUpdate | FrontendUpdate) {

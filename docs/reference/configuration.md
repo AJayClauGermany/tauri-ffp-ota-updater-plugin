@@ -111,7 +111,7 @@ endpoint's carries none of the configured headers, and no `Referer`.
 | `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). A redirect starts a new request. |
 | `proxy(Url)` | Use this proxy instead of the system's. |
 | `no_proxy()` | Ignore the system's proxy settings. |
-| `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. Not the handling of redirects: the plugin follows them itself. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
+| `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. Not the handling of redirects, which the plugin follows itself, nor response decompression, which stays off so that the bytes checked are the bytes signed. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
 | `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. Independently of the rule, a bundle has to be newer than the binary, and is only offered if it is newer than the frontend being served. |
 | `build()` | The plugin. |
 
@@ -119,8 +119,8 @@ Per-check settings: [`RequestOptions`](api.md#requestoptions).
 
 ### TLS
 
-The crate has the same Cargo features as `tauri-plugin-updater`, with the
-same defaults:
+The crate has the same TLS and proxy features as `tauri-plugin-updater`, with
+the same defaults:
 
 | Feature | |
 | --- | --- |

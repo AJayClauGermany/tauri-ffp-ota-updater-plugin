@@ -1,6 +1,6 @@
-//! The plugin next to `tauri-plugin-updater` in one app, set up as
-//! `docs/how-to/use-with-updater-plugin.md` shows ("Set up both" and the version comparator). Keep
-//! the two in step: this is what keeps those snippets compiling.
+//! The plugin next to `tauri-plugin-updater` in one app, configured as
+//! `docs/how-to/use-with-updater-plugin.md` shows ("Set up both"), with the guide's version
+//! comparator passed verbatim. Keep the two in step.
 //!
 //! A test binary of its own, because the plugin's asset state is per process.
 
@@ -32,8 +32,8 @@ impl Assets<MockRuntime> for BuiltIn {
     }
 }
 
-/// The comparator of "Every release is also a full release": the updater leaves the releases
-/// this plugin takes to it.
+/// The guide's comparator rule, for the assertions: the updater leaves the releases this
+/// plugin takes to it.
 fn full_update_wanted(current: Version, release: &Version) -> bool {
     *release > current && !default_compatibility(&current, release)
 }
@@ -72,8 +72,13 @@ fn both_plugins_share_an_app_and_a_key() {
         .plugin(tauri_plugin_ffp_ota_updater::init())
         .plugin(
             tauri_plugin_updater::Builder::new()
+                // verbatim from the guide's "Every release is also a full release"
                 .default_version_comparator(|current, release| {
-                    full_update_wanted(current, &release.version)
+                    release.version > current
+                        && !tauri_plugin_ffp_ota_updater::default_compatibility(
+                            &current,
+                            &release.version,
+                        )
                 })
                 .build(),
         )
