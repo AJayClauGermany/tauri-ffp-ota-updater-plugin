@@ -58,6 +58,19 @@ data:
 
 In-memory state of the page itself is lost on the reload, as with any reload.
 
+### Service workers
+
+A service worker is carried over as well, and that one gets in the way. On
+Windows the frontend is served from `http://tauri.localhost` (or `https://`),
+which counts as a secure origin, so a service worker can register there. One
+that caches the app shell (a PWA plugin, Workbox precaching) goes on answering
+with the files it cached, so the reload after `install()` can show the old
+frontend, and the new one only arrives once the worker updates itself.
+
+Do not register a caching service worker in a Tauri app: the files are local
+already, and the plugin is what decides which frontend is served. If one was
+shipped before, unregister it from the next frontend.
+
 ## Build it like the app's frontend
 
 A bundle is a drop-in replacement for the embedded files, so it has to be

@@ -606,6 +606,7 @@ fn frontend_update_lifecycle() {
     approval_is_optional();
     required_files_are_checked();
     frontends_are_bound_to_a_native_contract();
+    unknown_configuration_keys_are_refused();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -1983,6 +1984,35 @@ fn required_files_are_checked() {
         |_| {},
     );
     assert!(launched.is_err());
+}
+
+/// A key the plugin does not know stops the app from starting: a misspelled setting would
+/// otherwise be ignored, leaving its default in force. The documented aliases are known keys.
+fn unknown_configuration_keys_are_refused() {
+    let (pubkey, _) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let launch = |overrides: serde_json::Value| {
+        try_launch(
+            data_dir.path(),
+            "1.2.0",
+            &pubkey,
+            1,
+            overrides,
+            Builder::new(),
+            |_| {},
+        )
+    };
+    let Err(error) = launch(serde_json::json!({ "requireAproval": true })) else {
+        panic!("a misspelled key was accepted");
+    };
+    assert!(error.to_string().contains("requireAproval"), "{error}");
+    let app = launch(serde_json::json!({
+        "require-approval": true,
+        "trial-attempts": 3,
+        "max-bundle-size": 1 << 20,
+    }))
+    .unwrap();
+    assert!(app.ota_updater().status().rejected.is_empty());
 }
 
 /// The recipe of the integration guide: a tag in the version's build metadata says which native

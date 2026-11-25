@@ -18,6 +18,11 @@ on:
       - "**/Cargo.lock"
       - "**/Cargo.toml"
 
+# The audit action reports its result as a check run, which the token may not create by default.
+permissions:
+  contents: read
+  checks: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

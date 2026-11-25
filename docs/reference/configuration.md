@@ -49,8 +49,12 @@ and can be given on the [Builder](#builder) instead.
 
 A non-`https` entry in `endpoints` without
 `dangerousInsecureTransportProtocol` is a setup error: the app does not start.
-The same goes for a `pubkey` that cannot be read and an entry of
-`requiredFiles` that cannot be a path.
+The same goes for a `pubkey` that cannot be read, an entry of
+`requiredFiles` that cannot be a path, and a key that is not in this table
+(a misspelled `requireApproval`, say), which would otherwise leave the
+default in force without a word. Each key may also be written in
+kebab-case (`require-approval`), as the updater plugin allows for some of
+its keys.
 
 ```json
 {
@@ -110,15 +114,16 @@ endpoint's carries none of the configured headers, and no `Referer`.
 | `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. Not the handling of redirects: the plugin follows them itself. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
 | `compatibility(Fn(&Version, &Version) -> bool)` | Receives `(binary_version, bundle_version)` and says whether that binary can run that bundle. Default: [`default_compatibility`](api.md#functions). Applied to releases found by `check`, and whenever a bundle is stored or loaded; at startup a stored bundle that fails it is deleted. Independently of the rule, a bundle has to be newer than the binary, and is only offered if it is newer than the frontend being served. |
 
+| `build()` | The plugin. |
+
+Per-check settings: [`RequestOptions`](api.md#requestoptions).
+
 ### TLS
 
 Requests use [rustls](https://docs.rs/rustls). If no process-wide rustls
 crypto provider is installed when the first request is made, the plugin
 installs *ring*'s, as `tauri-plugin-updater` does. An app that wants another
 provider installs it before then, for example at the start of `main`.
-| `build()` | The plugin. |
-
-Per-check settings: [`RequestOptions`](api.md#requestoptions).
 
 ## Permissions
 

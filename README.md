@@ -80,6 +80,10 @@ Register it on the `Builder` as shown, not from inside `.setup()` the way the
 updater's documentation registers that plugin: this plugin has to choose the
 frontend before the first window is created.
 
+The plugin is desktop-only, like the updater. An app that also builds for
+Android or iOS puts both lines under `#[cfg(desktop)]`:
+[Apps that also build for mobile](docs/how-to/integrate.md#apps-that-also-build-for-mobile).
+
 ### 3. Configure
 
 ```json

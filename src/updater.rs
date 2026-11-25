@@ -710,9 +710,18 @@ impl<R: Runtime> OtaUpdater<R> {
         // After `configure`, which may change everything else: were reqwest to follow redirects,
         // it would take every header but a few standard ones (`Authorization`, `Cookie`) to
         // another origin, and name the URL it came from, query included, in a `Referer`.
+        //
+        // Nor does it decompress anything. The plugin does not enable those features, but
+        // another crate of the app may (they are shared). A host that sends the `.tar.gz` with
+        // `Content-Encoding: gzip`, as some object stores do, would then hand over the tar
+        // inside it, whose bytes are not the ones that were signed.
         builder = builder
             .redirect(reqwest::redirect::Policy::none())
-            .referer(false);
+            .referer(false)
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd();
         Ok(builder.build()?)
     }
 
