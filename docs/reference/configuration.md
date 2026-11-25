@@ -108,7 +108,7 @@ endpoint's carries none of the configured headers, and no `Referer`.
 | `endpoints(Vec<Url>)` | Overrides `endpoints`. |
 | `header(key, value) -> Result<Self>` | Adds a header sent with every manifest request, and with bundle downloads on the endpoint's origin (scheme, host and port). Never sent to another origin, including by a redirect. |
 | `headers(HeaderMap)` | Replaces those headers. |
-| `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). A redirect starts a new request. |
+| `timeout(Duration)` | Deadline for each request, instead of 30 s (manifest) and 30 min (bundle). A redirect starts a new request. A timeout given to one check, or to one download, replaces it for that request. |
 | `proxy(Url)` | Use this proxy instead of the system's. |
 | `no_proxy()` | Ignore the system's proxy settings. |
 | `configure_client(Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder)` | Runs last on the HTTP client, so it can override everything above, including the `https`-only rule. Not the handling of redirects, which the plugin follows itself, nor response decompression, which stays off so that the bytes checked are the bytes signed. `reqwest` is re-exported as `tauri_plugin_ffp_ota_updater::reqwest`. |
@@ -130,7 +130,8 @@ the same defaults:
 
 Cargo features are shared by every crate of an app: if anything turns on
 reqwest's native TLS (the updater's `native-tls` feature, say), this plugin
-uses it too.
+uses it too. With `default-features = false`, turn one TLS feature back on:
+without any, the plugin cannot make an `https` request.
 
 The updater's `dangerousAcceptInvalidCerts` and
 `dangerousAcceptInvalidHostnames` keys are not configuration keys here, and

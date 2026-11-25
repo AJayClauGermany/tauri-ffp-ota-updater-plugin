@@ -82,9 +82,10 @@ pub struct RequestOptions {
     /// manifest points: an app whose bundles need credentials on another origin fetches them
     /// itself and hands them to [`OtaUpdater::stage`].
     pub headers: HeaderMap,
-    /// Timeout applied to each request, and to each request a redirect leads to. Defaults to
-    /// 30 seconds for the manifest and 30 minutes for the bundle; a connection that stalls for
-    /// 30 seconds is given up on either way.
+    /// Timeout for the manifest request, and for each request a redirect leads to. Defaults to
+    /// the [`Builder`](crate::Builder)'s, or else 30 seconds. As in the updater plugin, it does
+    /// not apply to the download of the release found, which gets the builder's timeout, or
+    /// else 30 minutes. A connection that stalls for 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
     /// Proxy for the manifest request and the bundle download.
     pub proxy: Option<Url>,
@@ -271,14 +272,18 @@ impl<R: Runtime> OtaUpdater<R> {
         }
         self.ensure_pubkey()?;
 
-        // what the download of the release found here is made with, too
+        // The headers and proxy are what the download of the release found here is made with,
+        // too. This check's timeout is not, as in the updater plugin: a deadline for a manifest
+        // of a few hundred bytes is no deadline for the bundle. The download gets its own, or
+        // the builder's, or `DOWNLOAD_TIMEOUT`.
         options.headers = merge_headers(&self.client.headers, std::mem::take(&mut options.headers));
-        options.timeout = options.timeout.or(self.client.timeout);
         options.proxy = options.proxy.or_else(|| self.client.proxy.clone());
+        let check_timeout = options.timeout.or(self.client.timeout);
+        options.timeout = self.client.timeout;
 
         let current_version = self.current_version();
         let client = self.client(
-            options.timeout.unwrap_or(CHECK_TIMEOUT),
+            check_timeout.unwrap_or(CHECK_TIMEOUT),
             options.proxy.as_ref(),
         )?;
 

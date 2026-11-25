@@ -286,7 +286,7 @@ For one check, from the webview:
 
 ```js
 const update = await check({ headers: { "X-Channel": "beta" }, timeout: 20000 });
-// the check's timeout applies to the download too, unless it gets its own
+// the timeout is for the check; the download has its own (30 minutes by default)
 await update?.download(undefined, { timeout: 10 * 60_000 });
 ```
 

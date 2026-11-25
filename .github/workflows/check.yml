@@ -54,3 +54,5 @@ jobs:
       # The library alone, as apps get it: without the dev-dependencies, tauri's default
       # features are off, so this fails if the plugin starts to rely on one of them.
       - run: cargo check --lib
+      # The other TLS backend, on its own
+      - run: cargo check --lib --no-default-features --features native-tls,system-proxy

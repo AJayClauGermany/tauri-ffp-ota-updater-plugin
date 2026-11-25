@@ -10,8 +10,9 @@ export interface CheckOptions {
    */
   headers?: HeadersInit
   /**
-   * Timeout in milliseconds, applied to each request: the manifest request,
-   * and the bundle download unless {@link Update.download} sets its own.
+   * Timeout in milliseconds for the manifest request. As in the updater
+   * plugin, it does not apply to the download: give {@link Update.download}
+   * its own.
    */
   timeout?: number
   /** Proxy URL for the manifest request and the bundle download. */
@@ -30,8 +31,8 @@ export interface DownloadOptions {
    */
   headers?: HeadersInit
   /**
-   * Timeout in milliseconds for the download, instead of the one given to
-   * {@link check}. Without either, the one set in Rust, or else 30 minutes.
+   * Timeout in milliseconds for the download. Without it, the one set in
+   * Rust, or else 30 minutes.
    */
   timeout?: number
 }

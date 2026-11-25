@@ -30,7 +30,7 @@ Package `tauri-plugin-ffp-ota-updater-api`. Every function rejects with an
 | Field | Type | |
 | --- | --- | --- |
 | `headers` | `HeadersInit` | Sent with the manifest request, and with the bundle download if it is on the endpoint's origin; never to another origin. Replace builder headers of the same name. |
-| `timeout` | `number` (ms) | Deadline for each request: the manifest, and the bundle download unless `download()` sets its own. |
+| `timeout` | `number` (ms) | Deadline for the manifest request. As in the updater plugin, not for the download: give `download()` its own. |
 | `proxy` | `string` | Proxy URL for both requests. `invalidUrl` if it is not a URL. |
 
 These replace the builder's settings for one check. Endpoints cannot be set
@@ -39,12 +39,12 @@ from the webview.
 ### `DownloadOptions`
 
 The updater plugin's `DownloadOptions`, for one `download()` or
-`downloadAndInstall()`. What is left out is what the check used.
+`downloadAndInstall()`. Headers left out are the check's.
 
 | Field | Type | |
 | --- | --- | --- |
 | `headers` | `HeadersInit` | Instead of the check's headers (builder headers of other names still apply). Like those, only sent if the bundle is on the endpoint's origin. |
-| `timeout` | `number` (ms) | Deadline for the download, instead of the check's `timeout`. Without either, the builder's `timeout()`, or else 30 minutes. |
+| `timeout` | `number` (ms) | Deadline for the download. Without it, the builder's `timeout()`, or else 30 minutes. |
 
 ### `Update`
 
@@ -110,9 +110,9 @@ the same run of the app returned (`noPendingUpdate` otherwise). The offers of
 the 8 newest versions are kept. An offer is kept by version, since
 [a version is one bundle](../explanation/how-it-works.md#a-version-is-one-bundle):
 if several checks return the same version, for instance from two windows, the
-latest of them decides the options (`headers`, `timeout`, `proxy`) and the
-URL that version is downloaded with. `headers` and `timeout` given to
-`download` itself apply to that download only.
+latest of them decides the options (`headers`, `proxy`) and the URL that
+version is downloaded with. `headers` and `timeout` given to `download`
+itself apply to that download only.
 
 `download_and_install` installs as well, whether or not `install` is allowed:
 see [Permissions](configuration.md#permissions).
@@ -169,10 +169,11 @@ What is left unset falls back to the builder's setting.
 | `new()` | |
 | `endpoints(Vec<Url>)` | Manifest URLs for this check, instead of the configured ones. |
 | `header(key, value) -> Result<Self>` | Replaces a builder header of the same name. |
-| `timeout(Duration)` | |
+| `timeout(Duration)` | For the manifest request only, as in the updater plugin. |
 | `proxy(Url)` | |
 
-The download of the release a check finds uses that check's options.
+The download of the release a check finds uses that check's headers and
+proxy, and the builder's timeout.
 
 ### Other exports
 

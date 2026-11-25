@@ -83,6 +83,9 @@ fn sign(key: &minisign::KeyPair, data: &[u8], version: Option<&str>) -> String {
 
 type Routes = Arc<Mutex<HashMap<&'static str, Vec<u8>>>>;
 
+/// A route whose content starts with this is answered after a second and a half, without it.
+const SLOW: &[u8] = b"<slow> ";
+
 /// Serves `routes` by the last path segment and records every requested path, followed by
 /// `#` and the value of the `x-channel` header if one was sent, and by `!referer` if the
 /// request names where it came from. A route whose content is `-> ` and a URL redirects there.
@@ -129,6 +132,13 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
                 request.push_str("!referer");
             }
             requests.lock().unwrap().push(request);
+            let body = body.map(|body| match body.strip_prefix(SLOW) {
+                Some(rest) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    rest.to_vec()
+                }
+                None => body,
+            });
             let (status, body) = match body {
                 Some(body) => match body.strip_prefix(b"-> ") {
                     Some(location) => (
@@ -608,6 +618,7 @@ fn frontend_update_lifecycle() {
     frontends_are_bound_to_a_native_contract();
     unknown_configuration_keys_are_refused();
     installing_the_served_version_again_does_nothing();
+    a_check_timeout_is_not_a_download_timeout();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -2103,4 +2114,31 @@ fn installing_the_served_version_again_does_nothing() {
     assert_eq!(updater.current_version(), v("1.2.1"));
     assert_eq!(served_index(&app), "own 1.2.1");
     updater.reset().unwrap();
+}
+
+/// As in the updater plugin, the timeout of a check is for the manifest: a bundle that takes
+/// longer to arrive than the check was given is still downloaded.
+fn a_check_timeout_is_not_a_download_timeout() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let bundle = archive("slow 1.2.1");
+    let routes = Routes::default();
+    let port = serve(routes.clone(), Default::default());
+    let manifest = serde_json::json!({
+        "version": "1.2.1",
+        "url": format!("http://127.0.0.1:{port}/bundle.tar.gz"),
+        "signature": sign(&key, &bundle, Some("1.2.1")),
+    });
+    routes.lock().unwrap().extend([
+        ("ota.json", manifest.to_string().into_bytes()),
+        ("bundle.tar.gz", [SLOW, &bundle].concat()),
+    ]);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    let options = RequestOptions::new().timeout(std::time::Duration::from_secs(1));
+    let update = block_on(app.ota_updater().check_with(options))
+        .unwrap()
+        .expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    assert_eq!(app.ota_updater().status().staged, Some(v("1.2.1")));
 }
