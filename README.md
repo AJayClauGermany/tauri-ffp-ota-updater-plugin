@@ -19,7 +19,9 @@ keys and `tauri signer` tooling, same manifest fields, same
 | Default scope | any newer version | newer **patch** versions of the installed binary |
 | Safety net | none | a frontend that does not call `notifyReady()` is rolled back |
 
-Desktop only (Windows, macOS, Linux), like the updater plugin.
+Desktop only (Windows, macOS, Linux), like the updater plugin. Needs Tauri
+2.12.5 or newer (`@tauri-apps/api` 2.12 or newer for the JavaScript package)
+and Tauri CLI 2.12 or newer to sign bundles.
 
 ## Quick start
 
@@ -80,6 +82,10 @@ Register it on the `Builder` as shown, not from inside `.setup()` the way the
 updater's documentation registers that plugin: this plugin has to choose the
 frontend before the first window is created.
 
+The plugin is desktop-only, like the updater. An app that also builds for
+Android or iOS puts both lines under `#[cfg(desktop)]`:
+[Apps that also build for mobile](docs/how-to/integrate.md#apps-that-also-build-for-mobile).
+
 ### 3. Configure
 
 ```json
@@ -133,8 +139,15 @@ tar -czf frontend-1.2.1.tar.gz -C dist .
 ```
 
 ```bash
-npm run tauri signer sign -- --app-version 1.2.1 frontend-1.2.1.tar.gz
+TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/myapp.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+  npm run tauri signer sign -- --app-version 1.2.1 frontend-1.2.1.tar.gz
 ```
+
+Put the key's password in `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, or leave it
+empty for a key without one. Already signing updater artifacts with
+`TAURI_SIGNING_PRIVATE_KEY`? Leave out `TAURI_SIGNING_PRIVATE_KEY_PATH`, since
+the signer takes one or the other, not both; that key works if it holds the
+key itself rather than a path ([details](docs/how-to/publish.md#3-sign-it)).
 
 ```json
 {

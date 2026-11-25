@@ -83,6 +83,9 @@ fn sign(key: &minisign::KeyPair, data: &[u8], version: Option<&str>) -> String {
 
 type Routes = Arc<Mutex<HashMap<&'static str, Vec<u8>>>>;
 
+/// A route whose content starts with this is answered after a second and a half, without it.
+const SLOW: &[u8] = b"<slow> ";
+
 /// Serves `routes` by the last path segment and records every requested path, followed by
 /// `#` and the value of the `x-channel` header if one was sent, and by `!referer` if the
 /// request names where it came from. A route whose content is `-> ` and a URL redirects there.
@@ -129,6 +132,13 @@ fn serve(routes: Routes, requests: Arc<Mutex<Vec<String>>>) -> u16 {
                 request.push_str("!referer");
             }
             requests.lock().unwrap().push(request);
+            let body = body.map(|body| match body.strip_prefix(SLOW) {
+                Some(rest) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    rest.to_vec()
+                }
+                None => body,
+            });
             let (status, body) = match body {
                 Some(body) => match body.strip_prefix(b"-> ") {
                     Some(location) => (
@@ -606,6 +616,9 @@ fn frontend_update_lifecycle() {
     approval_is_optional();
     required_files_are_checked();
     frontends_are_bound_to_a_native_contract();
+    unknown_configuration_keys_are_refused();
+    installing_the_served_version_again_does_nothing();
+    a_check_timeout_is_not_a_download_timeout();
 }
 
 /// A key pair, and a function staging `own <version>` signed with it in an app.
@@ -1985,6 +1998,35 @@ fn required_files_are_checked() {
     assert!(launched.is_err());
 }
 
+/// A key the plugin does not know stops the app from starting: a misspelled setting would
+/// otherwise be ignored, leaving its default in force. The documented aliases are known keys.
+fn unknown_configuration_keys_are_refused() {
+    let (pubkey, _) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let launch = |overrides: serde_json::Value| {
+        try_launch(
+            data_dir.path(),
+            "1.2.0",
+            &pubkey,
+            1,
+            overrides,
+            Builder::new(),
+            |_| {},
+        )
+    };
+    let Err(error) = launch(serde_json::json!({ "requireAproval": true })) else {
+        panic!("a misspelled key was accepted");
+    };
+    assert!(error.to_string().contains("requireAproval"), "{error}");
+    let app = launch(serde_json::json!({
+        "require-approval": true,
+        "trial-attempts": 3,
+        "max-bundle-size": 1 << 20,
+    }))
+    .unwrap();
+    assert!(app.ota_updater().status().rejected.is_empty());
+}
+
 /// The recipe of the integration guide: a tag in the version's build metadata says which native
 /// build or IPC contract a frontend was made for, and `Builder::compatibility` holds bundles to
 /// the one compiled into the binary. Two binaries of the same version are then told apart.
@@ -2052,4 +2094,51 @@ fn frontends_are_bound_to_a_native_contract() {
     block_on(update.download_and_install(|_, _| {}, || {})).unwrap();
     assert_eq!(served_index(&app), "ota 1.2.1+ipc4");
     app.ota_updater().reset().unwrap();
+}
+
+/// Two windows, or a button pressed twice, that install the same update switch and reload once:
+/// the second install finds that version served already, and does not even read its archive.
+fn installing_the_served_version_again_does_nothing() {
+    let (pubkey, stage) = signer();
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = data_dir.path().join("ffp-ota-updater");
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, 1);
+    let updater = app.ota_updater();
+    stage(&app, "1.2.1", "own 1.2.1").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    assert_eq!(served_index(&app), "own 1.2.1");
+
+    std::fs::write(store.join("1.2.1.tar.gz"), "damaged").unwrap();
+    updater.install(&v("1.2.1")).unwrap();
+    updater.activate(&v("1.2.1")).unwrap();
+    assert_eq!(updater.current_version(), v("1.2.1"));
+    assert_eq!(served_index(&app), "own 1.2.1");
+    updater.reset().unwrap();
+}
+
+/// As in the updater plugin, the timeout of a check is for the manifest: a bundle that takes
+/// longer to arrive than the check was given is still downloaded.
+fn a_check_timeout_is_not_a_download_timeout() {
+    let key = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let pubkey = b64(key.pk.to_box().unwrap().to_string());
+    let data_dir = tempfile::tempdir().unwrap();
+    let bundle = archive("slow 1.2.1");
+    let routes = Routes::default();
+    let port = serve(routes.clone(), Default::default());
+    let manifest = serde_json::json!({
+        "version": "1.2.1",
+        "url": format!("http://127.0.0.1:{port}/bundle.tar.gz"),
+        "signature": sign(&key, &bundle, Some("1.2.1")),
+    });
+    routes.lock().unwrap().extend([
+        ("ota.json", manifest.to_string().into_bytes()),
+        ("bundle.tar.gz", [SLOW, &bundle].concat()),
+    ]);
+    let app = launch(data_dir.path(), "1.2.0", &pubkey, port);
+    let options = RequestOptions::new().timeout(std::time::Duration::from_secs(1));
+    let update = block_on(app.ota_updater().check_with(options))
+        .unwrap()
+        .expect("no update");
+    block_on(update.download(|_, _| {}, || {})).unwrap();
+    assert_eq!(app.ota_updater().status().staged, Some(v("1.2.1")));
 }

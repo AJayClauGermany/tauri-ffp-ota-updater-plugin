@@ -123,9 +123,10 @@ impl Builder {
 
     /// Adjusts the HTTP client used for the manifest and the bundle, for example to trust a
     /// private certificate authority. Runs last, so it can override what the plugin and its
-    /// configuration set up, including the `https`-only rule. The exception is how redirects
-    /// are handled: the plugin follows them itself, to keep headers on their origin, so a
-    /// redirect policy or `Referer` setting given here has no effect.
+    /// configuration set up, including the `https`-only rule. The exceptions are how redirects
+    /// are handled (the plugin follows them itself, to keep headers on their origin, so a
+    /// redirect policy or `Referer` setting given here has no effect) and response
+    /// decompression, which stays off so that the bytes checked are the bytes that were signed.
     pub fn configure_client(
         mut self,
         configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,

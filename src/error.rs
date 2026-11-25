@@ -112,7 +112,7 @@ impl Error {
             Self::Reqwest(_) | Self::TooManyRedirects(_) => "network",
             Self::Json(_) => "json",
             Self::Semver(_) => "invalidVersion",
-            Self::InvalidSignature(_) => "signature",
+            Self::InvalidSignature(_) => "invalidSignature",
             Self::InvalidHeaderName(_) | Self::InvalidHeaderValue(_) | Self::Http(_) => {
                 "invalidHeader"
             }

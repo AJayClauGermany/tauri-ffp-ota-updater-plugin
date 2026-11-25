@@ -3,9 +3,13 @@ use url::Url;
 
 /// Plugin configuration, read from `plugins.ffp-ota-updater` in `tauri.conf.json`.
 ///
-/// The keys deliberately match `tauri-plugin-updater`.
+/// The keys both plugins have deliberately match `tauri-plugin-updater`; the updater's
+/// guide in `docs/how-to/use-with-updater-plugin.md` lists the ones this one does not take.
+/// A key the plugin does not know is a
+/// setup error rather than ignored: a misspelled `requireApproval` or `pubkey` would otherwise
+/// leave the app running with the default, which may be the less safe setting.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Config {
     /// URLs queried in order for a release manifest. Supports the `{{current_version}}`,

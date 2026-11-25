@@ -179,7 +179,7 @@ try {
   if (error instanceof OtaUpdateError && error.kind === "network") {
     // offline or the host is unreachable: try again later
   } else {
-    report(error); // "signature", "invalidBundle", "releaseNotFound", ...
+    report(error); // "invalidSignature", "invalidBundle", "releaseNotFound", ...
   }
 }
 ```
@@ -285,7 +285,9 @@ tauri_plugin_ffp_ota_updater::Builder::new()
 For one check, from the webview:
 
 ```js
-await check({ headers: { "X-Channel": "beta" }, timeout: 20000 });
+const update = await check({ headers: { "X-Channel": "beta" }, timeout: 20000 });
+// the timeout is for the check; the download has its own (30 minutes by default)
+await update?.download(undefined, { timeout: 10 * 60_000 });
 ```
 
 These headers go to the manifest endpoint, and to the bundle download only

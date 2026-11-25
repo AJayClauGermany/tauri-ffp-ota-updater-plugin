@@ -56,8 +56,10 @@ with `cannotServe`. The log has a warning saying that
 | Version of the app | `{{current_version}}` | `{{binary_version}}` |
 | `{{bundle_type}}` | yes | no |
 | `http://` endpoints | allowed in debug builds | only with `dangerousInsecureTransportProtocol`, in any build |
+| Invalid TLS certificates and host names | `dangerousAcceptInvalidCerts`, `dangerousAcceptInvalidHostnames` | not configuration keys (they stop the app at setup); see [TLS](../reference/configuration.md#tls) |
+| Other updater keys | `allowDowngrades`, `windows` | not taken: this plugin never downgrades, and installs nothing. Like any key it does not know, they stop the app at setup. |
 | Download URL and redirects | `https` not enforced | `https` enforced |
-| Timeouts | none unless set | 30 s for the manifest, 30 min for the bundle, 30 s without progress |
+| Timeouts | none unless set | 30 s for the manifest, 30 min for the bundle, 30 s without progress. As in the updater, a `check()` timeout is for the check only; `download()` takes its own. |
 
 ### Versions
 
@@ -85,8 +87,9 @@ resolves to `null`, exactly as if there were no update.
 
 | | Updater plugin | This plugin |
 | --- | --- | --- |
-| JS `Update` | a resource: `close()` it; `install()` only on the object that downloaded | plain object; `install(version)` also works in a later run, offline |
+| JS `Update` | a resource: `close()` it; `install()` only on the object that downloaded | holds no resource (`close()` does nothing); `install(version)` also works in a later run, offline |
 | JS `check()` options | `headers`, `timeout`, `proxy`, `target` | `headers`, `timeout`, `proxy` |
+| JS `download()` options | `headers`, `timeout` | the same |
 | Headers on the download | all of them, wherever the manifest points | only to the endpoint's origin, redirects included |
 | JS errors | strings | `OtaUpdateError` with a `kind` to branch on |
 | Rust entry point | `app.updater()?`, `app.updater_builder()` | `app.ota_updater()`; per-check options with `check_with(RequestOptions)` |
@@ -219,8 +222,22 @@ async function update() {
 update().catch((error) => console.warn("update check failed:", error));
 ```
 
-If one function handles both kinds, `update.kind === "frontend"` identifies
-this plugin's object.
+If one function handles both kinds, `"kind" in update` identifies this
+plugin's object, and narrows the type in TypeScript. (`update.kind` does not
+compile on the union: the updater's `Update` has no `kind`.) Both objects have
+`download(onEvent, { headers, timeout })`, `install()`, `downloadAndInstall()`
+and `close()`:
+
+```ts
+import type { Update as AppUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import type { Update as FrontendUpdate } from "tauri-plugin-ffp-ota-updater-api";
+
+async function apply(update: AppUpdate | FrontendUpdate) {
+  await update.downloadAndInstall();
+  if (!("kind" in update)) await relaunch(); // a full update
+}
+```
 
 Show the user this plugin's `currentVersion()`, not `getVersion()`, or the
 "About" screen will be a frontend release behind.

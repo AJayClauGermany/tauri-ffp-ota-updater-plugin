@@ -82,9 +82,10 @@ pub struct RequestOptions {
     /// manifest points: an app whose bundles need credentials on another origin fetches them
     /// itself and hands them to [`OtaUpdater::stage`].
     pub headers: HeaderMap,
-    /// Timeout applied to each request, and to each request a redirect leads to. Defaults to
-    /// 30 seconds for the manifest and 30 minutes for the bundle; a connection that stalls for
-    /// 30 seconds is given up on either way.
+    /// Timeout for the manifest request, and for each request a redirect leads to. Defaults to
+    /// the [`Builder`](crate::Builder)'s, or else 30 seconds. As in the updater plugin, it does
+    /// not apply to the download of the release found, which gets the builder's timeout, or
+    /// else 30 minutes. A connection that stalls for 30 seconds is given up on either way.
     pub timeout: Option<Duration>,
     /// Proxy for the manifest request and the bundle download.
     pub proxy: Option<Url>,
@@ -271,14 +272,18 @@ impl<R: Runtime> OtaUpdater<R> {
         }
         self.ensure_pubkey()?;
 
-        // what the download of the release found here is made with, too
+        // The headers and proxy are what the download of the release found here is made with,
+        // too. This check's timeout is not, as in the updater plugin: a deadline for a manifest
+        // of a few hundred bytes is no deadline for the bundle. The download gets its own, or
+        // the builder's, or `DOWNLOAD_TIMEOUT`.
         options.headers = merge_headers(&self.client.headers, std::mem::take(&mut options.headers));
-        options.timeout = options.timeout.or(self.client.timeout);
         options.proxy = options.proxy.or_else(|| self.client.proxy.clone());
+        let check_timeout = options.timeout.or(self.client.timeout);
+        options.timeout = self.client.timeout;
 
         let current_version = self.current_version();
         let client = self.client(
-            options.timeout.unwrap_or(CHECK_TIMEOUT),
+            check_timeout.unwrap_or(CHECK_TIMEOUT),
             options.proxy.as_ref(),
         )?;
 
@@ -415,25 +420,42 @@ impl<R: Runtime> OtaUpdater<R> {
     /// Fails with [`Error::CannotServe`] when the assets were not wrapped with
     /// [`wrap_assets`](crate::wrap_assets), the app runs from `devUrl` in development mode, or
     /// its `frontendDist` is a URL.
+    ///
+    /// Does nothing when `version` is already the frontend being served.
     pub fn activate(&self, version: &Version) -> Result<()> {
+        self.switch_to(version).map(|_| ())
+    }
+
+    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
+    ///
+    /// Does nothing, and reloads nothing, when `version` is already the frontend being served:
+    /// two windows, or a button pressed twice, that install the same update reload the app once.
+    ///
+    /// An [`Error::Tauri`] is a webview that could not be reloaded: the switch has happened
+    /// ([`Self::current_version`] is `version`), and that webview shows the previous frontend
+    /// until it is reloaded or recreated with [`Self::reload`]; installing again does not reload
+    /// it. Any other error means nothing was switched.
+    pub fn install(&self, version: &Version) -> Result<()> {
+        if self.switch_to(version)? {
+            self.reload()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`Self::activate`], returning whether anything was switched.
+    fn switch_to(&self, version: &Version) -> Result<bool> {
         if let Some(reason) = self.cannot_serve {
             return Err(Error::CannotServe(reason));
         }
         self.ensure_pubkey()?;
         let _switching = self.switching();
+        if assets::active().is_some_and(|active| active.version == *version) {
+            return Ok(false);
+        }
         self.ensure_not_older(version)?;
         self.serve(Some(self.store.activate(version)?));
-        Ok(())
-    }
-
-    /// [`Self::activate`], then reloads every webview so the bundle takes effect.
-    ///
-    /// An [`Error::Tauri`] is a webview that could not be reloaded: the switch has happened
-    /// ([`Self::current_version`] is `version`), and that webview shows the previous frontend
-    /// until it is reloaded or recreated. Any other error means nothing was switched.
-    pub fn install(&self, version: &Version) -> Result<()> {
-        self.activate(version)?;
-        self.reload()
+        Ok(true)
     }
 
     /// Approves the stored bundle `version` for the next launch, and changes nothing in this
@@ -687,6 +709,7 @@ impl<R: Runtime> OtaUpdater<R> {
     /// The HTTP client for one check or download. It follows no redirects: [`get`] does, to
     /// decide for each one which headers go along.
     fn client(&self, timeout: Duration, proxy: Option<&Url>) -> Result<reqwest::Client> {
+        #[cfg(feature = "rustls-tls")]
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             // can only fail if another thread installed one in the meantime, which is just as
             // good
@@ -710,9 +733,18 @@ impl<R: Runtime> OtaUpdater<R> {
         // After `configure`, which may change everything else: were reqwest to follow redirects,
         // it would take every header but a few standard ones (`Authorization`, `Cookie`) to
         // another origin, and name the URL it came from, query included, in a `Referer`.
+        //
+        // Nor does it decompress anything. The plugin does not enable those features, but
+        // another crate of the app may (they are shared). A host that sends the `.tar.gz` with
+        // `Content-Encoding: gzip`, as some object stores do, would then hand over the tar
+        // inside it, whose bytes are not the ones that were signed.
         builder = builder
             .redirect(reqwest::redirect::Policy::none())
-            .referer(false);
+            .referer(false)
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd();
         Ok(builder.build()?)
     }
 
@@ -887,6 +919,24 @@ impl<R: Runtime> Clone for Update<R> {
 }
 
 impl<R: Runtime> Update<R> {
+    /// This update with other headers and a timeout for its download, as the updater plugin's
+    /// `DownloadOptions` give them. Headers given here replace those of the check, on top of the
+    /// [`Builder`](crate::Builder)'s, and still only go to the endpoint's origin.
+    pub(crate) fn with_download_options(
+        mut self,
+        headers: Option<HeaderMap>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        if let Some(headers) = headers {
+            let base = &self.app.ota_updater().client.headers;
+            self.options.headers = merge_headers(base, headers);
+        }
+        if let Some(timeout) = timeout {
+            self.options.timeout = Some(timeout);
+        }
+        self
+    }
+
     /// Downloads the bundle, verifies it and stores it.
     ///
     /// A stored bundle is picked up automatically on the next launch, or with `requireApproval`

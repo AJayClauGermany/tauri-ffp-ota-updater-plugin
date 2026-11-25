@@ -63,7 +63,7 @@ in environment variables:
 | Variable | Value |
 | --- | --- |
 | `TAURI_SIGNING_PRIVATE_KEY` | the private key itself (the content of the key file) |
-| `TAURI_SIGNING_PRIVATE_KEY_PATH` | *or* the path of the key file |
+| `TAURI_SIGNING_PRIVATE_KEY_PATH` | *or* the path of the key file; set only one of the two |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password; set it to an empty string if there is none |
 
 > `tauri build` accepts a path in `TAURI_SIGNING_PRIVATE_KEY`; `tauri signer
@@ -114,7 +114,9 @@ previous version and let it update.
 ## The whole thing as a script
 
 `VERSION` is the new patch version, `BASE_URL` where the files will be served
-from:
+from, and the signing key is in `TAURI_SIGNING_PRIVATE_KEY` or
+`TAURI_SIGNING_PRIVATE_KEY_PATH`, with `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`,
+as in [step 3](#3-sign-it):
 
 ```bash
 grep -rq notify_ready dist   # heuristic: fail if the build lost notifyReady()

@@ -36,6 +36,7 @@ built-in frontend.
 | The plugin is registered inside `.setup()`. | Register it with `.plugin(…)` on `tauri::Builder`. |
 | Only `download()` was called. | That is how it works: the bundle is used from the next launch. Call `install()` or `downloadAndInstall()` to switch now. |
 | `requireApproval` is set and the bundle was not approved. `status()` has it as `staged`, at every start. | That is what the setting is for: call `approve(version)` to use it from the next launch, or `install(version)` to switch now. |
+| `currentVersion()` is the new version, but the page is not (on Windows). A service worker of the frontend answers from its cache. | Do not cache the app shell in a service worker; see [Service workers](../explanation/frontend-only-updates.md#service-workers). |
 
 ## `check()` resolves to `null`, but I published an update
 
@@ -76,6 +77,12 @@ Publish the corrected frontend under a **new** version.
 `error while running tauri application: … does not use https`: an entry of
 `endpoints` is `http://`. Use `https`, or for local testing only set
 `"dangerousInsecureTransportProtocol": true`.
+
+``unknown field `…` ``: a key under `plugins.ffp-ota-updater` that the plugin
+does not take, either misspelled or copied from the updater's block
+(`allowDowngrades`, `windows`, `dangerousAcceptInvalidCerts`,
+`dangerousAcceptInvalidHostnames`). See the
+[configuration table](../reference/configuration.md#tauriconfjson).
 
 ## Errors from `check()`
 
@@ -121,7 +128,7 @@ frontend: under `tauri dev`, or without `wrap_assets(&mut context)`. The
 bundle stays stored. See [the update downloads, but the app looks the
 same](#the-update-downloads-but-the-app-looks-the-same).
 
-### `signature`
+### `invalidSignature`
 
 The bundle is not signed by the key in `pubkey`.
 
